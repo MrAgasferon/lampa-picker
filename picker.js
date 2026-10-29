@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.4.0';
+  var VERSION = '0.5.0';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -794,6 +794,26 @@
     }
     profile.animShare = posW > 0 ? animW / posW : 0.2;
 
+    // Нижняя граница годов: самое раннее десятилетие с заметной долей среди того, что нравится
+    var decW = {}, decMax = 0;
+    for (var di = 0; di < events.length; di++) {
+      var de = events[di];
+      if (!(de.s > 0) || !de.c || !de.c.year) continue;
+      var dy = parseInt(de.c.year, 10);
+      if (isNaN(dy)) continue;
+      var dk = Math.floor(dy / 10) * 10;
+      decW[dk] = (decW[dk] || 0) + de.s * decay(de.date);
+      if (decW[dk] > decMax) decMax = decW[dk];
+    }
+    var floorDec = null;
+    each(decW, function (v, d) {
+      d = parseInt(d, 10);
+      if (v >= decMax * 0.15 && (floorDec === null || d < floorDec)) floorDec = d;
+    });
+    // Холодный старт — 1990; не строже 2010, чтобы не обеднить пул
+    if (n < 5 || floorDec === null) floorDec = 1990;
+    profile.yearFloor = Math.min(floorDec, 2010);
+
     var seeds = events.filter(function (e) { return e.s > 0.25; });
     seeds.sort(function (a, b) { return b.s * decay(b.date) - a.s * decay(a.date); });
     profile.seeds = seeds.slice(0, 15);
@@ -830,28 +850,84 @@
     return ['movie', 'tv'];
   }
 
+  // Пары и одиночные жанры для discover: пересечение «подходит под настроение» × «нравится пользователю»
+  function discoverPlan(profile, ans) {
+    var mood = MOODS[ans.mood];
+    var user = topGenres(profile, 4, true);
+    var plan = [];
+    var seen = {};
+    var push = function (genres, kind, w) {
+      var key = genres.slice().sort().join(',');
+      if (seen[key]) return;
+      seen[key] = true;
+      plan.push({ g: genres, kind: kind, w: w });
+    };
+
+    var hasMood = false;
+    if (mood) each(mood.w, function () { hasMood = true; });
+
+    if (hasMood) {
+      var mg = moodPlus(mood, 3);
+      var pairs = [];
+      for (var i = 0; i < mg.length; i++) {
+        for (var j = 0; j < user.length; j++) {
+          if (mg[i] === user[j]) continue;
+          var uw = (profile.f.genre && profile.f.genre[user[j]]) || 0;
+          var own = mood.w[user[j]];
+          if (own !== undefined && own < 0) continue;         // жанр пользователя мешает настроению
+          pairs.push({ g: [mg[i], user[j]], w: mood.w[mg[i]] * (0.5 + uw) });
+        }
+      }
+      pairs.sort(function (a, b) { return b.w - a.w; });
+      for (var p = 0; p < Math.min(4, pairs.length); p++) push(pairs[p].g, 'pair', pairs[p].w);
+      for (var k = 0; k < Math.min(2, mg.length); k++) push([mg[k]], 'mood', mood.w[mg[k]]);
+      // Жанры пользователя, которые сами подходят под настроение
+      for (var u = 0; u < user.length; u++) {
+        var uwm = mood.w[user[u]];
+        if (uwm !== undefined && uwm > 0) push([user[u]], 'user', uwm);
+      }
+    } else {
+      for (var z = 0; z < Math.min(3, user.length); z++) push([user[z]], 'user', 1);
+      if (!plan.length) { push([35], 'user', 1); push([18], 'user', 1); push([878], 'user', 1); }
+    }
+    return plan.slice(0, 7);
+  }
+
+  function moodExclude(ans, type) {
+    var mood = MOODS[ans.mood];
+    var out = [];
+    if (mood) each(mood.w, function (v, g) { if (v <= -0.5) out.push(parseInt(g, 10)); });
+    if (ans.company === 'kids') out = out.concat([27, 10752]);
+    if (type === 'tv') out = out.map(toTvGenre).filter(Boolean);
+    return uniq(out);
+  }
+
   function gatherPool(profile, events, ans, cb) {
     var pool = {};
     var pending = 1; // защитная единица: снимается после постановки всех запросов
     var closed = false;
     var types = wantedTypes(ans);
+    var srcCount = {};
 
-    function add(list, type, seed) {
+    function add(list, type, seed, src) {
       for (var i = 0; i < (list || []).length; i++) {
         var r = list[i];
         var t = r.media_type || type;
         if (t !== 'movie' && t !== 'tv') continue;
         if (types.indexOf(t) < 0) continue;
         var k = keyOf(t, r.id);
-        if (!pool[k]) pool[k] = { k: k, id: r.id, type: t, r: r, seedHits: 0, seeds: [], wath: false };
+        if (!pool[k]) {
+          pool[k] = { k: k, id: r.id, type: t, r: r, seedHits: 0, seeds: [], wath: false, src: src };
+          srcCount[src] = (srcCount[src] || 0) + 1;
+        }
         if (seed) { pool[k].seedHits++; pool[k].seeds.push(seed); }
       }
     }
 
-    function req(path, params, type, seed) {
+    function req(path, params, type, seed, src) {
       pending++;
       tmdb(path, params, 3 * DAY, function (json) {
-        if (json && json.results) add(json.results, type, seed);
+        if (json && json.results) add(json.results, type, seed, src);
         if (--pending === 0) finish();
       });
     }
@@ -859,57 +935,77 @@
     function finish() {
       if (closed) return;
       closed = true;
+      pool.__src = srcCount;
       cb(pool);
     }
 
-    // 1. Рекомендации по seed-фильмам
-    var seeds = profile.seeds.slice(0, 8);
+    var short = ans.time === '40';
+    var limited = ans.time !== 'any';
+    var surprise = ans.mood === 'surprise';
+    var floor = (profile.yearFloor || 1990) - (surprise ? 10 : 0);
+
+    // 1. Рекомендации по seed-фильмам — только от тех, что сами подходят под настроение
+    var fits = [], rest = [];
+    for (var si = 0; si < profile.seeds.length; si++) {
+      var sd = profile.seeds[si];
+      if (types.length === 1 && sd.type !== types[0]) continue;
+      if (!sd.c) continue;
+      if (MOODS[ans.mood] && moodScore(sd.c, ans) < 0.5) rest.push(sd);
+      else fits.push(sd);
+    }
+    // При ограничении по времени рекомендации чаще мимо по длительности — берём меньше
+    var seedCap = limited ? 5 : 8;
+    var seeds = fits.slice(0, seedCap);
+    if (seeds.length < 3) seeds = seeds.concat(rest.slice(0, 3 - seeds.length));
     for (var i = 0; i < seeds.length; i++) {
-      var s = seeds[i];
-      req(s.type + '/' + s.id + '/recommendations', { page: 1 }, s.type, s.c ? s.c.title : '');
+      var s0 = seeds[i];
+      req(s0.type + '/' + s0.id + '/recommendations', { page: 1 }, s0.type, s0.c ? s0.c.title : '', 'rec');
     }
 
-    // 2. Discover по жанрам профиля (холодный старт — по жанрам настроения)
-    var genres = topGenres(profile, 3, true);
-    var mood = MOODS[ans.mood];
-    if (genres.length < 2 && mood) genres = uniq(genres.concat(moodPlus(mood, 3)));
-    if (!genres.length) genres = [35, 18, 878];
-
-    var short = ans.time === '40';
-
+    // 2. Discover: пересечение настроения и вкуса, длительность и годы фильтрует сам TMDB
+    var plan = discoverPlan(profile, ans);
     for (var t = 0; t < types.length; t++) {
       var type = types[t];
-      for (var g = 0; g < genres.length; g++) {
-        var gid = type === 'tv' ? toTvGenre(genres[g]) : genres[g];
-        if (!gid) continue;
+      var excl = moodExclude(ans, type);
+      for (var g = 0; g < plan.length; g++) {
+        var ids = [];
+        for (var gi = 0; gi < plan[g].g.length; gi++) {
+          var gid = type === 'tv' ? toTvGenre(plan[g].g[gi]) : plan[g].g[gi];
+          if (gid && ids.indexOf(gid) < 0) ids.push(gid);
+        }
+        if (ids.length !== plan[g].g.length) continue;
         var p = {
-          with_genres: gid,
+          with_genres: ids.join(','),
           sort_by: 'popularity.desc',
-          'vote_count.gte': type === 'tv' ? 100 : (short ? 30 : 300)
+          'vote_count.gte': type === 'tv' ? 100 : (short ? 30 : 200),
+          'vote_average.gte': 6
         };
-        if (type === 'movie' && ans.time !== 'any') {
-          var limit = short ? 45 : parseInt(ans.time, 10) + 10;
-          if (!isNaN(limit)) p['with_runtime.lte'] = limit;
+        p[type === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = floor + '-01-01';
+        if (type === 'movie' && limited) {
+          var lim = short ? 45 : parseInt(ans.time, 10) + 10;
+          if (!isNaN(lim)) p['with_runtime.lte'] = lim;
         }
         if (type === 'tv' && short) p['with_runtime.lte'] = 35;
         if (type === 'tv' && ans.time === 'series') p['with_runtime.lte'] = 60;
-        if (ans.company === 'kids') p['without_genres'] = type === 'tv' ? '' : '27,10752';
-        if (!p['without_genres']) delete p['without_genres'];
+        var ex = excl.filter(function (x) { return ids.indexOf(x) < 0; });
+        if (ex.length) p.without_genres = ex.join(',');
 
-        req('discover/' + type, extend(p, { page: 1 }), type, null);
-        req('discover/' + type, extend(p, { page: 2 }), type, null);
+        req('discover/' + type, extend(p, { page: 1 }), type, null, 'disc');
+        if (plan[g].kind !== 'pair') req('discover/' + type, extend(p, { page: 2 }), type, null, 'disc');
       }
     }
 
     // 3. Исследование: жанр с небольшим положительным весом
     var all = topGenres(profile, 6, true);
     if (all.length > 3) {
-      var ex = all[3 + Math.floor(rng(todaySeed())() * (all.length - 3))];
+      var exg = all[3 + Math.floor(rng(todaySeed())() * (all.length - 3))];
       var exType = types[0];
-      var exId = exType === 'tv' ? toTvGenre(ex) : ex;
-      if (exId) req('discover/' + exType, {
-        with_genres: exId, sort_by: 'vote_average.desc', 'vote_count.gte': 500, page: 1
-      }, exType, null);
+      var exId = exType === 'tv' ? toTvGenre(exg) : exg;
+      if (exId) {
+        var ep = { with_genres: exId, sort_by: 'vote_average.desc', 'vote_count.gte': 500, page: 1 };
+        ep[exType === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = floor + '-01-01';
+        req('discover/' + exType, ep, exType, null, 'explore');
+      }
     }
 
     // 4. Закладки «Позже»
@@ -918,8 +1014,10 @@
       var intent = false;
       for (var it = 0; it < INTENT_TYPES.length; it++) if (ev.flags[INTENT_TYPES[it]]) intent = true;
       if (!intent || types.indexOf(ev.type) < 0) continue;
-      if (!pool[ev.k]) pool[ev.k] = { k: ev.k, id: ev.id, type: ev.type, r: ev.card, seedHits: 0, seeds: [], wath: true };
-      else pool[ev.k].wath = true;
+      if (!pool[ev.k]) {
+        pool[ev.k] = { k: ev.k, id: ev.id, type: ev.type, r: ev.card, seedHits: 0, seeds: [], wath: true, src: 'wath' };
+        srcCount.wath = (srcCount.wath || 0) + 1;
+      } else pool[ev.k].wath = true;
     }
 
     if (--pending === 0) finish();
@@ -962,6 +1060,7 @@
     var bump = function (k) { stats[k] = (stats[k] || 0) + 1; };
 
     each(pool, function (it, k) {
+      if (k === '__src') return;
       if (ex[k]) return bump(ex[k]);
       var r = it.r || {};
       var date = r.release_date || r.first_air_date || '';
@@ -1102,6 +1201,16 @@
     return clamp(n, 0, 1);
   }
 
+  // Множитель за возраст: десятилетием старше границы — ×0,75, ещё старше — ×0,4
+  function yearFactor(c, profile, ans) {
+    var y = parseInt(c.year, 10);
+    var floor = profile.yearFloor || 1990;
+    if (isNaN(y) || y >= floor) return 1;
+    var surprise = ans.mood === 'surprise';
+    if (y >= floor - 10) return surprise ? 0.9 : 0.75;
+    return surprise ? 0.7 : 0.4;
+  }
+
   function pickWeights(ans, profile) {
     if (profile.n < 5) return { key: 'cold', w: WEIGHTS.cold };
     if (ans.company === 'group') return { key: 'group', w: WEIGHTS.group };
@@ -1202,7 +1311,8 @@
       var rest = 1 - w.m;
       var base = (w.q * pt.q + w.a * pt.an + w.n * pt.n + w.s * pt.s) / (rest > 0 ? rest : 1);
       var moodGate = w.m > 0 ? 0.35 + 0.65 * pt.m : 1;
-      x.score = base * moodGate * (0.65 + 0.35 * pt.f);
+      pt.y = x.wath ? 1 : yearFactor(x.c, profile, ans); // «Позже» — явный выбор, годы не штрафуем
+      x.score = base * moodGate * (0.65 + 0.35 * pt.f) * pt.y;
       x.reason = reasonOf(x, pt, w, profile);
     }
 
@@ -1257,6 +1367,79 @@
   }
 
   // =========================================================================
+  // Франшизы: одна карточка на коллекцию — первая непросмотренная часть
+  // =========================================================================
+
+  function franchiseFilter(list, events, ans, stats, cb) {
+    var byColl = {};
+    for (var i = 0; i < list.length; i++) {
+      var c = list[i].c;
+      if (c && c.type === 'movie' && c.coll) (byColl[c.coll] = byColl[c.coll] || []).push(list[i]);
+    }
+    var colls = Object.keys(byColl);
+    if (!colls.length) return cb(list);
+
+    var ex = excludedKeys(events);
+    var today = new Date().toISOString().slice(0, 10);
+    var drop = {};
+    var additions = [];
+    var left = colls.length;
+
+    var done = function () {
+      if (--left > 0) return;
+      var kept = list.filter(function (it) { return !drop[it.k]; });
+      if (!additions.length) return cb(kept);
+      detailsMany(additions, function () {
+        for (var a = 0; a < additions.length; a++) {
+          var r = postReason(additions[a], ans);
+          if (r) stats[r] = (stats[r] || 0) + 1;
+          else kept.push(additions[a]);
+        }
+        cb(kept);
+      });
+    };
+
+    each(byColl, function (items, collId) {
+      tmdb('collection/' + collId, {}, 30 * DAY, function (col) {
+        var parts = ((col && col.parts) || []).filter(function (pt) {
+          return pt.release_date && pt.release_date <= today;
+        });
+        parts.sort(function (a, b) { return a.release_date < b.release_date ? -1 : 1; });
+
+        // Следующая часть: первая, которую не смотрели (отклонённая — франшиза пропускается целиком)
+        var next = null, blocked = false;
+        for (var p = 0; p < parts.length; p++) {
+          var k = keyOf('movie', parts[p].id);
+          if (ex[k] === 'rejected') { blocked = true; break; }
+          if (!ex[k]) { next = parts[p]; break; }
+        }
+
+        var best = items[0];
+        for (var b = 1; b < items.length; b++) if ((items[b].score || 0) > (best.score || 0)) best = items[b];
+
+        for (var j = 0; j < items.length; j++) {
+          var it = items[j];
+          var keep = !blocked && (next ? it.id === next.id : (parts.length === 0 && it === best));
+          if (!keep) { drop[it.k] = true; stats.franchise = (stats.franchise || 0) + 1; }
+        }
+
+        // Нужная часть не в списке — подставляем её вместо лучшего представителя франшизы
+        if (!blocked && next) {
+          var inList = false;
+          for (var q = 0; q < items.length; q++) if (items[q].id === next.id) inList = true;
+          if (!inList) {
+            additions.push({
+              k: keyOf('movie', next.id), id: next.id, type: 'movie', r: next,
+              seedHits: best.seedHits, seeds: best.seeds, wath: false, src: 'franchise'
+            });
+          }
+        }
+        done();
+      });
+    });
+  }
+
+  // =========================================================================
   // Конвейер
   // =========================================================================
 
@@ -1288,24 +1471,41 @@
         var stats = {};
         var list = prefilter(pool, events, ans, stats);
 
-        // Предоценка по полям списка, детали — только для топ-60
+        // Предоценка по полям списка, затем детали партиями, пока не наберётся достаточно подходящих
         for (var i = 0; i < list.length; i++) list[i].c = cardCompact(list[i].r || {});
         scoreAll(list, profile, ans);
         list.sort(function (a, b) { return b.score - a.score; });
-        var top = list.slice(0, 60);
-        stage('Сравниваю ' + top.length + ' вариантов');
 
-        detailsMany(top, function () {
+        var BATCH = 30, WANT = 30, MAX_DETAILED = 150;
+        var passed = [];
+        var offset = 0;
+
+        var nextBatch = function () {
           if (!alive()) return;
-          var finalList = top.filter(function (it) {
-            var r = postReason(it, ans);
-            if (r) stats[r] = (stats[r] || 0) + 1;
-            return !r;
+          var batch = list.slice(offset, offset + BATCH);
+          offset += batch.length;
+          stage('Сравниваю ' + offset + ' вариантов');
+          detailsMany(batch, function () {
+            if (!alive()) return;
+            for (var b = 0; b < batch.length; b++) {
+              var r = postReason(batch[b], ans);
+              if (r) stats[r] = (stats[r] || 0) + 1;
+              else passed.push(batch[b]);
+            }
+            if (passed.length < WANT && offset < list.length && offset < MAX_DETAILED) nextBatch();
+            else afterDetails();
           });
+        };
+
+        var afterDetails = function () {
+          scoreAll(passed, profile, ans);
+          franchiseFilter(passed, events, ans, stats, function (finalList) {
+          if (!alive()) return;
+          var top = list.slice(0, offset);
           var wkey = scoreAll(finalList, profile, ans);
           jitter(finalList);
 
-          log('events', events.length, 'profile.n', profile.n, 'pool', Object.keys(pool).length,
+          log('events', events.length, 'profile.n', profile.n, 'pool', Object.keys(pool).length - 1,
             'prefiltered', list.length, 'final', finalList.length, 'ms', now() - started);
 
           var st = {
@@ -1314,13 +1514,17 @@
           };
           st.journal = Journal.begin(ans, {
             wkey: wkey, ms: now() - started, moods: MoodsApi.state,
-            counts: { events: events.length, profile: profile.n, pool: Object.keys(pool).length, prefiltered: list.length, detailed: top.length, final: finalList.length },
+            counts: { events: events.length, profile: profile.n, pool: Object.keys(pool).length - 1, prefiltered: list.length, detailed: top.length, final: finalList.length },
+            sources: pool.__src,
             dropped: stats,
             profile: profileSummary(profile),
             top: finalList.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).map(journalItem)
           });
           if (h.done) h.done(st);
-        });
+          });
+        };
+
+        nextBatch();
       });
     });
     });
@@ -1348,7 +1552,9 @@
       kp: it.kp || null,
       imdb: it.imdbR || null,
       score: round3(it.score),
-      q: round3(p.q), a: round3(p.a), an: round3(p.an), m: round3(p.m), n: round3(p.n), s: round3(p.s), f: round3(p.f),
+      q: round3(p.q), a: round3(p.a), an: round3(p.an), m: round3(p.m), n: round3(p.n), s: round3(p.s), f: round3(p.f), y: round3(p.y),
+      src: it.src || null,
+      coll: c.coll || null,
       anim: isAnimated(c),
       cert: c.cert ? [c.cert.ru ? 'RU:' + c.cert.ru : '', c.cert.us ? 'US:' + c.cert.us : ''].filter(Boolean).join(' ') : null,
       moods: c.moods || null,
@@ -1372,6 +1578,7 @@
     return {
       events: profile.n,
       animShare: round3(profile.animShare),
+      yearFloor: profile.yearFloor,
       genres: topOf(profile.f.genre, 6, function (g) { return GENRE_NAMES[g]; }),
       dislikedGenres: topOf((function () {
         var neg = {};
@@ -1433,10 +1640,11 @@
       this.saveEntry(entry);
     },
 
-    action: function (entry, type, it) {
+    action: function (entry, type, it, extra) {
       if (!entry) return;
       var a = { sec: Math.round((now() - entry.id) / 1000), act: type };
       if (it) { a.k = it.k; a.title = it.c.title; }
+      if (extra) each(extra, function (v, k) { a[k] = v; });
       entry.actions.push(a);
       this.saveEntry(entry);
     },
@@ -2159,7 +2367,8 @@
 
       var footer = $('<div class="pkr-actions pkr-actions--footer"></div>');
       if (state.rest.length) footer.append(button('refresh', 'Ещё варианты', 'pkr-btn--ghost', function () {
-        Journal.action(state.journal, 'more');
+        Journal.action(state.journal, 'more', null, { opened: !!state.pageOpened });
+        state.pageOpened = false;
         state.page = nextPage(state, 5);
         state.pageNo = (state.pageNo || 1) + 1;
         state.logged = false;
@@ -2210,7 +2419,7 @@
     }
 
     function openIt(it) {
-      if (state) Journal.action(state.journal, 'open', it);
+      if (state) { Journal.action(state.journal, 'open', it); state.pageOpened = true; }
       openCard(it);
     }
 
