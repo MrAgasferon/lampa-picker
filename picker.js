@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.3.0';
+  var VERSION = '0.3.1';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -95,17 +95,17 @@
     28: 'Боевик', 12: 'Приключения', 16: 'Мультфильм', 35: 'Комедия', 80: 'Криминал',
     99: 'Документальный', 18: 'Драма', 10751: 'Семейный', 14: 'Фэнтези', 36: 'История',
     27: 'Ужасы', 10402: 'Музыка', 9648: 'Детектив', 10749: 'Мелодрама', 878: 'Фантастика',
-    10770: 'ТВ-фильм', 53: 'Триллер', 10752: 'Военный', 37: 'Вестерн'
+    10770: 'ТВ-фильм', 53: 'Триллер', 10752: 'Военный', 37: 'Вестерн', 10762: 'Детское'
   };
 
   // Сериальные жанры TMDB → жанры фильмов (вся логика живёт в пространстве жанров фильмов)
   var TV_TO_MOVIE = {
-    10759: [28, 12], 10765: [878, 14], 10768: [10752], 10762: [10751],
+    10759: [28, 12], 10765: [878, 14], 10768: [10752], 10762: [10762],
     10763: [], 10764: [], 10766: [18], 10767: []
   };
 
   var MOVIE_TO_TV = { 28: 10759, 12: 10759, 878: 10765, 14: 10765, 10752: 10768 };
-  var TV_HAS_SAME = [16, 35, 80, 99, 18, 10751, 9648, 37];
+  var TV_HAS_SAME = [16, 35, 80, 99, 18, 10751, 9648, 37, 10762];
 
   function normGenres(ids) {
     var out = [];
@@ -124,7 +124,7 @@
   }
 
   var MOODS = {
-    relax: { title: 'Расслабиться', plus: [35, 10751, 16, 10749, 12], minus: [27, 10752, 53] },
+    relax: { title: 'Расслабиться', plus: [35, 10749, 12, 10402], minus: [27, 10752, 53] },
     laugh: { title: 'Посмеяться', plus: [35], minus: [27, 10752], req: 35 },
     nerves: { title: 'Пощекотать нервы', plus: [53, 27, 9648, 80], minus: [10751, 16] },
     think: { title: 'Подумать', plus: [18, 878, 9648, 36, 99], minus: [10751] },
@@ -329,6 +329,20 @@
     }
     return ['G', 'PG', 'TV-Y', 'TV-Y7', 'TV-G', 'TV-PG'].indexOf(cert.v) > -1;
   }
+
+  // Контент для детей: сериальный жанр «Детское» или возрастной рейтинг ниже 7 лет
+  function kidsTargeted(c) {
+    if ((c.genres || []).indexOf(10762) > -1) return true;
+    var ct = c.cert;
+    if (!ct) return false;
+    if (ct.c === 'RU') {
+      var n = parseInt(ct.v, 10);
+      return !isNaN(n) && n <= 6;
+    }
+    return ['TV-Y', 'TV-Y7', 'TV-Y7-FV'].indexOf(ct.v) > -1;
+  }
+
+  function isAnimated(c) { return (c.genres || []).indexOf(16) > -1; }
 
   function compact(type, d) {
     var kwRaw = (d.keywords && (d.keywords.keywords || d.keywords.results)) || [];
@@ -633,8 +647,35 @@
         if (Math.abs(val) > max) max = Math.abs(val);
       });
       if (max > 0) each(out, function (v, x) { out[x] = v / max; });
+
+      // Жанры центрируем: важно, какие жанры выше среднего у пользователя, а не что «нравится всё»
+      if (t === 'genre') {
+        var keys = Object.keys(out);
+        if (keys.length > 3) {
+          var mean = 0;
+          for (var i = 0; i < keys.length; i++) mean += out[keys[i]];
+          mean /= keys.length;
+          var m2 = 0;
+          for (var j = 0; j < keys.length; j++) {
+            out[keys[j]] -= mean;
+            if (Math.abs(out[keys[j]]) > m2) m2 = Math.abs(out[keys[j]]);
+          }
+          if (m2 > 0) for (var q = 0; q < keys.length; q++) out[keys[q]] /= m2;
+        }
+      }
       profile.f[t] = out;
     });
+
+    // Доля анимации среди того, что нравится: анимация — формат, а не жанр
+    var posW = 0, animW = 0;
+    for (var ai = 0; ai < events.length; ai++) {
+      var ae = events[ai];
+      if (!(ae.s > 0) || !ae.c) continue;
+      var aw = ae.s * decay(ae.date);
+      posW += aw;
+      if (isAnimated(ae.c)) animW += aw;
+    }
+    profile.animShare = posW > 0 ? animW / posW : 0.2;
 
     var seeds = events.filter(function (e) { return e.s > 0.25; });
     seeds.sort(function (a, b) { return b.s * decay(b.date) - a.s * decay(a.date); });
@@ -733,6 +774,8 @@
           var limit = short ? 45 : parseInt(ans.time, 10) + 10;
           if (!isNaN(limit)) p['with_runtime.lte'] = limit;
         }
+        if (type === 'tv' && short) p['with_runtime.lte'] = 35;
+        if (type === 'tv' && ans.time === 'series') p['with_runtime.lte'] = 60;
         if (ans.company === 'kids') p['without_genres'] = type === 'tv' ? '' : '27,10752';
         if (!p['without_genres']) delete p['without_genres'];
 
@@ -833,6 +876,8 @@
       if (c.runtime && c.runtime > 60) return 'too_long';
     }
 
+    if (ans.company !== 'kids' && kidsTargeted(c)) return 'kids_content';
+
     if (ans.company === 'kids') {
       if (!kidsOk(c.cert)) return 'kids_cert';
       if (c.genres.indexOf(27) > -1 || c.genres.indexOf(10752) > -1) return 'kids_genre';
@@ -910,6 +955,7 @@
     }
 
     if (ans.company === 'couple' && c.genres.indexOf(27) > -1 && ans.mood !== 'nerves') m -= 0.1;
+    if (ans.company !== 'kids' && isAnimated(c) && c.genres.indexOf(10751) > -1) m -= 0.4;
 
     return clamp(m, 0, 1);
   }
@@ -942,12 +988,15 @@
   function reasonOf(it, parts, w, profile) {
     var c = it.c;
     if (it.wath) return 'Из вашего списка «Позже»';
-    if (parts.s >= 0.67 && it.seeds.length && it.seeds[0]) return 'Похож на «' + it.seeds[0] + '»';
+    if (it.seedHits >= 1 && it.seeds.length && it.seeds[0]) {
+      if (it.seeds.length > 1) return 'Похож на «' + it.seeds[0] + '» и «' + it.seeds[1] + '»';
+      return 'Похож на «' + it.seeds[0] + '»';
+    }
 
     var contrib = [
       { k: 's', v: Math.max(w.s, 0.25) * parts.s }, // «Похож на» — самое понятное объяснение
       { k: 'a', v: w.a * (parts.a - 0.5) * 2 },
-      { k: 'q', v: w.q * parts.q },
+      { k: 'q', v: w.q * parts.q * 0.5 }, // рейтинг — объяснение последней очереди
       { k: 'n', v: w.n * parts.n }
     ];
     contrib.sort(function (a, b) { return b.v - a.v; });
@@ -997,8 +1046,29 @@
       it.parts = parts;
       it.kp = qq.kp;
       it.imdbR = qq.imdb;
-      it.score = w.q * parts.q + w.a * parts.a + w.m * parts.m + w.n * parts.n + w.s * parts.s;
-      it.reason = reasonOf(it, parts, w, profile);
+    }
+
+    // Совпадение растягиваем на диапазон текущего списка: иначе все в 0,65–0,76 и вклад тонет
+    var minA = 1, maxA = 0;
+    for (var a1 = 0; a1 < items.length; a1++) {
+      var av = items[a1].parts.a;
+      if (av < minA) minA = av;
+      if (av > maxA) maxA = av;
+    }
+    var spread = maxA - minA;
+
+    // Формат: доля анимации у пользователя против формата кандидата
+    var share = typeof profile.animShare === 'number' ? profile.animShare : 0.2;
+
+    for (var k = 0; k < items.length; k++) {
+      var x = items[k];
+      var pt = x.parts;
+      pt.an = spread > 0.04 ? 0.5 * pt.a + 0.5 * (pt.a - minA) / spread : pt.a;
+      var anim = isAnimated(x.c);
+      pt.f = clamp((anim ? share : 1 - share) * 2, 0.25, 1);
+      var base = w.q * pt.q + w.a * pt.an + w.m * pt.m + w.n * pt.n + w.s * pt.s;
+      x.score = base * (0.65 + 0.35 * pt.f);
+      x.reason = reasonOf(x, pt, w, profile);
     }
 
     log('weights', pw.key, 'C', C.toFixed(2));
@@ -1141,7 +1211,8 @@
       kp: it.kp || null,
       imdb: it.imdbR || null,
       score: round3(it.score),
-      q: round3(p.q), a: round3(p.a), m: round3(p.m), n: round3(p.n), s: round3(p.s),
+      q: round3(p.q), a: round3(p.a), an: round3(p.an), m: round3(p.m), n: round3(p.n), s: round3(p.s), f: round3(p.f),
+      anim: isAnimated(c),
       wath: !!it.wath,
       seeds: (it.seeds || []).slice(0, 3),
       reason: it.reason || ''
@@ -1161,6 +1232,7 @@
   function profileSummary(profile) {
     return {
       events: profile.n,
+      animShare: round3(profile.animShare),
       genres: topOf(profile.f.genre, 6, function (g) { return GENRE_NAMES[g]; }),
       dislikedGenres: topOf((function () {
         var neg = {};
@@ -1849,7 +1921,7 @@
       if (isDebug() && it.parts) {
         var p = it.parts;
         h += '<div class="pkr-debug">Q ' + p.q.toFixed(2) + ' · A ' + p.a.toFixed(2) + ' · M ' + p.m.toFixed(2) +
-          ' · N ' + p.n.toFixed(2) + ' · S ' + p.s.toFixed(2) + ' = ' + it.score.toFixed(3) + ' [' + state.wkey + ']</div>';
+          ' · N ' + p.n.toFixed(2) + ' · S ' + p.s.toFixed(2) + ' · An ' + (p.an || 0).toFixed(2) + ' · F ' + (p.f || 0).toFixed(2) + ' = ' + it.score.toFixed(3) + ' [' + state.wkey + ']</div>';
       }
       return h;
     }
