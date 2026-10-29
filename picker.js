@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.5.2';
+  var VERSION = '0.5.3';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -262,6 +262,79 @@
       if (!this.db) return;
       try { this.db.transaction('kv', 'readwrite').objectStore('kv').put(rec, key); } catch (e) {}
     }
+  };
+
+  // =========================================================================
+  // Durable: объёмные данные плагина (журнал, карта КП) — в IndexedDB, не в localStorage.
+  // localStorage общий с Lampa и ограничен ~5 МБ, его не трогаем.
+  // В памяти держится рабочая копия, на диск — с задержкой 2 с.
+  // =========================================================================
+
+  var Durable = {
+    vals: {},
+    loaded: {},
+    waiting: {},
+    timers: {},
+
+    // Однократный перенос старых данных из localStorage
+    takeLegacy: function (key) {
+      try {
+        var raw = window.localStorage && window.localStorage.getItem(NS + key);
+        if (!raw) return null;
+        window.localStorage.removeItem(NS + key);
+        return JSON.parse(raw);
+      } catch (e) { return null; }
+    },
+
+    load: function (key, def, cb) {
+      var self = this;
+      if (self.loaded[key]) { if (cb) cb(self.vals[key]); return; }
+      (self.waiting[key] = self.waiting[key] || []).push(cb);
+      if (self.waiting[key].length > 1) return;
+
+      Cache.get('durable:' + key, Infinity, function (v) {
+        var legacy = self.takeLegacy(key);
+        if ((v === null || v === undefined) && legacy !== null) v = legacy;
+        // Пока грузились, могли что-то записать — не теряем
+        if (self.loaded[key] && Object.prototype.toString.call(self.vals[key]) === '[object Array]' &&
+          Object.prototype.toString.call(v) === '[object Array]') {
+          v = v.concat(self.vals[key]);
+        } else if (self.loaded[key] && self.vals[key] && typeof self.vals[key] === 'object' && v && typeof v === 'object') {
+          v = extend(v, self.vals[key]);
+        }
+        self.vals[key] = (v === null || v === undefined) ? def : v;
+        self.loaded[key] = true;
+        if (legacy !== null) self.flush(key);
+        var w = self.waiting[key] || [];
+        self.waiting[key] = [];
+        for (var i = 0; i < w.length; i++) if (w[i]) w[i](self.vals[key]);
+      });
+    },
+
+    get: function (key, def) {
+      var v = this.vals[key];
+      return v === undefined || v === null ? def : v;
+    },
+
+    set: function (key, val) {
+      var self = this;
+      self.vals[key] = val;
+      if (!self.loaded[key]) self.loaded[key] = true;
+      if (self.timers[key]) return;
+      self.timers[key] = setTimeout(function () { self.flush(key); }, 2000);
+    },
+
+    flush: function (key) {
+      if (this.timers[key]) { clearTimeout(this.timers[key]); this.timers[key] = null; }
+      Cache.set('durable:' + key, this.vals[key]);
+    },
+
+    flushAll: function () {
+      var self = this;
+      each(self.timers, function (t, key) { if (t) self.flush(key); });
+    },
+
+    persistent: function () { return !!Cache.db; }
   };
 
   // =========================================================================
@@ -580,7 +653,23 @@
     return fb;
   }
 
-  function saveFeedback(fb) { save('feedback', fb); }
+  // Обратная связь остаётся в localStorage (нужна синхронно), но с ограничением размера
+  function trimMap(map, max, keepIf) {
+    var keys = Object.keys(map);
+    if (keepIf) for (var i = 0; i < keys.length; i++) if (!keepIf(map[keys[i]])) delete map[keys[i]];
+    keys = Object.keys(map);
+    if (keys.length <= max) return;
+    keys.sort(function (a, b) { return ((map[a] && map[a].t) || 0) - ((map[b] && map[b].t) || 0); });
+    for (var j = 0; j < keys.length - max; j++) delete map[keys[j]];
+  }
+
+  function saveFeedback(fb) {
+    var t = now();
+    trimMap(fb.rejected, 500, function (v) { return v && t - v.t < 90 * DAY; });
+    trimMap(fb.opened, 300);
+    trimMap(fb.seen, 1000);
+    save('feedback', fb);
+  }
 
   function miniCard(c) {
     return {
@@ -1509,6 +1598,9 @@
 
     var events = collect();
 
+    Durable.load('journal', []);
+    Durable.load('kpmap', {});
+    Durable.load('journal', [], function () {
     probeMoods(function () {
     enrichEvents(events, function () {
       if (!alive()) return;
@@ -1575,6 +1667,7 @@
 
         nextBatch();
       });
+    });
     });
     });
   }
@@ -1644,8 +1737,9 @@
 
   var Journal = {
     list: function () {
-      var a = store('journal', []);
-      return Object.prototype.toString.call(a) === '[object Array]' ? a : [];
+      var a = Durable.get('journal', null);
+      if (Object.prototype.toString.call(a) !== '[object Array]') { a = []; Durable.vals.journal = a; }
+      return a;
     },
 
     saveEntry: function (entry) {
@@ -1654,7 +1748,7 @@
       for (var k = 0; k < a.length; k++) if (a[k].id === entry.id) i = k;
       if (i >= 0) a[i] = entry; else a.push(entry);
       while (a.length > JOURNAL_MAX) a.shift();
-      save('journal', a);
+      Durable.set('journal', a);
     },
 
     begin: function (ans, data) {
@@ -1698,7 +1792,7 @@
       this.saveEntry(entry);
     },
 
-    clear: function () { save('journal', []); },
+    clear: function () { Durable.set('journal', []); Durable.flush('journal'); },
 
     // Последний подбор в компактном виде — помещается в одно сообщение мессенджера
     exportLast: function () {
@@ -1872,21 +1966,21 @@
       return cb({ kp: parseFloat(cached.kp) || 0, imdb: parseFloat(cached.imdb) || 0 });
     }
 
-    var map = store('kpmap', {});
+    var map = Durable.get('kpmap', {});
     var m = map[it.k];
     if (m && now() - m.t < 14 * DAY) return cb(m.kp || m.imdb ? { kp: m.kp, imdb: m.imdb } : null);
 
     var finish = function (kp, imdb, kpId) {
       kp = parseFloat(kp) || 0;
       imdb = parseFloat(imdb) || 0;
-      var mp = store('kpmap', {});
+      var mp = Durable.get('kpmap', {});
       mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now() };
       var keys = Object.keys(mp);
       if (keys.length > 1500) {
         keys.sort(function (a, b) { return mp[a].t - mp[b].t; });
         for (var i = 0; i < keys.length - 1500; i++) delete mp[keys[i]];
       }
-      save('kpmap', mp);
+      Durable.set('kpmap', mp);
       if (kp || imdb) {
         writeKpCache(c.id, { kp: kp, imdb: imdb, timestamp: now() });
         cb({ kp: kp, imdb: imdb });
@@ -2671,7 +2765,8 @@
       wrap.append('<div class="pkr-j__title">Журнал подборов</div>');
       wrap.append('<div class="pkr-j__sub">Сессий: ' + list.length + '. ' +
         '«Последний подбор» помещается в одно сообщение (' + lastText.length + ' симв.). ' +
-        '«Весь журнал» сжат (gzip + base64) — для разбора разработчиком. Хранится только на этом устройстве.</div>');
+        '«Весь журнал» сжат (gzip + base64) — для разбора разработчиком. ' +
+        (Durable.persistent() ? 'Хранится только на этом устройстве.' : 'IndexedDB недоступен — журнал живёт до перезапуска.') + '</div>');
 
       var actions = $('<div class="pkr-actions"></div>');
       if (list.length) {
@@ -2857,6 +2952,16 @@
     try { report.manifest = Lampa.Manifest && Lampa.Manifest.origin; } catch (e) {}
     report.hasTmdbKey = !!(Lampa.TMDB && Lampa.TMDB.key);
     report.hasIndexedDB = !!window.indexedDB;
+    report.idbOpened = Durable.persistent();
+    try {
+      var mine = 0, total = 0;
+      for (var li = 0; li < localStorage.length; li++) {
+        var lk = localStorage.key(li), ln = (localStorage.getItem(lk) || '').length;
+        total += ln;
+        if (lk.indexOf(NS) === 0) mine += ln;
+      }
+      report.localStorage = { pluginChars: mine, totalChars: total, totalPctOf5M: Math.round(total / 50000) };
+    } catch (e) {}
     probeMoods(function (ok) { console.log('[Picker] moods endpoint:', ok ? 'доступен' : 'нет', store('moods_probe', {})); });
 
     console.log('[Picker] diag', report);
@@ -2881,6 +2986,12 @@
 
   function init() {
     injectCss();
+    Durable.load('journal', []);
+    Durable.load('kpmap', {});
+    try {
+      window.addEventListener('pagehide', function () { Durable.flushAll(); });
+      document.addEventListener('visibilitychange', function () { if (document.hidden) Durable.flushAll(); });
+    } catch (e) {}
     try { Lampa.Component.add('lampa_picker', PickerComponent); } catch (e) { log('component error', e); }
     addMenu();
     setTimeout(warmup, 30000);
