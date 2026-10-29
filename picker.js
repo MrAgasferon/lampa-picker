@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.3.2';
+  var VERSION = '0.4.0';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -123,13 +123,21 @@
     return null;
   }
 
+  // Вес жанра для настроения: >0 подходит, <0 мешает
   var MOODS = {
-    relax: { title: 'Расслабиться', plus: [35, 10749, 12, 10402], minus: [27, 10752, 53] },
-    laugh: { title: 'Посмеяться', plus: [35], minus: [27, 10752], req: 35 },
-    nerves: { title: 'Пощекотать нервы', plus: [53, 27, 9648, 80], minus: [10751, 16] },
-    think: { title: 'Подумать', plus: [18, 878, 9648, 36, 99], minus: [10751] },
-    surprise: { title: 'Удиви меня', plus: [], minus: [] }
+    relax: { title: 'Расслабиться', w: { 35: 1, 10749: 0.8, 10402: 0.6, 12: 0.4, 14: 0.3, 18: 0.1, 28: -0.3, 9648: -0.3, 80: -0.5, 53: -0.8, 10752: -0.8, 27: -1 } },
+    laugh: { title: 'Посмеяться', w: { 35: 1, 10402: 0.2, 12: 0.1, 18: -0.2, 53: -0.4, 10752: -0.6, 27: -0.6 }, req: 35 },
+    nerves: { title: 'Пощекотать нервы', w: { 53: 1, 27: 1, 9648: 0.8, 80: 0.7, 28: 0.5, 878: 0.3, 35: -0.3, 10749: -0.3, 16: -0.3, 10751: -0.8 } },
+    think: { title: 'Подумать', w: { 99: 1, 18: 0.8, 878: 0.8, 9648: 0.8, 36: 0.8, 10752: 0.5, 80: 0.4, 35: -0.2, 16: -0.2, 10751: -0.6 } },
+    surprise: { title: 'Удиви меня', w: {} }
   };
+
+  function moodPlus(mood, n) {
+    var arr = [];
+    each(mood.w, function (v, g) { if (v > 0) arr.push({ g: parseInt(g, 10), v: v }); });
+    arr.sort(function (a, b) { return b.v - a.v; });
+    return arr.slice(0, n).map(function (x) { return x.g; });
+  }
 
   var GROUP_PLUS = [35, 28, 12, 27];
 
@@ -315,9 +323,9 @@
     }
 
     var ru = pick('RU');
-    if (ru) return { c: 'RU', v: ru };
     var us = pick('US');
-    if (us) return { c: 'US', v: us };
+    if (ru) return { c: 'RU', v: ru, ru: ru, us: us };
+    if (us) return { c: 'US', v: us, ru: null, us: us };
     return null;
   }
 
@@ -335,22 +343,117 @@
     if ((c.genres || []).indexOf(10762) > -1) return true;
     var ct = c.cert;
     if (!ct) return false;
-    if (ct.c === 'RU') {
-      var n = parseInt(ct.v, 10);
-      return !isNaN(n) && n <= 6;
-    }
-    return ['TV-Y', 'TV-Y7', 'TV-Y7-FV'].indexOf(ct.v) > -1;
+    if (ct.us && ['TV-Y', 'TV-Y7', 'TV-Y7-FV'].indexOf(ct.us) > -1) return true;
+    var n = parseInt(ct.ru || '', 10);
+    return !isNaN(n) && n <= 6;
   }
 
-  // 18+: жёсткий контент, неуместный для «расслабиться» и «посмеяться»
+  // 18+: жёсткий контент. Американский рейтинг надёжнее: российский 18+ в TMDB часто стоит у безобидных фильмов
   function adultRated(c) {
     var ct = c.cert;
     if (!ct) return false;
-    if (ct.c === 'RU') {
-      var n = parseInt(ct.v, 10);
-      return !isNaN(n) && n >= 18;
+    if (ct.us) return ['R', 'NC-17', 'TV-MA'].indexOf(ct.us) > -1;
+    var n = parseInt(ct.ru || '', 10);
+    return !isNaN(n) && n >= 18;
+  }
+
+  // =========================================================================
+  // Шкалы настроения (amodb через прокси ByLampa, если доступно)
+  // =========================================================================
+
+  var MOOD_ALIASES = {
+    fear: ['fear', 'scary', 'horror', 'страх', 'тревож'],
+    humor: ['humor', 'humour', 'funny', 'comedy', 'юмор', 'смеш'],
+    sadness: ['sad', 'грус', 'печал'],
+    violence: ['violen', 'gore', 'blood', 'насили', 'жесто', 'агресс'],
+    action: ['action', 'экшн', 'динами'],
+    pace: ['pace', 'tempo', 'темп'],
+    profanity: ['profan', 'swear', 'language', 'брань', 'лексик', 'мат'],
+    tension: ['tension', 'suspense', 'tense', 'напряж'],
+    romance: ['roman', 'love', 'романт', 'любов']
+  };
+
+  // Формат ответа не задокументирован — собираем все числовые шкалы 0–10 (или 0–100) на глубине до 3
+  function parseMoods(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var flat = {};
+    var walk = function (o, depth, prefix) {
+      if (!o || depth > 3) return;
+      if (Object.prototype.toString.call(o) === '[object Array]') {
+        for (var i = 0; i < o.length; i++) {
+          var e = o[i];
+          if (e && typeof e === 'object') {
+            var name = e.name || e.key || e.mood || e.title || e.id;
+            var val = e.value !== undefined ? e.value : (e.score !== undefined ? e.score : e.rating);
+            if (name && typeof val === 'number') flat[String(name).toLowerCase()] = val;
+            else walk(e, depth + 1, prefix);
+          }
+        }
+        return;
+      }
+      each(o, function (v, k) {
+        if (typeof v === 'number') flat[(prefix + k).toLowerCase()] = v;
+        else if (v && typeof v === 'object') walk(v, depth + 1, k + '.');
+      });
+    };
+    walk(raw, 0, '');
+
+    var out = {}, found = 0;
+    var max = 0;
+    each(flat, function (v) { if (v > max) max = v; });
+    var scale = max > 10 ? 10 : 1; // проценты → 0–10
+    each(MOOD_ALIASES, function (al, key) {
+      each(flat, function (v, name) {
+        if (out[key] !== undefined) return;
+        for (var i = 0; i < al.length; i++) {
+          if (name.indexOf(al[i]) > -1 && name.indexOf('id') !== 0) { out[key] = clamp(v / scale, 0, 10); found++; return; }
+        }
+      });
+    });
+    return found ? out : null;
+  }
+
+  var MoodsApi = { state: null };
+
+  // Пробный запрос раз в сутки: отдаёт ли прокси пользователя эндпоинт /moods
+  function probeMoods(cb) {
+    var cached = store('moods_probe', {});
+    if (cached.day === todaySeed() && typeof cached.ok === 'boolean') {
+      MoodsApi.state = cached.ok;
+      return cb(cached.ok);
     }
-    return ['R', 'NC-17', 'TV-MA'].indexOf(ct.v) > -1;
+    tmdb('movie/550/moods', {}, DAY, function (raw) {
+      var parsed = parseMoods(raw);
+      var ok = !!parsed;
+      MoodsApi.state = ok;
+      save('moods_probe', { day: todaySeed(), ok: ok, sample: raw ? JSON.stringify(raw).slice(0, 600) : null });
+      log('moods probe', ok, raw);
+      cb(ok);
+    });
+  }
+
+  function mv(c, key) {
+    return c.moods && typeof c.moods[key] === 'number' ? c.moods[key] : null;
+  }
+
+  // Оценка соответствия настроению по шкалам; null — данных нет
+  function moodFromScales(c, ans) {
+    if (!c.moods) return null;
+    var f = mv(c, 'fear'), h = mv(c, 'humor'), sd = mv(c, 'sadness'), v = mv(c, 'violence'),
+      a = mv(c, 'action'), t = mv(c, 'tension'), r = mv(c, 'romance'), pr = mv(c, 'profanity');
+    var z = function (x) { return x === null ? 0 : x; };
+    var m = null;
+
+    if (ans.mood === 'relax') m = 1 - 0.09 * z(f) - 0.07 * z(v) - 0.05 * z(t) - 0.04 * z(sd) + 0.04 * z(h) + 0.03 * z(r);
+    else if (ans.mood === 'laugh') m = (h === null ? 0.5 : h / 10 * 1.2) - 0.04 * z(f) - 0.03 * z(sd);
+    else if (ans.mood === 'nerves') m = Math.max(z(f), z(t)) / 10 * 0.85 + z(a) / 10 * 0.25;
+    else if (ans.mood === 'think') m = 0.75 - 0.05 * z(a) - 0.04 * z(h) + 0.03 * z(sd);
+    else return null;
+
+    if ((ans.company === 'couple' || ans.company === 'group') && (ans.mood === 'relax' || ans.mood === 'laugh')) {
+      m -= 0.02 * z(pr) + 0.02 * z(v);
+    }
+    return clamp(m, 0, 1);
   }
 
   function isAnimated(c) { return (c.genres || []).indexOf(16) > -1; }
@@ -392,6 +495,8 @@
       names: names,
       lang: d.original_language || '',
       cert: certOf(type, d),
+      moods: d.moods ? parseMoods(d.moods) : null,
+      moodsRaw: d.moods ? JSON.stringify(d.moods).slice(0, 400) : null,
       coll: d.belongs_to_collection ? d.belongs_to_collection.id : null,
       imdb: (d.external_ids && d.external_ids.imdb_id) || d.imdb_id || null,
       va: d.vote_average || 0,
@@ -416,6 +521,7 @@
     var append = type === 'movie'
       ? 'keywords,credits,release_dates,external_ids'
       : 'keywords,credits,content_ratings,external_ids';
+    if (MoodsApi.state === true) append += ',moods';
     tmdb(type + '/' + id, { append_to_response: append }, 30 * DAY, function (d) {
       cb(d && d.id ? compact(type, d) : null);
     });
@@ -766,7 +872,7 @@
     // 2. Discover по жанрам профиля (холодный старт — по жанрам настроения)
     var genres = topGenres(profile, 3, true);
     var mood = MOODS[ans.mood];
-    if (genres.length < 2 && mood && mood.plus.length) genres = uniq(genres.concat(mood.plus.slice(0, 3)));
+    if (genres.length < 2 && mood) genres = uniq(genres.concat(moodPlus(mood, 3)));
     if (!genres.length) genres = [35, 18, 878];
 
     var short = ans.time === '40';
@@ -890,6 +996,7 @@
     if (ans.company !== 'kids' && kidsTargeted(c)) return 'kids_content';
 
     if (ans.company === 'kids') {
+      if (c.moods && ((mv(c, 'fear') || 0) > 6 || (mv(c, 'violence') || 0) > 5 || (mv(c, 'profanity') || 0) > 3)) return 'kids_moods';
       if (!kidsOk(c.cert)) return 'kids_cert';
       if (c.genres.indexOf(27) > -1 || c.genres.indexOf(10752) > -1) return 'kids_genre';
     }
@@ -950,29 +1057,39 @@
     var mood = MOODS[ans.mood];
     var m = 0.5;
 
-    if (mood && (mood.plus.length || mood.minus.length)) {
-      var has = false;
-      for (var i = 0; i < mood.plus.length; i++) if (c.genres.indexOf(mood.plus[i]) > -1) has = true;
-      m = has ? 1 : 0.2;
-      if (mood.req && c.genres.indexOf(mood.req) < 0) m = 0;
-      for (var j = 0; j < mood.minus.length; j++) if (c.genres.indexOf(mood.minus[j]) > -1) m -= 0.5;
+    var hasW = false;
+    if (mood) each(mood.w, function () { hasW = true; });
+    if (hasW) {
+      var maxPos = 0, neg = 0;
+      for (var i = 0; i < c.genres.length; i++) {
+        var gw = mood.w[c.genres[i]];
+        if (gw === undefined) continue;
+        if (gw > maxPos) maxPos = gw;
+        if (gw < 0) neg += gw;
+      }
+      m = 0.3 + 0.7 * maxPos + 0.5 * neg;
+      if (mood.req && c.genres.indexOf(mood.req) < 0) m = Math.min(m, 0.15);
     }
 
     if (ans.company === 'group') {
       var fun = false;
       for (var g = 0; g < GROUP_PLUS.length; g++) if (c.genres.indexOf(GROUP_PLUS[g]) > -1) fun = true;
-      if (fun) m += 0.3;
-      else if (c.genres.indexOf(18) > -1) m -= 0.3;
+      if (fun) m += 0.2;
+      else if (c.genres.indexOf(18) > -1) m -= 0.2;
     }
 
-    if (ans.company === 'couple' && c.genres.indexOf(27) > -1 && ans.mood !== 'nerves') m -= 0.1;
     if (ans.company !== 'kids' && isAnimated(c) && c.genres.indexOf(10751) > -1) m -= 0.4;
-    if ((ans.mood === 'relax' || ans.mood === 'laugh') && adultRated(c)) m -= 0.5;
-    if (ans.company === 'couple' && adultRated(c) && ans.mood !== 'nerves' && ans.mood !== 'think') m -= 0.15;
+    if ((ans.mood === 'relax' || ans.mood === 'laugh') && adultRated(c)) m -= 0.25;
+    if (ans.company === 'couple' && adultRated(c) && ans.mood !== 'nerves' && ans.mood !== 'think') m -= 0.1;
+
+    m = clamp(m, 0, 1);
+
+    // Если есть шкалы настроения — они точнее жанров
+    var scaled = moodFromScales(c, ans);
+    if (scaled !== null) m = 0.65 * scaled + 0.35 * m;
 
     return clamp(m, 0, 1);
   }
-
   function novelty(c, profile) {
     var n = 0;
     var f = featuresOf(c);
@@ -1081,8 +1198,11 @@
       pt.f = clamp((anim ? share : 1 - share) * 2, 0.25, 1);
       // Смотрят не одни: доля анимации у пользователя ничего не говорит о вкусе второго зрителя
       if (anim && (ans.company === 'couple' || ans.company === 'group')) pt.f *= 0.6;
-      var base = w.q * pt.q + w.a * pt.an + w.m * pt.m + w.n * pt.n + w.s * pt.s;
-      x.score = base * (0.65 + 0.35 * pt.f);
+      // Настроение — множитель: «Позже» или высокий рейтинг не вытащат фильм, который не подходит под запрос
+      var rest = 1 - w.m;
+      var base = (w.q * pt.q + w.a * pt.an + w.n * pt.n + w.s * pt.s) / (rest > 0 ? rest : 1);
+      var moodGate = w.m > 0 ? 0.35 + 0.65 * pt.m : 1;
+      x.score = base * moodGate * (0.65 + 0.35 * pt.f);
       x.reason = reasonOf(x, pt, w, profile);
     }
 
@@ -1157,6 +1277,7 @@
 
     var events = collect();
 
+    probeMoods(function () {
     enrichEvents(events, function () {
       if (!alive()) return;
       var profile = buildProfile(events);
@@ -1192,7 +1313,7 @@
             profile: profile, wkey: wkey, cold: profile.n < 5
           };
           st.journal = Journal.begin(ans, {
-            wkey: wkey, ms: now() - started,
+            wkey: wkey, ms: now() - started, moods: MoodsApi.state,
             counts: { events: events.length, profile: profile.n, pool: Object.keys(pool).length, prefiltered: list.length, detailed: top.length, final: finalList.length },
             dropped: stats,
             profile: profileSummary(profile),
@@ -1201,6 +1322,7 @@
           if (h.done) h.done(st);
         });
       });
+    });
     });
   }
 
@@ -1228,7 +1350,8 @@
       score: round3(it.score),
       q: round3(p.q), a: round3(p.a), an: round3(p.an), m: round3(p.m), n: round3(p.n), s: round3(p.s), f: round3(p.f),
       anim: isAnimated(c),
-      cert: c.cert ? c.cert.c + ':' + c.cert.v : null,
+      cert: c.cert ? [c.cert.ru ? 'RU:' + c.cert.ru : '', c.cert.us ? 'US:' + c.cert.us : ''].filter(Boolean).join(' ') : null,
+      moods: c.moods || null,
       wath: !!it.wath,
       seeds: (it.seeds || []).slice(0, 3),
       reason: it.reason || ''
@@ -1328,7 +1451,8 @@
         exported: new Date().toISOString(),
         sessions: a.length,
         ua: (navigator.userAgent || '').slice(0, 120),
-        kpQuotaToday: kpQuota().n
+        kpQuotaToday: kpQuota().n,
+        moodsProbe: store('moods_probe', {})
       };
       var lines = [JSON.stringify(head)];
       for (var i = 0; i < a.length; i++) lines.push(JSON.stringify(a[i]));
@@ -1634,6 +1758,11 @@
     '.pkr-b--kp{background:#ff6a00;color:#fff}',
     '.pkr-b--imdb{background:#f5c518;color:#111}',
     '.pkr-b--text{background:none;padding-left:0;padding-right:.2em;font-weight:400;opacity:.75}',
+    '.pkr-moods{margin-top:.5em;line-height:1}',
+    '.pkr-mood{display:inline-block;margin:0 1.1em .4em 0;font-size:.82em;vertical-align:middle}',
+    '.pkr-mood i{font-style:normal;opacity:.7;margin-right:.45em;vertical-align:middle}',
+    '.pkr-mood b{display:inline-block;width:3.6em;height:.35em;border-radius:.2em;background:rgba(255,255,255,.15);vertical-align:middle;overflow:hidden}',
+    '.pkr-mood b span{display:block;height:100%;background:#ffd166;border-radius:.2em}',
     '.pkr-hero__reason{margin-top:.55em;font-size:1.08em;color:#ffd166;line-height:1.35}',
     '.pkr-hero__reason svg{width:1.05em;height:1.05em;vertical-align:-.12em;margin-right:.45em}',
     '.pkr-hero__descr{margin-top:.6em;opacity:.75;line-height:1.45;max-height:2.9em;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}',
@@ -1930,6 +2059,19 @@
       if (g) meta += '<span class="pkr-b pkr-b--text">' + esc(g) + '</span>';
       h += '<div class="pkr-hero__meta">' + meta + '</div>';
 
+      if (c.moods) {
+        var labels = { humor: 'Юмор', romance: 'Романтика', fear: 'Страх', tension: 'Напряжение', violence: 'Насилие', sadness: 'Грусть', action: 'Экшн', pace: 'Темп', profanity: 'Брань' };
+        var sc = [];
+        each(labels, function (lbl, key) { if (typeof c.moods[key] === 'number') sc.push({ l: lbl, v: c.moods[key] }); });
+        sc.sort(function (a, b) { return b.v - a.v; });
+        if (sc.length) {
+          var bars = '';
+          for (var si = 0; si < Math.min(4, sc.length); si++) {
+            bars += '<span class="pkr-mood"><i>' + esc(sc[si].l) + '</i><b><span style="width:' + Math.round(sc[si].v * 10) + '%"></span></b></span>';
+          }
+          h += '<div class="pkr-moods">' + bars + '</div>';
+        }
+      }
       if (it.reason) h += '<div class="pkr-hero__reason">' + svg('sparkle') + esc(it.reason) + '</div>';
       var descr = c.card && c.card.overview;
       if (descr) h += '<div class="pkr-hero__descr">' + esc(descr) + '</div>';
@@ -2351,6 +2493,7 @@
     try { report.manifest = Lampa.Manifest && Lampa.Manifest.origin; } catch (e) {}
     report.hasTmdbKey = !!(Lampa.TMDB && Lampa.TMDB.key);
     report.hasIndexedDB = !!window.indexedDB;
+    probeMoods(function (ok) { console.log('[Picker] moods endpoint:', ok ? 'доступен' : 'нет', store('moods_probe', {})); });
 
     console.log('[Picker] diag', report);
     tmdb('movie/27205', {}, 0, function (d) {
