@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.1.0';
+  var VERSION = '0.2.0';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -1022,113 +1022,89 @@
   // Конвейер
   // =========================================================================
 
-  var running = false;
+  var runToken = 0;
 
-  function loading(on) {
-    try {
-      if (on && Lampa.Loading) Lampa.Loading.start(function () { running = false; Lampa.Loading.stop(); });
-      else if (Lampa.Loading) Lampa.Loading.stop();
-    } catch (e) {}
-    if (on && !(window.Lampa && Lampa.Loading)) noty('Подбираю…');
-  }
+  function cancelRun() { runToken++; }
 
-  function run(ans) {
-    if (running) return;
-    running = true;
-    save('last_answers', ans);
-    loading(true);
-
+  // h: { stage(text), done(state) }
+  function run(ans, h) {
+    h = h || {};
+    var token = ++runToken;
+    var alive = function () { return token === runToken; };
+    var stage = function (t) { if (h.stage && alive()) h.stage(t); };
     var started = now();
+
+    save('last_answers', ans);
+    stage('Изучаю вашу историю');
+
     var events = collect();
 
     enrichEvents(events, function () {
-      if (!running) return;
+      if (!alive()) return;
       var profile = buildProfile(events);
+      stage('Ищу кандидатов');
 
       gatherPool(profile, events, ans, function (pool) {
-        if (!running) return;
+        if (!alive()) return;
         var list = prefilter(pool, events, ans);
 
         // Предоценка по полям списка, детали — только для топ-60
-        var tmp = list.map(function (it) {
-          return { it: it, c: cardCompact(it.r || {}) };
-        });
-        var light = tmp.map(function (x) {
-          x.it.c = x.c;
-          return x.it;
-        });
-        scoreAll(light, profile, ans);
-        light.sort(function (a, b) { return b.score - a.score; });
-        var top = light.slice(0, 60);
+        for (var i = 0; i < list.length; i++) list[i].c = cardCompact(list[i].r || {});
+        scoreAll(list, profile, ans);
+        list.sort(function (a, b) { return b.score - a.score; });
+        var top = list.slice(0, 60);
+        stage('Сравниваю ' + top.length + ' вариантов');
 
         detailsMany(top, function () {
-          if (!running) return;
+          if (!alive()) return;
           var finalList = top.filter(function (it) { return postfilter(it, ans); });
           var wkey = scoreAll(finalList, profile, ans);
           jitter(finalList);
 
-          running = false;
-          loading(false);
-
           log('events', events.length, 'profile.n', profile.n, 'pool', Object.keys(pool).length,
             'prefiltered', list.length, 'final', finalList.length, 'ms', now() - started);
 
-          if (!finalList.length) {
-            noty('Ничего не нашлось под эти условия. Попробуйте «Неважно» по времени.');
-            return;
-          }
-          if (profile.n < 5) noty('Истории пока мало — подбор в основном по рейтингу и настроению');
-
-          showResults({ ans: ans, rest: finalList, shown: [], profile: profile, wkey: wkey, page: [] });
+          if (h.done) h.done({
+            ans: ans, rest: finalList, shown: [], page: [],
+            profile: profile, wkey: wkey, cold: profile.n < 5
+          });
         });
       });
     });
   }
 
   // =========================================================================
-  // Интерфейс
+  // Интерфейс: справочники, иконки, стили
   // =========================================================================
 
-  function toContent() {
-    try { Lampa.Controller.toggle('content'); } catch (e) {}
-  }
-
-  function select(title, items, onSelect, onBack) {
-    Lampa.Select.show({
-      title: title,
-      items: items,
-      onSelect: function (a) {
-        try { Lampa.Select.close(); } catch (e) {}
-        setTimeout(function () { onSelect(a); }, 30);
-      },
-      onBack: function () {
-        if (onBack) onBack(); else toContent();
-      }
-    });
-  }
-
   var TIME_ITEMS = [
-    { title: 'До 40 минут', value: '40' },
-    { title: 'До 1,5 часа', value: '90' },
-    { title: 'До 2 часов', value: '120' },
-    { title: 'Сериал на вечер', value: 'series' },
-    { title: 'Неважно', value: 'any' }
+    { title: 'До 40 минут', hint: 'Короткий метр или пара серий', value: '40', icon: 'stopwatch' },
+    { title: 'До 1,5 часа', hint: 'Один фильм без спешки', value: '90', icon: 'film' },
+    { title: 'До 2 часов', hint: 'Полный метр', value: '120', icon: 'hourglass' },
+    { title: 'Сериал на вечер', hint: 'Несколько серий подряд', value: 'series', icon: 'tv' },
+    { title: 'Неважно', hint: 'Без ограничений', value: 'any', icon: 'infinity' }
   ];
 
   var MOOD_ITEMS = [
-    { title: 'Расслабиться', value: 'relax' },
-    { title: 'Посмеяться', value: 'laugh' },
-    { title: 'Пощекотать нервы', value: 'nerves' },
-    { title: 'Подумать', value: 'think' },
-    { title: 'Удиви меня', value: 'surprise' },
-    { title: 'Неважно', value: 'any' }
+    { title: 'Расслабиться', hint: 'Лёгкое и тёплое', value: 'relax', icon: 'sun' },
+    { title: 'Посмеяться', hint: 'Комедии', value: 'laugh', icon: 'smile' },
+    { title: 'Пощекотать нервы', hint: 'Триллеры и детективы', value: 'nerves', icon: 'bolt' },
+    { title: 'Подумать', hint: 'Драмы и фантастика', value: 'think', icon: 'bulb' },
+    { title: 'Удиви меня', hint: 'То, что вы обычно не смотрите', value: 'surprise', icon: 'sparkle' },
+    { title: 'Неважно', hint: 'Только по вкусу', value: 'any', icon: 'dots' }
   ];
 
   var COMPANY_ITEMS = [
-    { title: 'Один', value: 'solo' },
-    { title: 'Вдвоём', value: 'couple' },
-    { title: 'С детьми', value: 'kids' },
-    { title: 'Компанией', value: 'group' }
+    { title: 'Один', hint: 'Только мой вкус', value: 'solo', icon: 'user' },
+    { title: 'Вдвоём', hint: 'На двоих', value: 'couple', icon: 'couple' },
+    { title: 'С детьми', hint: 'Рейтинг до 12+', value: 'kids', icon: 'kids' },
+    { title: 'Компанией', hint: 'Чтобы зашло всем', value: 'group', icon: 'group' }
+  ];
+
+  var STEPS = [
+    { key: 'time', q: 'Сколько есть времени?', items: TIME_ITEMS },
+    { key: 'mood', q: 'Какое настроение?', items: MOOD_ITEMS },
+    { key: 'company', q: 'С кем смотрите?', items: COMPANY_ITEMS }
   ];
 
   function titleOf(items, v) {
@@ -1136,101 +1112,585 @@
     return v;
   }
 
-  function describe(ans) {
-    return [titleOf(TIME_ITEMS, ans.time), titleOf(MOOD_ITEMS, ans.mood), titleOf(COMPANY_ITEMS, ans.company)].join(' · ');
+  function describeList(ans) {
+    var out = [];
+    if (ans.time) out.push(titleOf(TIME_ITEMS, ans.time));
+    if (ans.mood) out.push(titleOf(MOOD_ITEMS, ans.mood));
+    if (ans.company) out.push(titleOf(COMPANY_ITEMS, ans.company));
+    return out;
   }
 
-  function wizard() {
-    var ans = {};
-    select('Сколько есть времени?', TIME_ITEMS, function (a) {
-      ans.time = a.value;
-      select('Какое настроение?', MOOD_ITEMS, function (b) {
-        ans.mood = b.value;
-        select('С кем смотрите?', COMPANY_ITEMS, function (c) {
-          ans.company = c.value;
-          run(ans);
-        });
-      });
+  var ICONS = {
+    stopwatch: '<circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 1.5M9 2h6"/>',
+    film: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/>',
+    hourglass: '<path d="M6 3h12M6 21h12M7 3v3a5 5 0 0 0 10 0V3M7 21v-3a5 5 0 0 1 10 0v3"/>',
+    tv: '<rect x="3" y="7" width="18" height="12" rx="2"/><path d="M8 3l4 4 4-4"/>',
+    infinity: '<path d="M7 9a3 3 0 1 0 0 6c2 0 3-1.5 5-3s3-3 5-3a3 3 0 1 1 0 6c-2 0-3-1.5-5-3S9 9 7 9z"/>',
+    sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+    smile: '<circle cx="12" cy="12" r="9"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9.5h.01M15 9.5h.01"/>',
+    bolt: '<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>',
+    bulb: '<path d="M9 18h6M10 22h4M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/>',
+    sparkle: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/>',
+    dots: '<circle cx="12" cy="12" r="9"/><path d="M8 12h.01M12 12h.01M16 12h.01"/>',
+    user: '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/>',
+    couple: '<circle cx="9" cy="8" r="3.5"/><circle cx="16.5" cy="9" r="3"/><path d="M2 20c0-3.5 3-5.5 7-5.5s7 2 7 5.5M16.5 14.5c3 0 5.5 1.5 5.5 5"/>',
+    kids: '<circle cx="8" cy="7" r="3.5"/><circle cx="17" cy="11" r="2.5"/><path d="M2 20c0-3.5 2.5-5.5 6-5.5s6 2 6 5.5M13.5 20c0-2.5 1.5-4 3.5-4s3.5 1.5 3.5 4"/>',
+    group: '<circle cx="12" cy="7" r="3"/><circle cx="5" cy="10" r="2.5"/><circle cx="19" cy="10" r="2.5"/><path d="M6 20c0-3.5 2.7-5.5 6-5.5s6 2 6 5.5M1 19c0-2.5 1.8-4 4-4M23 19c0-2.5-1.8-4-4-4"/>',
+    play: '<path d="M7 4l13 8-13 8z" fill="currentColor"/>',
+    close: '<path d="M6 6l12 12M18 6L6 18"/>',
+    check: '<path d="M4 12l5 5L20 6"/>',
+    refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>',
+    sliders: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
+    search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/>',
+    star: '<path d="M12 2l2.9 6.26L21.5 9l-5 4.73L17.8 21 12 17.27 6.2 21l1.3-7.27L2.5 9l6.6-.74L12 2z"/>'
+  };
+
+  function svg(name, cls) {
+    return '<svg class="' + (cls || '') + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+      'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + (ICONS[name] || '') + '</svg>';
+  }
+
+  function esc(s) {
+    return String(s === undefined || s === null ? '' : s).replace(/[&<>"]/g, function (ch) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch];
     });
   }
 
-  function start() {
-    var last = store('last_answers', null);
-    if (last && last.time) {
-      select('Что посмотреть', [
-        { title: 'Как в прошлый раз', subtitle: describe(last), value: 'last' },
-        { title: 'Новый подбор', value: 'new' }
-      ], function (a) {
-        if (a.value === 'last') run(last); else wizard();
-      });
-    } else wizard();
+  function img(path, size) {
+    if (!path) return '';
+    try {
+      if (Lampa.TMDB && typeof Lampa.TMDB.image === 'function') return Lampa.TMDB.image('t/p/' + size + path);
+    } catch (e) {}
+    return 'https://image.tmdb.org/t/p/' + size + path;
   }
+
+  var CSS = [
+    '.pkr{position:relative;padding:1.5em 2em 4em;color:#fff;min-height:100%}',
+    '.pkr *{box-sizing:border-box}',
+    '.pkr svg{display:inline-block}',
+
+    /* Мастер */
+    '.pkr-step{font-size:.8em;letter-spacing:.18em;text-transform:uppercase;opacity:.5}',
+    '.pkr-dots{margin-top:.7em;line-height:0}',
+    '.pkr-dots span{display:inline-block;width:2.4em;height:.25em;border-radius:.2em;background:rgba(255,255,255,.18);margin-right:.4em;transition:background-color .3s}',
+    '.pkr-dots span.on{background:#fff}',
+    '.pkr-q{font-size:2.4em;font-weight:700;line-height:1.15;margin:.55em 0 .25em}',
+    '.pkr-sub{opacity:.5;margin-bottom:1.6em;min-height:1.3em}',
+    '.pkr-tiles{margin:0 -.5em}',
+    '.pkr-tile{display:inline-block;vertical-align:top;width:12em;min-height:10em;margin:0 .5em 1em;padding:1.3em 1.2em 1.25em;border-radius:1em;',
+    'background:rgba(255,255,255,.07);border:.15em solid rgba(255,255,255,.05);transition:transform .15s ease,background-color .15s ease,color .15s ease}',
+    '.pkr-tile svg{width:2.3em;height:2.3em;margin-bottom:.9em;opacity:.9}',
+    '.pkr-tile__title{font-size:1.2em;font-weight:600;line-height:1.2}',
+    '.pkr-tile__hint{font-size:.82em;opacity:.55;margin-top:.4em;line-height:1.3}',
+    '.pkr-tile.is-chosen{border-color:rgba(255,255,255,.45)}',
+    '.pkr-tile.focus{background:#fff;color:#111;transform:scale(1.05)}',
+    '.pkr-tile.focus .pkr-tile__hint{opacity:.65}',
+    '.pkr-last{display:inline-block;margin:0 0 1.8em;padding:.65em 1.3em .65em 1em;border-radius:2em;background:rgba(255,255,255,.09);transition:background-color .15s,color .15s}',
+    '.pkr-last svg{width:1.25em;height:1.25em;vertical-align:middle;margin-right:.6em}',
+    '.pkr-last span{vertical-align:middle}',
+    '.pkr-last b{font-weight:600;margin-right:.6em}',
+    '.pkr-last i{font-style:normal;opacity:.6}',
+    '.pkr-last.focus{background:#fff;color:#111}',
+
+    /* Чипы ответов */
+    '.pkr-chips{line-height:1}',
+    '.pkr-chip{display:inline-block;padding:.4em .85em;border-radius:2em;background:rgba(255,255,255,.12);font-size:.82em;margin:0 .4em .4em 0}',
+
+    /* Загрузка */
+    '.pkr-load__title{font-size:2.2em;font-weight:700;margin-top:.4em}',
+    '.pkr-load__stage{opacity:.55;margin:.5em 0 2.2em;min-height:1.4em}',
+    '.pkr-skel{background:rgba(255,255,255,.06);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,.09) 50%,rgba(255,255,255,0) 100%);',
+    'background-size:200% 100%;background-repeat:no-repeat;-webkit-animation:pkrShimmer 1.3s infinite linear;animation:pkrShimmer 1.3s infinite linear}',
+    '.pkr-skel-line{height:.8em;border-radius:.3em;margin-top:.8em;width:75%}',
+    '.pkr-skel-line.short{width:45%;margin-top:.45em}',
+    '@-webkit-keyframes pkrShimmer{0%{background-position:150% 0}100%{background-position:-50% 0}}',
+    '@keyframes pkrShimmer{0%{background-position:150% 0}100%{background-position:-50% 0}}',
+
+    /* Результаты */
+    '.pkr-res{position:relative}',
+    '.pkr-bg{position:absolute;left:-2em;right:-2em;top:-1.5em;height:32em;z-index:0;overflow:hidden;',
+    '-webkit-mask-image:linear-gradient(to bottom,#000 40%,transparent 100%);mask-image:linear-gradient(to bottom,#000 40%,transparent 100%)}',
+    '.pkr-bg__img{position:absolute;left:0;top:0;right:0;bottom:0;background-size:cover;background-position:center 25%;opacity:0;transition:opacity .45s ease}',
+    '.pkr-bg__img.on{opacity:.5}',
+    '.pkr-bg__shade{position:absolute;left:0;top:0;right:0;bottom:0;background:linear-gradient(90deg,rgba(0,0,0,.88) 0%,rgba(0,0,0,.55) 45%,rgba(0,0,0,.15) 100%)}',
+    '.pkr-content{position:relative;z-index:1}',
+    '.pkr-hero{min-height:13.5em;padding:1em 0 0;max-width:44em}',
+    '.pkr-hero__title{font-size:2.6em;font-weight:700;line-height:1.1;text-shadow:0 .1em .5em rgba(0,0,0,.5)}',
+    '.pkr-hero__orig{opacity:.55;margin-top:.35em}',
+    '.pkr-hero__meta{margin-top:.9em;line-height:1}',
+    '.pkr-b{display:inline-block;padding:.32em .6em;border-radius:.4em;background:rgba(255,255,255,.15);font-size:.85em;font-weight:600;margin:0 .45em .45em 0;vertical-align:middle;white-space:nowrap}',
+    '.pkr-b--match{background:#21c063;color:#062a12}',
+    '.pkr-b--kp{background:#ff6a00;color:#fff}',
+    '.pkr-b--imdb{background:#f5c518;color:#111}',
+    '.pkr-b--text{background:none;padding-left:0;padding-right:.2em;font-weight:400;opacity:.75}',
+    '.pkr-hero__reason{margin-top:.55em;font-size:1.08em;color:#ffd166;line-height:1.35}',
+    '.pkr-hero__reason svg{width:1.05em;height:1.05em;vertical-align:-.12em;margin-right:.45em}',
+    '.pkr-hero__descr{margin-top:.6em;opacity:.75;line-height:1.45;max-height:2.9em;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}',
+    '.pkr-debug{margin-top:.6em;font-family:monospace;font-size:.78em;opacity:.55}',
+    '.pkr-note{font-size:.82em;opacity:.5;margin:.2em 0 .8em}',
+
+    '.pkr-row{margin:0 -.55em;padding-top:.6em;white-space:nowrap;font-size:1em}',
+    '.pkr-card{display:inline-block;vertical-align:top;width:14.2%;padding:0 .55em;white-space:normal}',
+    '.pkr-card__img{position:relative;padding-bottom:150%;border-radius:.7em;background-color:rgba(255,255,255,.06);background-size:cover;background-position:center;',
+    'box-shadow:0 .4em 1.2em rgba(0,0,0,.45);transition:transform .18s ease,opacity .25s ease}',
+    '.pkr-card__img:after{content:"";position:absolute;left:0;top:0;right:0;bottom:0;border-radius:.7em;border:.2em solid transparent;transition:border-color .15s}',
+    '.pkr-card.is-active .pkr-card__img:after{border-color:rgba(255,255,255,.4)}',
+    '.pkr-card.focus .pkr-card__img{transform:scale(1.06)}',
+    '.pkr-card.focus .pkr-card__img:after{border-color:#fff}',
+    '.pkr-card.is-gone .pkr-card__img{opacity:0;transform:scale(.9)}',
+    '.pkr-card__num{position:absolute;left:.45em;top:.45em;width:1.7em;height:1.7em;line-height:1.7em;text-align:center;border-radius:50%;background:rgba(0,0,0,.7);font-weight:700;font-size:.8em}',
+    '.pkr-card__rate{position:absolute;right:.45em;top:.45em;padding:.2em .45em;border-radius:.35em;background:rgba(0,0,0,.72);font-size:.78em;font-weight:700}',
+    '.pkr-card__type{position:absolute;left:.45em;bottom:.45em;padding:.2em .5em;border-radius:.35em;background:rgba(0,0,0,.72);font-size:.68em;text-transform:uppercase;letter-spacing:.06em}',
+    '.pkr-card__noimg{position:absolute;left:0;top:0;right:0;bottom:0;padding:1em;display:-webkit-box;display:flex;-webkit-box-align:center;align-items:center;-webkit-box-pack:center;justify-content:center;text-align:center;font-weight:600;opacity:.6}',
+    '.pkr-card__name{margin-top:.65em;font-size:.95em;font-weight:600;line-height:1.25;max-height:2.5em;overflow:hidden}',
+    '.pkr-card__year{font-size:.8em;opacity:.5;margin-top:.2em}',
+
+    '.pkr-actions{margin:1.2em 0 1.4em}','.pkr-actions--footer{margin:1.4em 0 0}','.pkr-btn--ghost{background:none;opacity:.75}','.pkr-btn--ghost.focus{opacity:1}',
+    '.pkr-btn{display:inline-block;padding:.75em 1.3em;border-radius:.6em;background:rgba(255,255,255,.14);margin:0 .6em .6em 0;font-weight:600;transition:transform .15s,background-color .15s,color .15s}',
+    '.pkr-btn svg{width:1.15em;height:1.15em;vertical-align:-.2em;margin-right:.55em}',
+    '.pkr-btn--primary{background:rgba(255,255,255,.92);color:#111}',
+    '.pkr-btn.focus{background:#fff;color:#111;transform:scale(1.04)}',
+    '.pkr-btn--primary.focus{background:#ffd166}',
+
+    /* Пусто */
+    '.pkr-empty{padding:4em 0 2em;text-align:center}',
+    '.pkr-empty svg{width:4em;height:4em;opacity:.35;margin-bottom:1em}',
+    '.pkr-empty__title{font-size:1.7em;font-weight:700}',
+    '.pkr-empty__text{opacity:.55;margin:.6em auto 1.8em;max-width:30em;line-height:1.4}',
+
+    /* Телефон */
+    '@media (max-width: 767px){',
+    '.pkr{padding:1em 1em 4em}',
+    '.pkr-q{font-size:1.7em}',
+    '.pkr-tiles{margin:0 -.35em}',
+    '.pkr-tile{width:-webkit-calc(50% - .7em);width:calc(50% - .7em);margin:0 .35em .7em;padding:1em .9em}',
+    '.pkr-tile svg{width:1.9em;height:1.9em;margin-bottom:.6em}',
+    '.pkr-tile__title{font-size:1.05em}',
+    '.pkr-bg{left:-1em;right:-1em;top:-1em;height:24em}',
+    '.pkr-hero{min-height:0;padding-top:.6em}',
+    '.pkr-hero__title{font-size:1.75em}',
+    '.pkr-hero__descr{max-height:4.35em;-webkit-line-clamp:3}',
+    '.pkr-row{margin:0 -1em;padding:.7em .65em .4em;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}',
+    '.pkr-card{width:38%;padding:0 .35em}',
+    '.pkr-btn{padding:.65em .9em;margin:0 .4em .5em 0;font-size:.92em}','.pkr-actions{margin:1em 0 1.2em}',
+    '}'
+  ].join('');
+
+  function injectCss() {
+    if (document.getElementById('pkr-style')) return;
+    var st = document.createElement('style');
+    st.id = 'pkr-style';
+    st.textContent = CSS;
+    document.head.appendChild(st);
+  }
+
+  // =========================================================================
+  // Экран подборщика (компонент Lampa)
+  // =========================================================================
 
   function runtimeText(c) {
     if (!c.runtime) return '';
-    if (c.type === 'tv') return 'серия ' + c.runtime + ' мин';
+    if (c.type === 'tv') return 'серия ~' + c.runtime + ' мин';
     var h = Math.floor(c.runtime / 60), m = c.runtime % 60;
-    return h ? (h + ' ч ' + (m ? m + ' мин' : '')).trim() : m + ' мин';
+    return h ? (h + ' ч' + (m ? ' ' + m + ' мин' : '')) : m + ' мин';
   }
 
-  function itemTitle(it) {
-    var c = it.c;
-    var rating = it.kp ? 'КП ' + it.kp.toFixed(1) : (c.va ? '★ ' + c.va.toFixed(1) : '');
-    return c.title + (c.year ? ' (' + c.year + ')' : '') + (rating ? ' · ' + rating : '');
-  }
-
-  function itemSubtitle(it, debug) {
-    var parts = [];
-    if (it.c.type === 'tv') parts.push('Сериал');
-    var rt = runtimeText(it.c);
-    if (rt) parts.push(rt);
-    if (it.reason) parts.push(it.reason);
-    if (debug && it.parts) {
-      var p = it.parts;
-      parts.push('[Q' + p.q.toFixed(2) + ' A' + p.a.toFixed(2) + ' M' + p.m.toFixed(2) +
-        ' N' + p.n.toFixed(2) + ' S' + p.s.toFixed(2) + ' = ' + it.score.toFixed(3) + ']');
+  function genresText(c) {
+    var out = [];
+    for (var i = 0; i < c.genres.length && out.length < 3; i++) {
+      if (GENRE_NAMES[c.genres[i]]) out.push(GENRE_NAMES[c.genres[i]]);
     }
-    return parts.join(' · ');
+    return out.join(', ');
   }
 
-  function showResults(state) {
-    if (!state.page.length) state.page = nextPage(state, 5);
-    var debug = isDebug();
-
-    var items = state.page.map(function (it, i) {
-      return { title: itemTitle(it), subtitle: itemSubtitle(it, debug), value: 'item', index: i };
-    });
-
-    if (state.rest.length) items.push({ title: 'Ещё варианты', value: 'more' });
-    items.push({ title: 'Изменить ответы', value: 'restart' });
-
-    select('Подборка: ' + describe(state.ans), items, function (a) {
-      if (a.value === 'more') { state.page = nextPage(state, 5); showResults(state); }
-      else if (a.value === 'restart') wizard();
-      else itemActions(state, state.page[a.index]);
-    });
+  function shortRating(it) {
+    if (it.kp) return it.kp.toFixed(1);
+    if (it.c.va) return it.c.va.toFixed(1);
+    return '';
   }
 
-  function itemActions(state, it) {
-    select(itemTitle(it), [
-      { title: 'Открыть', value: 'open' },
-      { title: 'Не то', subtitle: 'Не показывать 90 дней', value: 'reject' },
-      { title: 'Уже видел', value: 'seen' },
-      { title: 'Назад к подборке', value: 'back' }
-    ], function (a) {
+  function PickerComponent(object) {
+    var self = this;
+    var html = $('<div class="pkr-root"></div>');
+    var body = $('<div class="pkr"></div>');
+    var scroll = null;
+    var last = null;          // последний элемент в фокусе
+    var view = 'wizard';      // wizard | loading | results | empty
+    var step = 0;
+    var ans = {};
+    var state = null;
+    var current = null;       // карточка, показанная в блоке описания
+    var heroEl, bgA, bgB, bgFront = 0, cardEls = [];
+    var stageEl = null;
+
+    // ---- служебное
+
+    function focusable() { return scroll ? scroll.render() : html; }
+
+    function refresh(target) {
+      if (target) last = target.jquery ? target[0] : target;
+      try {
+        var en = Lampa.Controller.enabled();
+        if (en && en.name === 'content') {
+          Lampa.Controller.collectionSet(focusable());
+          Lampa.Controller.collectionFocus(last || false, focusable());
+        }
+      } catch (e) {}
+    }
+
+    function bindFocus(el, onFocus) {
+      el.on('hover:focus', function () {
+        last = el[0];
+        try { if (scroll) scroll.update(el, true); } catch (e) {}
+        if (onFocus) onFocus();
+      });
+    }
+
+    function setBody(node) {
+      body.empty().append(node);
+      try { if (scroll) scroll.reset && scroll.reset(); } catch (e) {}
+    }
+
+    // ---- мастер
+
+    function renderWizard(n) {
+      view = 'wizard';
+      step = n;
+      var def = STEPS[n];
+      var wrap = $('<div class="pkr-wizard"></div>');
+
+      var dots = '';
+      for (var i = 0; i < STEPS.length; i++) dots += '<span class="' + (i <= n ? 'on' : '') + '"></span>';
+
+      wrap.append('<div class="pkr-step">Что посмотреть · шаг ' + (n + 1) + ' из ' + STEPS.length + '</div>');
+      wrap.append('<div class="pkr-dots">' + dots + '</div>');
+      wrap.append('<div class="pkr-q">' + esc(def.q) + '</div>');
+
+      var chosen = describeList(ans).slice(0, n);
+      var sub = $('<div class="pkr-sub"></div>');
+      if (chosen.length) {
+        var chips = $('<div class="pkr-chips"></div>');
+        for (var c = 0; c < chosen.length; c++) chips.append('<span class="pkr-chip">' + esc(chosen[c]) + '</span>');
+        sub.append(chips);
+      }
+      wrap.append(sub);
+
+      var focusEl = null;
+
+      if (n === 0) {
+        var prev = store('last_answers', null);
+        if (prev && prev.time && prev.mood && prev.company) {
+          var lastBtn = $('<div class="pkr-last selector">' + svg('refresh') +
+            '<span><b>Как в прошлый раз</b><i>' + esc(describeList(prev).join(' · ')) + '</i></span></div>');
+          lastBtn.on('hover:enter', function () { ans = extend(prev, {}); startRun(); });
+          bindFocus(lastBtn);
+          wrap.append(lastBtn);
+        }
+      }
+
+      var tiles = $('<div class="pkr-tiles"></div>');
+      for (var t = 0; t < def.items.length; t++) {
+        (function (item) {
+          var tile = $('<div class="pkr-tile selector">' + svg(item.icon) +
+            '<div class="pkr-tile__title">' + esc(item.title) + '</div>' +
+            (item.hint ? '<div class="pkr-tile__hint">' + esc(item.hint) + '</div>' : '') + '</div>');
+          if (ans[def.key] === item.value) { tile.addClass('is-chosen'); focusEl = tile; }
+          tile.on('hover:enter', function () {
+            ans[def.key] = item.value;
+            if (n < STEPS.length - 1) renderWizard(n + 1);
+            else startRun();
+          });
+          bindFocus(tile);
+          tiles.append(tile);
+          if (!focusEl && t === 0) focusEl = tile;
+        })(def.items[t]);
+      }
+      wrap.append(tiles);
+
+      setBody(wrap);
+      refresh(focusEl);
+    }
+
+    // ---- загрузка
+
+    function renderLoading() {
+      view = 'loading';
+      var wrap = $('<div class="pkr-loading"></div>');
+      var chips = $('<div class="pkr-chips"></div>');
+      var d = describeList(ans);
+      for (var i = 0; i < d.length; i++) chips.append('<span class="pkr-chip">' + esc(d[i]) + '</span>');
+      wrap.append(chips);
+      wrap.append('<div class="pkr-load__title">Подбираю для вас</div>');
+      stageEl = $('<div class="pkr-load__stage"></div>');
+      wrap.append(stageEl);
+
+      var row = $('<div class="pkr-row"></div>');
+      for (var k = 0; k < 5; k++) {
+        row.append('<div class="pkr-card"><div class="pkr-card__img pkr-skel"></div>' +
+          '<div class="pkr-skel pkr-skel-line"></div><div class="pkr-skel pkr-skel-line short"></div></div>');
+      }
+      wrap.append(row);
+      setBody(wrap);
+      last = null;
+      refresh();
+    }
+
+    function startRun() {
+      renderLoading();
+      run(ans, {
+        stage: function (t) { if (stageEl) stageEl.text(t + '…'); },
+        done: function (st) {
+          state = st;
+          if (!state.rest.length) return renderEmpty();
+          state.page = nextPage(state, 5);
+          current = state.page[0];
+          renderResults(0);
+        }
+      });
+    }
+
+    // ---- результаты
+
+    function heroHtml(it) {
+      var c = it.c;
+      var h = '<div class="pkr-hero__title">' + esc(c.title) + '</div>';
+      var orig = [];
+      if (c.original && c.original !== c.title) orig.push(esc(c.original));
+      if (c.year) orig.push(c.year);
+      if (orig.length) h += '<div class="pkr-hero__orig">' + orig.join(' · ') + '</div>';
+
+      var meta = '';
+      if (!state.cold && it.parts) meta += '<span class="pkr-b pkr-b--match">Совпадение ' + Math.round(it.parts.a * 100) + '%</span>';
+      if (c.va) meta += '<span class="pkr-b">TMDB ' + c.va.toFixed(1) + '</span>';
+      if (it.kp) meta += '<span class="pkr-b pkr-b--kp">КП ' + it.kp.toFixed(1) + '</span>';
+      if (it.imdbR) meta += '<span class="pkr-b pkr-b--imdb">IMDb ' + it.imdbR.toFixed(1) + '</span>';
+      if (c.type === 'tv') meta += '<span class="pkr-b">Сериал</span>';
+      var rt = runtimeText(c);
+      if (rt) meta += '<span class="pkr-b pkr-b--text">' + rt + '</span>';
+      var g = genresText(c);
+      if (g) meta += '<span class="pkr-b pkr-b--text">' + esc(g) + '</span>';
+      h += '<div class="pkr-hero__meta">' + meta + '</div>';
+
+      if (it.reason) h += '<div class="pkr-hero__reason">' + svg('sparkle') + esc(it.reason) + '</div>';
+      var descr = c.card && c.card.overview;
+      if (descr) h += '<div class="pkr-hero__descr">' + esc(descr) + '</div>';
+
+      if (isDebug() && it.parts) {
+        var p = it.parts;
+        h += '<div class="pkr-debug">Q ' + p.q.toFixed(2) + ' · A ' + p.a.toFixed(2) + ' · M ' + p.m.toFixed(2) +
+          ' · N ' + p.n.toFixed(2) + ' · S ' + p.s.toFixed(2) + ' = ' + it.score.toFixed(3) + ' [' + state.wkey + ']</div>';
+      }
+      return h;
+    }
+
+    function setBackdrop(it) {
+      var path = it && it.c.card && (it.c.card.backdrop_path || it.c.card.poster_path);
+      var url = img(path, 'w1280');
+      var next = bgFront ? bgA : bgB;
+      var prevEl = bgFront ? bgB : bgA;
+      if (!url) { bgA.removeClass('on'); bgB.removeClass('on'); return; }
+
+      var im = new Image();
+      im.onload = function () {
+        if (current !== it) return;
+        next.css('background-image', 'url("' + url + '")').addClass('on');
+        prevEl.removeClass('on');
+        bgFront = bgFront ? 0 : 1;
+      };
+      im.src = url;
+    }
+
+    function setCurrent(it) {
+      if (!it) return;
+      current = it;
+      heroEl.html(heroHtml(it));
+      for (var i = 0; i < cardEls.length; i++) cardEls[i].toggleClass('is-active', state.page[i] === it);
+      setBackdrop(it);
+    }
+
+    function cardEl(it, idx) {
+      var c = it.c;
+      var poster = img(c.card && c.card.poster_path, 'w342');
+      var rate = shortRating(it);
+      var el = $('<div class="pkr-card selector">' +
+        '<div class="pkr-card__img"' + (poster ? ' style="background-image:url(\'' + poster + '\')"' : '') + '>' +
+        (poster ? '' : '<div class="pkr-card__noimg">' + esc(c.title) + '</div>') +
+        '<div class="pkr-card__num">' + (idx + 1) + '</div>' +
+        (rate ? '<div class="pkr-card__rate">' + rate + '</div>' : '') +
+        (c.type === 'tv' ? '<div class="pkr-card__type">Сериал</div>' : '') +
+        '</div>' +
+        '<div class="pkr-card__name">' + esc(c.title) + '</div>' +
+        '<div class="pkr-card__year">' + esc([c.year, runtimeText(c)].filter(Boolean).join(' · ')) + '</div>' +
+        '</div>');
+
+      bindFocus(el, function () { if (current !== it) setCurrent(it); });
+      el.on('hover:enter', function () {
+        // ТВ: фокус уже выбрал карточку — открываем. Телефон: первый тап выбирает, второй открывает.
+        if (current === it) openCard(it);
+        else setCurrent(it);
+      });
+      return el;
+    }
+
+    function button(icon, text, cls, fn) {
+      var b = $('<div class="pkr-btn selector ' + (cls || '') + '">' + svg(icon) + '<span>' + esc(text) + '</span></div>');
+      b.on('hover:enter', fn);
+      bindFocus(b);
+      return b;
+    }
+
+    function renderResults(focusIdx) {
+      view = 'results';
+      if (!state.page.length) return renderEmpty();
+      if (state.page.indexOf(current) < 0) current = state.page[0];
+
+      var wrap = $('<div class="pkr-res"></div>');
+      var bg = $('<div class="pkr-bg"><div class="pkr-bg__img"></div><div class="pkr-bg__img"></div><div class="pkr-bg__shade"></div></div>');
+      bgA = bg.find('.pkr-bg__img').eq(0);
+      bgB = bg.find('.pkr-bg__img').eq(1);
+      bgFront = 0;
+      wrap.append(bg);
+
+      var actions = $('<div class="pkr-actions"></div>');
+      actions.append(button('play', 'Открыть', 'pkr-btn--primary', function () { if (current) openCard(current); }));
+      actions.append(button('close', 'Не то', '', function () { dismiss('reject'); }));
+      actions.append(button('check', 'Уже видел', '', function () { dismiss('seen'); }));
+
+      var footer = $('<div class="pkr-actions pkr-actions--footer"></div>');
+      if (state.rest.length) footer.append(button('refresh', 'Ещё варианты', 'pkr-btn--ghost', function () {
+        state.page = nextPage(state, 5);
+        current = state.page[0];
+        renderResults(0);
+      }));
+      footer.append(button('sliders', 'Изменить ответы', 'pkr-btn--ghost', function () {
+        ans = extend(state.ans, {});
+        renderWizard(0);
+      }));
+
+      var content = $('<div class="pkr-content"></div>');
+      var chips = $('<div class="pkr-chips"></div>');
+      var d = describeList(state.ans);
+      for (var i = 0; i < d.length; i++) chips.append('<span class="pkr-chip">' + esc(d[i]) + '</span>');
+      content.append(chips);
+
+      heroEl = $('<div class="pkr-hero"></div>');
+      content.append(heroEl);
+      content.append(actions);
+
+      if (state.cold) content.append('<div class="pkr-note">Истории просмотров пока мало — подбор в основном по рейтингу и настроению</div>');
+
+      var row = $('<div class="pkr-row"></div>');
+      cardEls = [];
+      for (var k = 0; k < state.page.length; k++) {
+        var ce = cardEl(state.page[k], k);
+        cardEls.push(ce);
+        row.append(ce);
+      }
+      content.append(row);
+      content.append(footer);
+
+      wrap.append(content);
+      setBody(wrap);
+      setCurrent(current);
+
+      var fi = typeof focusIdx === 'number' ? Math.min(focusIdx, cardEls.length - 1) : state.page.indexOf(current);
+      refresh(cardEls[fi < 0 ? 0 : fi]);
+    }
+
+    function dismiss(kind) {
+      if (!current) return;
+      var it = current;
+      var idx = state.page.indexOf(it);
       var fb = feedback();
-      if (a.value === 'open') {
-        fb.opened[it.k] = { t: now(), card: miniCard(it.c) };
-        saveFeedback(fb);
-        openCard(it);
-      } else if (a.value === 'reject' || a.value === 'seen') {
-        if (a.value === 'reject') fb.rejected[it.k] = { t: now(), card: miniCard(it.c) };
-        else fb.seen[it.k] = { t: now(), card: miniCard(it.c) };
-        saveFeedback(fb);
+      if (kind === 'reject') fb.rejected[it.k] = { t: now(), card: miniCard(it.c) };
+      else fb.seen[it.k] = { t: now(), card: miniCard(it.c) };
+      saveFeedback(fb);
+      noty(kind === 'reject' ? 'Скрыто на 90 дней' : 'Отмечено как просмотренное');
+
+      if (cardEls[idx]) cardEls[idx].addClass('is-gone');
+      setTimeout(function () {
         replaceInPage(state, it);
-        showResults(state);
-      } else showResults(state);
-    }, function () { showResults(state); });
+        current = state.page[Math.min(idx, state.page.length - 1)];
+        renderResults(idx);
+      }, 220);
+    }
+
+    function renderEmpty() {
+      view = 'empty';
+      var wrap = $('<div class="pkr-empty">' + svg('search') +
+        '<div class="pkr-empty__title">Под эти условия ничего не нашлось</div>' +
+        '<div class="pkr-empty__text">Чаще всего мешает ограничение по времени или режим «С детьми» — у многих фильмов нет возрастного рейтинга.</div></div>');
+      var actions = $('<div class="pkr-actions"></div>');
+      if (ans.time && ans.time !== 'any') {
+        actions.append(button('infinity', 'Без ограничения по времени', 'pkr-btn--primary', function () {
+          ans.time = 'any';
+          startRun();
+        }));
+      }
+      actions.append(button('sliders', 'Изменить ответы', '', function () { renderWizard(0); }));
+      wrap.append(actions);
+      setBody(wrap);
+      refresh(actions.find('.selector').eq(0));
+    }
+
+    // ---- жизненный цикл компонента
+
+    this.create = function () {
+      injectCss();
+      try {
+        scroll = new Lampa.Scroll({ mask: true, over: true });
+        scroll.append(body);
+        html.append(scroll.render());
+      } catch (e) {
+        scroll = null;
+        html.append(body);
+      }
+      if (this.activity && this.activity.loader) this.activity.loader(false);
+
+      var preset = object && object.answers;
+      if (preset && preset.time && preset.mood && preset.company) { ans = extend(preset, {}); startRun(); }
+      else renderWizard(0);
+
+      return this.render();
+    };
+
+    this.start = function () {
+      Lampa.Controller.add('content', {
+        link: self,
+        toggle: function () {
+          Lampa.Controller.collectionSet(focusable());
+          Lampa.Controller.collectionFocus(last || false, focusable());
+        },
+        left: function () {
+          if (Navigator.canmove('left')) Navigator.move('left');
+          else Lampa.Controller.toggle('menu');
+        },
+        right: function () { Navigator.move('right'); },
+        up: function () {
+          if (Navigator.canmove('up')) Navigator.move('up');
+          else Lampa.Controller.toggle('head');
+        },
+        down: function () { if (Navigator.canmove('down')) Navigator.move('down'); },
+        back: function () { self.back(); }
+      });
+      Lampa.Controller.toggle('content');
+    };
+
+    this.back = function () {
+      if (view === 'wizard' && step > 0) return renderWizard(step - 1);
+      if (view === 'loading') { cancelRun(); return renderWizard(STEPS.length - 1); }
+      Lampa.Activity.backward();
+    };
+
+    this.pause = function () {};
+    this.stop = function () {};
+    this.render = function () { return html; };
+
+    this.destroy = function () {
+      cancelRun();
+      try { if (scroll) scroll.destroy(); } catch (e) {}
+      html.remove();
+    };
   }
 
   function replaceInPage(state, it) {
@@ -1242,14 +1702,27 @@
   }
 
   function openCard(it) {
-    var card = it.c.card || { id: it.id };
+    var fb = feedback();
+    fb.opened[it.k] = { t: now(), card: miniCard(it.c) };
+    saveFeedback(fb);
+
     Lampa.Activity.push({
       url: '',
       component: 'full',
       id: it.id,
       method: it.type,
-      card: card,
+      card: it.c.card || { id: it.id },
       source: 'tmdb'
+    });
+  }
+
+  function openPicker(answers) {
+    Lampa.Activity.push({
+      url: '',
+      title: 'Что посмотреть',
+      component: 'lampa_picker',
+      answers: answers || null,
+      page: 1
     });
   }
 
@@ -1267,7 +1740,7 @@
       var item = $('<li class="menu__item selector" data-action="picker">' +
         '<div class="menu__ico">' + ICON + '</div>' +
         '<div class="menu__text">Что посмотреть</div></li>');
-      item.on('hover:enter', start);
+      item.on('hover:enter', function () { openPicker(); });
       $('.menu .menu__list').eq(0).append(item);
     } catch (e) { log('menu error', e); }
   }
@@ -1310,7 +1783,7 @@
 
   window.LampaPicker = {
     version: VERSION,
-    start: start,
+    start: openPicker,
     run: run,
     diag: diag,
     collect: collect,
@@ -1319,6 +1792,8 @@
   };
 
   function init() {
+    injectCss();
+    try { Lampa.Component.add('lampa_picker', PickerComponent); } catch (e) { log('component error', e); }
     addMenu();
     setTimeout(warmup, 30000);
     log('ready', VERSION);
