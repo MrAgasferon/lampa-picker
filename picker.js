@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.5.1';
+  var VERSION = '0.5.2';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -1700,6 +1700,87 @@
 
     clear: function () { save('journal', []); },
 
+    // Последний подбор в компактном виде — помещается в одно сообщение мессенджера
+    exportLast: function () {
+      var a = this.list();
+      var e = a[a.length - 1];
+      if (!e) return '';
+      var r2 = function (x) { return typeof x === 'number' ? Math.round(x * 100) / 100 : x; };
+      var short = function (t, n) { t = String(t || ''); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
+      var flags = function (it) {
+        var f = '';
+        if (it.anim) f += 'A';
+        if (it.wath) f += 'W';
+        if (it.coll) f += 'C';
+        return f;
+      };
+      var c = e.counts || {};
+      var p = e.profile || {};
+      var out = {
+        f: 'LPJ-last',
+        v: e.v,
+        at: e.at,
+        ans: e.answers,
+        wk: e.wkey,
+        ms: e.ms,
+        mood: e.moods ? 1 : 0,
+        kpq: kpQuota().n,
+        cnt: [c.events, c.pool, c.prefiltered, c.detailed, c.final],
+        src: e.sources,
+        dr: e.dropped,
+        pr: {
+          an: p.animShare, yf: p.yearFloor,
+          g: (p.genres || []).slice(0, 6),
+          dg: (p.dislikedGenres || []).slice(0, 3),
+          s: (p.seeds || []).slice(0, 5).map(function (x) { return short(x, 22); })
+        },
+        // t, год, тип, источник, флаги, score, q, an, m, n, s, f, y, tmdb, голоса, kp, imdb, cert, стр/поз, причина
+        sh: (e.shown || []).map(function (it) {
+          return [short(it.title, 28), it.year, it.k ? it.k.charAt(0) : '', it.src || '', flags(it),
+            r2(it.score), r2(it.q), r2(it.an), r2(it.m), r2(it.n), r2(it.s), r2(it.f), r2(it.y),
+            it.tmdb, it.votes, it.kp ? r2(it.kp) : 0, it.imdb ? r2(it.imdb) : 0,
+            it.cert || '', it.page + '/' + it.pos, short(it.reason, 34)];
+        }),
+        act: (e.actions || []).map(function (x) {
+          var row = [x.sec, x.act];
+          if (x.title) row.push(short(x.title, 22));
+          if (x.act === 'more') row.push(x.opened ? 1 : 0);
+          return row;
+        })
+      };
+      // Лимит сообщения Telegram — 4096 символов: сначала убираем причины, потом самые ранние показы
+      var txt = JSON.stringify(out);
+      if (txt.length > 3900) {
+        for (var i = 0; i < out.sh.length; i++) out.sh[i][19] = '';
+        txt = JSON.stringify(out);
+      }
+      while (txt.length > 3900 && out.sh.length > 5) {
+        out.sh.shift();
+        out.cut = (out.cut || 0) + 1;
+        txt = JSON.stringify(out);
+      }
+      return txt;
+    },
+
+    // Весь журнал, сжатый gzip + base64. Возвращает Promise со строкой или null, если сжатие недоступно
+    exportPacked: function () {
+      var text = this.exportText();
+      if (typeof CompressionStream === 'undefined' || typeof Blob === 'undefined' || typeof Response === 'undefined') {
+        return Promise.resolve(null);
+      }
+      try {
+        var stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+        return new Response(stream).arrayBuffer().then(function (buf) {
+          var bytes = new Uint8Array(buf);
+          var bin = '';
+          for (var i = 0; i < bytes.length; i += 0x8000) {
+            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+          }
+          return 'LPJ1:' + btoa(bin);
+        })['catch'](function () { return null; });
+      } catch (e) { return Promise.resolve(null); }
+    },
+
     exportText: function () {
       var a = this.list();
       var head = {
@@ -1745,20 +1826,6 @@
       }
     } catch (e) {}
     legacy();
-  }
-
-  function downloadText(name, text) {
-    try {
-      var blob = new Blob([text], { type: 'application/x-ndjson' });
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement('a');
-      a.href = url;
-      a.download = name;
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(function () { URL.revokeObjectURL(url); document.body.removeChild(a); }, 1500);
-      return true;
-    } catch (e) { return false; }
   }
 
   function canShare() { return !!(navigator.share); }
@@ -2024,8 +2091,8 @@
     '.pkr-hero__reason svg{width:1.05em;height:1.05em;vertical-align:-.12em;margin-right:.45em}',
     '.pkr-hero__descr{margin-top:.6em;border-radius:.5em;transition:background-color .15s}',
     '.pkr-hero__text{opacity:.75;line-height:1.45;max-height:2.9em;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}',
-    '.pkr-hero__more{display:none;font-size:.8em;font-weight:600;color:#ffd166;margin-top:.25em}',
-    '.pkr-hero__descr.is-long .pkr-hero__more{display:block}',
+    '.pkr-hero__more{display:none;font-size:.85em;font-weight:600;color:#ffd166;margin-top:.35em;padding:.5em .9em;border-radius:2em;background:rgba(255,209,102,.12)}',
+    '.pkr-hero__descr.is-long .pkr-hero__more{display:inline-block}',
     '.pkr-hero__descr.is-long{cursor:pointer;margin-left:-.5em;margin-right:-.5em;padding:.3em .5em}',
     '.pkr-hero__descr.is-open .pkr-hero__text{max-height:none;display:block;-webkit-line-clamp:unset;opacity:.9}',
     '.pkr-hero__descr.focus{background:rgba(255,255,255,.1)}',
@@ -2083,6 +2150,7 @@
     '.pkr-hero{min-height:0;padding-top:.6em}',
     '.pkr-hero__title{font-size:1.75em}',
     '.pkr-hero__text{max-height:4.35em;-webkit-line-clamp:3}',
+    '.pkr-hero__more{min-height:44px;line-height:28px;padding:8px 18px;margin-top:.5em;box-sizing:border-box}',
     '.pkr-row{margin:0 -1em;padding:.7em .65em .4em;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}',
     '.pkr-card{width:38%;padding:0 .35em}',
     '.pkr-btn{padding:.65em .9em;margin:0 .4em .5em 0;font-size:.92em}','.pkr-actions{margin:1em 0 1.2em}',
@@ -2337,7 +2405,7 @@
       }
       if (it.reason) h += '<div class="pkr-hero__reason">' + svg('sparkle') + esc(it.reason) + '</div>';
       var descr = c.card && c.card.overview;
-      if (descr) h += '<div class="pkr-hero__descr"><div class="pkr-hero__text">' + esc(descr) + '</div><div class="pkr-hero__more">Читать полностью</div></div>';
+      if (descr) h += '<div class="pkr-hero__descr"><div class="pkr-hero__text">' + esc(descr) + '</div><div class="pkr-hero__more"><span>Читать полностью</span> ▾</div></div>';
 
       if (isDebug() && it.parts) {
         var p = it.parts;
@@ -2371,12 +2439,18 @@
       var t = d.find('.pkr-hero__text')[0];
       if (!t || t.scrollHeight <= t.clientHeight + 2) return;
       d.addClass('is-long selector');
-      d.on('hover:enter', function () {
+      var lastToggle = 0;
+      var toggle = function () {
+        // Lampa на сенсорных экранах может прислать и hover:enter, и click — второй игнорируем
+        if (now() - lastToggle < 400) return;
+        lastToggle = now();
         var open = !d.hasClass('is-open');
         d.toggleClass('is-open', open);
-        d.find('.pkr-hero__more').text(open ? 'Свернуть' : 'Читать полностью');
+        d.find('.pkr-hero__more').html('<span>' + (open ? 'Свернуть' : 'Читать полностью') + '</span> ' + (open ? '▴' : '▾'));
         if (state) Journal.action(state.journal, open ? 'descr_open' : 'descr_close', current);
-      });
+      };
+      d.on('hover:enter', toggle);
+      d.on('click', toggle);
       bindFocus(d);
       try {
         var en = Lampa.Controller.enabled();
@@ -2590,29 +2664,34 @@
       view = 'journal';
       var list = Journal.list();
       var text = Journal.exportText();
-      var kb = Math.max(1, Math.round(text.length / 1024));
+      var lastText = Journal.exportLast();
 
       var wrap = $('<div class="pkr-journal"></div>');
       wrap.append('<div class="pkr-step">Что посмотреть</div>');
       wrap.append('<div class="pkr-j__title">Журнал подборов</div>');
-      wrap.append('<div class="pkr-j__sub">Сессий: ' + list.length + ' · около ' + kb + ' КБ. ' +
-        'Внутри ответы, профиль вкуса, причины отсева, показанные фильмы с разбивкой оценки и ваши действия. ' +
-        'Хранится только на этом устройстве.</div>');
+      wrap.append('<div class="pkr-j__sub">Сессий: ' + list.length + '. ' +
+        '«Последний подбор» помещается в одно сообщение (' + lastText.length + ' симв.). ' +
+        '«Весь журнал» сжат (gzip + base64) — для разбора разработчиком. Хранится только на этом устройстве.</div>');
 
       var actions = $('<div class="pkr-actions"></div>');
-      actions.append(button('copy', 'Скопировать', 'pkr-btn--primary', function () {
-        copyText(Journal.exportText(), function () { noty('Журнал скопирован: ' + list.length + ' сессий'); },
-          function () { noty('Не удалось скопировать — попробуйте «Скачать» или «Поделиться»'); });
-      }));
-      if (canShare()) actions.append(button('share', 'Поделиться', '', function () {
-        try {
-          navigator.share({ title: 'Журнал подборщика Lampa', text: Journal.exportText() })['catch'](function () {});
-        } catch (e) { noty('Поделиться не получилось'); }
-      }));
-      actions.append(button('download', 'Скачать файл', '', function () {
-        var ok = downloadText('lampa-picker-journal-' + todaySeed() + '.jsonl', Journal.exportText());
-        noty(ok ? 'Файл сохранён' : 'Скачивание недоступно на этом устройстве');
-      }));
+      if (list.length) {
+        actions.append(button('copy', 'Последний подбор', 'pkr-btn--primary', function () {
+          copyText(Journal.exportLast(), function () { noty('Скопировано: последний подбор'); },
+            function () { noty('Не удалось скопировать в буфер'); });
+        }));
+        actions.append(button('copy', 'Весь журнал (сжато)', '', function () {
+          Journal.exportPacked().then(function (packed) {
+            if (!packed) return noty('Сжатие не поддерживается на этом устройстве — используйте «Последний подбор»');
+            copyText(packed, function () { noty('Скопировано: ' + list.length + ' сессий, ' + packed.length + ' симв.'); },
+              function () { noty('Не удалось скопировать в буфер'); });
+          });
+        }));
+        if (canShare()) actions.append(button('share', 'Поделиться', '', function () {
+          try {
+            navigator.share({ title: 'Журнал подборщика Lampa', text: Journal.exportLast() })['catch'](function () {});
+          } catch (e) { noty('Поделиться не получилось'); }
+        }));
+      }
       actions.append(button('trash', 'Очистить', 'pkr-btn--ghost', function () {
         Journal.clear();
         noty('Журнал очищен');
@@ -2795,6 +2874,8 @@
     collect: collect,
     debug: function (on) { save('debug', on !== false); return isDebug(); },
     journal: function () { var t = Journal.exportText(); console.log(t); return t; },
+    journalLast: function () { return Journal.exportLast(); },
+    journalPacked: function () { return Journal.exportPacked(); },
     reset: function () { save('feedback', {}); save('seen', {}); save('last_answers', null); return 'reset'; }
   };
 
