@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.3.1';
+  var VERSION = '0.3.2';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -340,6 +340,17 @@
       return !isNaN(n) && n <= 6;
     }
     return ['TV-Y', 'TV-Y7', 'TV-Y7-FV'].indexOf(ct.v) > -1;
+  }
+
+  // 18+: жёсткий контент, неуместный для «расслабиться» и «посмеяться»
+  function adultRated(c) {
+    var ct = c.cert;
+    if (!ct) return false;
+    if (ct.c === 'RU') {
+      var n = parseInt(ct.v, 10);
+      return !isNaN(n) && n >= 18;
+    }
+    return ['R', 'NC-17', 'TV-MA'].indexOf(ct.v) > -1;
   }
 
   function isAnimated(c) { return (c.genres || []).indexOf(16) > -1; }
@@ -956,6 +967,8 @@
 
     if (ans.company === 'couple' && c.genres.indexOf(27) > -1 && ans.mood !== 'nerves') m -= 0.1;
     if (ans.company !== 'kids' && isAnimated(c) && c.genres.indexOf(10751) > -1) m -= 0.4;
+    if ((ans.mood === 'relax' || ans.mood === 'laugh') && adultRated(c)) m -= 0.5;
+    if (ans.company === 'couple' && adultRated(c) && ans.mood !== 'nerves' && ans.mood !== 'think') m -= 0.15;
 
     return clamp(m, 0, 1);
   }
@@ -1066,6 +1079,8 @@
       pt.an = spread > 0.04 ? 0.5 * pt.a + 0.5 * (pt.a - minA) / spread : pt.a;
       var anim = isAnimated(x.c);
       pt.f = clamp((anim ? share : 1 - share) * 2, 0.25, 1);
+      // Смотрят не одни: доля анимации у пользователя ничего не говорит о вкусе второго зрителя
+      if (anim && (ans.company === 'couple' || ans.company === 'group')) pt.f *= 0.6;
       var base = w.q * pt.q + w.a * pt.an + w.m * pt.m + w.n * pt.n + w.s * pt.s;
       x.score = base * (0.65 + 0.35 * pt.f);
       x.reason = reasonOf(x, pt, w, profile);
@@ -1213,6 +1228,7 @@
       score: round3(it.score),
       q: round3(p.q), a: round3(p.a), an: round3(p.an), m: round3(p.m), n: round3(p.n), s: round3(p.s), f: round3(p.f),
       anim: isAnimated(c),
+      cert: c.cert ? c.cert.c + ':' + c.cert.v : null,
       wath: !!it.wath,
       seeds: (it.seeds || []).slice(0, 3),
       reason: it.reason || ''
