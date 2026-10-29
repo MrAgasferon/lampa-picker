@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.5.0';
+  var VERSION = '0.5.1';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -349,6 +349,16 @@
   }
 
   // 18+: жёсткий контент. Американский рейтинг надёжнее: российский 18+ в TMDB часто стоит у безобидных фильмов
+  var HARD_GENRES = [28, 53, 80, 27, 10752];
+
+  // 18+ с «жёстким» жанром. R у комедии или мелодрамы — обычно лексика, для «расслабиться» это не помеха
+  function harshAdult(c) {
+    if (!adultRated(c)) return false;
+    if (c.moods) return (mv(c, 'violence') || 0) >= 5 || (mv(c, 'fear') || 0) >= 5;
+    for (var i = 0; i < HARD_GENRES.length; i++) if ((c.genres || []).indexOf(HARD_GENRES[i]) > -1) return true;
+    return false;
+  }
+
   function adultRated(c) {
     var ct = c.cert;
     if (!ct) return false;
@@ -670,7 +680,8 @@
     });
 
     var fb = feedback();
-    each(fb.opened, function (rec) { if (rec && rec.card) put(rec.card, 0.2, 'opened'); });
+    // Открыл из подборки = «удачная рекомендация»: заметный плюс, может стать опорным фильмом
+    each(fb.opened, function (rec) { if (rec && rec.card) put(rec.card, 0.5, 'opened'); });
     each(fb.rejected, function (rec) { if (rec && rec.card) put(rec.card, -0.2, 'rejected'); });
     each(fb.seen, function (rec) { if (rec && rec.card) put(rec.card, 0, 'seen'); });
 
@@ -794,25 +805,30 @@
     }
     profile.animShare = posW > 0 ? animW / posW : 0.2;
 
-    // Нижняя граница годов: самое раннее десятилетие с заметной долей среди того, что нравится
-    var decW = {}, decMax = 0;
+    // Нижняя граница годов из данных пользователя: десятилетия, которые вместе дают 90% веса того, что нравится.
+    // Мало истории — границы нет.
+    var decW = {}, decTotal = 0, decN = 0;
     for (var di = 0; di < events.length; di++) {
       var de = events[di];
       if (!(de.s > 0) || !de.c || !de.c.year) continue;
       var dy = parseInt(de.c.year, 10);
       if (isNaN(dy)) continue;
       var dk = Math.floor(dy / 10) * 10;
-      decW[dk] = (decW[dk] || 0) + de.s * decay(de.date);
-      if (decW[dk] > decMax) decMax = decW[dk];
+      var dw = de.s * decay(de.date);
+      decW[dk] = (decW[dk] || 0) + dw;
+      decTotal += dw;
+      decN++;
     }
-    var floorDec = null;
-    each(decW, function (v, d) {
-      d = parseInt(d, 10);
-      if (v >= decMax * 0.15 && (floorDec === null || d < floorDec)) floorDec = d;
-    });
-    // Холодный старт — 1990; не строже 2010, чтобы не обеднить пул
-    if (n < 5 || floorDec === null) floorDec = 1990;
-    profile.yearFloor = Math.min(floorDec, 2010);
+    profile.yearFloor = null;
+    if (decN >= 10 && decTotal > 0) {
+      var decs = Object.keys(decW).map(Number).sort(function (x, y) { return y - x; });
+      var acc90 = 0;
+      for (var dd = 0; dd < decs.length; dd++) {
+        acc90 += decW[decs[dd]];
+        profile.yearFloor = decs[dd];
+        if (acc90 >= decTotal * 0.9) break;
+      }
+    }
 
     var seeds = events.filter(function (e) { return e.s > 0.25; });
     seeds.sort(function (a, b) { return b.s * decay(b.date) - a.s * decay(a.date); });
@@ -942,7 +958,7 @@
     var short = ans.time === '40';
     var limited = ans.time !== 'any';
     var surprise = ans.mood === 'surprise';
-    var floor = (profile.yearFloor || 1990) - (surprise ? 10 : 0);
+    var floor = profile.yearFloor ? profile.yearFloor - (surprise ? 10 : 0) : null;
 
     // 1. Рекомендации по seed-фильмам — только от тех, что сами подходят под настроение
     var fits = [], rest = [];
@@ -977,10 +993,10 @@
         var p = {
           with_genres: ids.join(','),
           sort_by: 'popularity.desc',
-          'vote_count.gte': type === 'tv' ? 100 : (short ? 30 : 200),
+          'vote_count.gte': type === 'tv' ? 100 : (short ? 150 : 200),
           'vote_average.gte': 6
         };
-        p[type === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = floor + '-01-01';
+        if (floor) p[type === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = floor + '-01-01';
         if (type === 'movie' && limited) {
           var lim = short ? 45 : parseInt(ans.time, 10) + 10;
           if (!isNaN(lim)) p['with_runtime.lte'] = lim;
@@ -1003,7 +1019,7 @@
       var exId = exType === 'tv' ? toTvGenre(exg) : exg;
       if (exId) {
         var ep = { with_genres: exId, sort_by: 'vote_average.desc', 'vote_count.gte': 500, page: 1 };
-        ep[exType === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = floor + '-01-01';
+        if (floor) ep[exType === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = floor + '-01-01';
         req('discover/' + exType, ep, exType, null, 'explore');
       }
     }
@@ -1066,7 +1082,7 @@
       var date = r.release_date || r.first_air_date || '';
       if (!it.wath) {
         if (date && date > today) return bump('future');
-        var minVotes = it.type === 'tv' ? 100 : (short ? 30 : 200);
+        var minVotes = it.type === 'tv' ? 100 : (short ? 150 : 200);
         if ((r.vote_count || 0) < minVotes) return bump('votes');
       }
       out.push(it);
@@ -1075,7 +1091,7 @@
   }
 
   // Пустая строка — подходит, иначе причина отсева
-  function postReason(it, ans) {
+  function postReason(it, ans, profile) {
     var c = it.c;
     if (!c) return 'no_details';
 
@@ -1092,7 +1108,13 @@
       if (c.runtime && c.runtime > 60) return 'too_long';
     }
 
+    if (c.type === 'movie' && c.runtime && c.runtime <= 45 && (c.vc || 0) < 150) return 'votes';
+
     if (ans.company !== 'kids' && kidsTargeted(c)) return 'kids_content';
+
+    // Смотрят не одни, а анимация пользователю почти не интересна — второму зрителю тем более
+    if ((ans.company === 'couple' || ans.company === 'group') && isAnimated(c) && profile && profile.n >= 5 &&
+      typeof profile.animShare === 'number' && profile.animShare < 0.2) return 'anim_format';
 
     if (ans.company === 'kids') {
       if (c.moods && ((mv(c, 'fear') || 0) > 6 || (mv(c, 'violence') || 0) > 5 || (mv(c, 'profanity') || 0) > 3)) return 'kids_moods';
@@ -1178,8 +1200,8 @@
     }
 
     if (ans.company !== 'kids' && isAnimated(c) && c.genres.indexOf(10751) > -1) m -= 0.4;
-    if ((ans.mood === 'relax' || ans.mood === 'laugh') && adultRated(c)) m -= 0.25;
-    if (ans.company === 'couple' && adultRated(c) && ans.mood !== 'nerves' && ans.mood !== 'think') m -= 0.1;
+    if ((ans.mood === 'relax' || ans.mood === 'laugh') && harshAdult(c)) m -= 0.25;
+    if (ans.company === 'couple' && harshAdult(c) && ans.mood !== 'nerves' && ans.mood !== 'think') m -= 0.1;
 
     m = clamp(m, 0, 1);
 
@@ -1204,8 +1226,8 @@
   // Множитель за возраст: десятилетием старше границы — ×0,75, ещё старше — ×0,4
   function yearFactor(c, profile, ans) {
     var y = parseInt(c.year, 10);
-    var floor = profile.yearFloor || 1990;
-    if (isNaN(y) || y >= floor) return 1;
+    var floor = profile.yearFloor;
+    if (!floor || isNaN(y) || y >= floor) return 1;
     var surprise = ans.mood === 'surprise';
     if (y >= floor - 10) return surprise ? 0.9 : 0.75;
     return surprise ? 0.7 : 0.4;
@@ -1224,7 +1246,28 @@
     return String(v);
   }
 
-  function reasonOf(it, parts, w, profile) {
+  var MOOD_REASON = {
+    relax: 'под «Расслабиться»', laugh: 'чтобы посмеяться', nerves: 'чтобы пощекотать нервы',
+    think: 'чтобы подумать', surprise: 'что-то непривычное'
+  };
+  var COMPANY_REASON = { couple: ' вдвоём', group: ' компанией', kids: ' с детьми' };
+
+  function moodReason(c, ans) {
+    var mood = MOODS[ans.mood];
+    if (!mood || !MOOD_REASON[ans.mood]) return '';
+    var gs = [];
+    for (var i = 0; i < c.genres.length; i++) {
+      var g = c.genres[i];
+      if (mood.w[g] > 0 && GENRE_NAMES[g]) gs.push({ n: GENRE_NAMES[g].toLowerCase(), v: mood.w[g] });
+    }
+    if (!gs.length) return '';
+    gs.sort(function (a, b) { return b.v - a.v; });
+    var what = gs.length > 1 ? gs[0].n + ' и ' + gs[1].n : gs[0].n;
+    what = what.charAt(0).toUpperCase() + what.slice(1);
+    return what + ' — ' + MOOD_REASON[ans.mood] + (COMPANY_REASON[ans.company] || '');
+  }
+
+  function reasonOf(it, parts, w, profile, ans) {
     var c = it.c;
     if (it.wath) return 'Из вашего списка «Позже»';
     if (it.seedHits >= 1 && it.seeds.length && it.seeds[0]) {
@@ -1253,7 +1296,12 @@
           var an = c.names['p' + b.id] || profile.names['p' + b.id];
           if (an) return 'С ' + an;
         }
-        if (b.type === 'genre' && GENRE_NAMES[b.id]) return 'Ваш жанр: ' + GENRE_NAMES[b.id].toLowerCase();
+        // Жанр как причина — только если он реально выделяется в профиле
+        if (b.type === 'genre' && GENRE_NAMES[b.id] && profile.f.genre[b.id] >= 0.6) return 'Ваш жанр: ' + GENRE_NAMES[b.id].toLowerCase();
+      }
+      if (k !== 'q' && ans && parts.m >= 0.8) {
+        var mr = moodReason(c, ans);
+        if (mr) return mr;
       }
       if (k === 'q' && parts.r) return 'Высокий рейтинг: ' + parts.r.toFixed(1) + ', ' + formatVotes(c.vc) + ' голосов';
       if (k === 'n' && c.genres.length) return 'Что-то новое: ' + (GENRE_NAMES[c.genres[0]] || '').toLowerCase();
@@ -1268,7 +1316,8 @@
 
     var sumVa = 0, nVa = 0;
     for (var i = 0; i < items.length; i++) if (items[i].c && items[i].c.vc > 0) { sumVa += items[i].c.va; nVa++; }
-    var C = nVa ? sumVa / nVa : 6.5;
+    // Априорное среднее ниже среднего по пулу: фильм без голосов не должен выглядеть «средне-хорошим»
+    var C = Math.min(nVa ? sumVa / nVa : 6.0, 6.0);
 
     for (var j = 0; j < items.length; j++) {
       var it = items[j];
@@ -1312,8 +1361,8 @@
       var base = (w.q * pt.q + w.a * pt.an + w.n * pt.n + w.s * pt.s) / (rest > 0 ? rest : 1);
       var moodGate = w.m > 0 ? 0.35 + 0.65 * pt.m : 1;
       pt.y = x.wath ? 1 : yearFactor(x.c, profile, ans); // «Позже» — явный выбор, годы не штрафуем
-      x.score = base * moodGate * (0.65 + 0.35 * pt.f) * pt.y;
-      x.reason = reasonOf(x, pt, w, profile);
+      x.score = base * moodGate * (0.3 + 0.7 * pt.f) * pt.y;
+      x.reason = reasonOf(x, pt, w, profile, ans);
     }
 
     log('weights', pw.key, 'C', C.toFixed(2));
@@ -1370,7 +1419,7 @@
   // Франшизы: одна карточка на коллекцию — первая непросмотренная часть
   // =========================================================================
 
-  function franchiseFilter(list, events, ans, stats, cb) {
+  function franchiseFilter(list, events, ans, stats, profileRef, cb) {
     var byColl = {};
     for (var i = 0; i < list.length; i++) {
       var c = list[i].c;
@@ -1391,7 +1440,7 @@
       if (!additions.length) return cb(kept);
       detailsMany(additions, function () {
         for (var a = 0; a < additions.length; a++) {
-          var r = postReason(additions[a], ans);
+          var r = postReason(additions[a], ans, profileRef);
           if (r) stats[r] = (stats[r] || 0) + 1;
           else kept.push(additions[a]);
         }
@@ -1488,7 +1537,7 @@
           detailsMany(batch, function () {
             if (!alive()) return;
             for (var b = 0; b < batch.length; b++) {
-              var r = postReason(batch[b], ans);
+              var r = postReason(batch[b], ans, profile);
               if (r) stats[r] = (stats[r] || 0) + 1;
               else passed.push(batch[b]);
             }
@@ -1499,7 +1548,7 @@
 
         var afterDetails = function () {
           scoreAll(passed, profile, ans);
-          franchiseFilter(passed, events, ans, stats, function (finalList) {
+          franchiseFilter(passed, events, ans, stats, profile, function (finalList) {
           if (!alive()) return;
           var top = list.slice(0, offset);
           var wkey = scoreAll(finalList, profile, ans);
@@ -1973,7 +2022,13 @@
     '.pkr-mood b span{display:block;height:100%;background:#ffd166;border-radius:.2em}',
     '.pkr-hero__reason{margin-top:.55em;font-size:1.08em;color:#ffd166;line-height:1.35}',
     '.pkr-hero__reason svg{width:1.05em;height:1.05em;vertical-align:-.12em;margin-right:.45em}',
-    '.pkr-hero__descr{margin-top:.6em;opacity:.75;line-height:1.45;max-height:2.9em;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}',
+    '.pkr-hero__descr{margin-top:.6em;border-radius:.5em;transition:background-color .15s}',
+    '.pkr-hero__text{opacity:.75;line-height:1.45;max-height:2.9em;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}',
+    '.pkr-hero__more{display:none;font-size:.8em;font-weight:600;color:#ffd166;margin-top:.25em}',
+    '.pkr-hero__descr.is-long .pkr-hero__more{display:block}',
+    '.pkr-hero__descr.is-long{cursor:pointer;margin-left:-.5em;margin-right:-.5em;padding:.3em .5em}',
+    '.pkr-hero__descr.is-open .pkr-hero__text{max-height:none;display:block;-webkit-line-clamp:unset;opacity:.9}',
+    '.pkr-hero__descr.focus{background:rgba(255,255,255,.1)}',
     '.pkr-debug{margin-top:.6em;font-family:monospace;font-size:.78em;opacity:.55}',
     '.pkr-note{font-size:.82em;opacity:.5;margin:.2em 0 .8em}',
 
@@ -2027,7 +2082,7 @@
     '.pkr-bg{left:-1em;right:-1em;top:-1em;height:24em}',
     '.pkr-hero{min-height:0;padding-top:.6em}',
     '.pkr-hero__title{font-size:1.75em}',
-    '.pkr-hero__descr{max-height:4.35em;-webkit-line-clamp:3}',
+    '.pkr-hero__text{max-height:4.35em;-webkit-line-clamp:3}',
     '.pkr-row{margin:0 -1em;padding:.7em .65em .4em;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}',
     '.pkr-card{width:38%;padding:0 .35em}',
     '.pkr-btn{padding:.65em .9em;margin:0 .4em .5em 0;font-size:.92em}','.pkr-actions{margin:1em 0 1.2em}',
@@ -2282,7 +2337,7 @@
       }
       if (it.reason) h += '<div class="pkr-hero__reason">' + svg('sparkle') + esc(it.reason) + '</div>';
       var descr = c.card && c.card.overview;
-      if (descr) h += '<div class="pkr-hero__descr">' + esc(descr) + '</div>';
+      if (descr) h += '<div class="pkr-hero__descr"><div class="pkr-hero__text">' + esc(descr) + '</div><div class="pkr-hero__more">Читать полностью</div></div>';
 
       if (isDebug() && it.parts) {
         var p = it.parts;
@@ -2309,10 +2364,31 @@
       im.src = url;
     }
 
+    // Длинное описание — фокусируемый блок, OK/тап разворачивает
+    function bindDescr() {
+      var d = heroEl.find('.pkr-hero__descr');
+      if (!d.length) return;
+      var t = d.find('.pkr-hero__text')[0];
+      if (!t || t.scrollHeight <= t.clientHeight + 2) return;
+      d.addClass('is-long selector');
+      d.on('hover:enter', function () {
+        var open = !d.hasClass('is-open');
+        d.toggleClass('is-open', open);
+        d.find('.pkr-hero__more').text(open ? 'Свернуть' : 'Читать полностью');
+        if (state) Journal.action(state.journal, open ? 'descr_open' : 'descr_close', current);
+      });
+      bindFocus(d);
+      try {
+        var en = Lampa.Controller.enabled();
+        if (en && en.name === 'content') Lampa.Controller.collectionSet(focusable());
+      } catch (e) {}
+    }
+
     function setCurrent(it) {
       if (!it) return;
       current = it;
       heroEl.html(heroHtml(it));
+      bindDescr();
       for (var i = 0; i < cardEls.length; i++) cardEls[i].toggleClass('is-active', state.page[i] === it);
       setBackdrop(it);
     }
@@ -2443,7 +2519,7 @@
             if (badge.length) badge.text(txt);
             else cardEls[idx].find('.pkr-card__img').append('<div class="pkr-card__rate">' + txt + '</div>');
             if (it.kp) cardEls[idx].find('.pkr-card__rate').addClass('is-kp');
-            if (current === it) heroEl.html(heroHtml(it));
+            if (current === it && !heroEl.find(".pkr-hero__descr.is-open").length) { heroEl.html(heroHtml(it)); bindDescr(); }
           });
         })(page[i]);
       }
