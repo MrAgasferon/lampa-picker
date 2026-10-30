@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.5.5';
+  var VERSION = '0.6.2';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -166,10 +166,13 @@
   // Очередь запросов (не больше 4 одновременно, один повтор при ошибке)
   // =========================================================================
 
+  // 429 — пауза всей очереди с нарастающей задержкой; 4xx — без повтора; сеть/5xx — один повтор
   var Net = {
     queue: [],
     active: 0,
     max: 4,
+    pauseUntil: 0,
+    pauseTimer: null,
 
     get: function (url, ok, fail, opts) {
       this.queue.push({ url: url, ok: ok, fail: fail, opts: opts, tries: 0 });
@@ -178,6 +181,11 @@
 
     pump: function () {
       var self = this;
+      var wait = self.pauseUntil - now();
+      if (wait > 0) {
+        if (!self.pauseTimer) self.pauseTimer = setTimeout(function () { self.pauseTimer = null; self.pump(); }, wait);
+        return;
+      }
       while (self.active < self.max && self.queue.length) {
         (function (job) {
           self.active++;
@@ -188,13 +196,21 @@
             try { job.ok(json); } catch (e) { log('callback error', e); }
             self.pump();
           };
-          var failed = function () {
+          var failed = function (a) {
             self.active--;
-            if (job.tries < 1) {
+            var status = (a && a.status) || 0;
+            if (status === 429 && job.tries < 3) {
+              job.tries++;
+              self.pauseUntil = now() + Math.min(30000, 2000 * Math.pow(2, job.tries));
+              self.queue.unshift(job);
+              log('429, пауза', self.pauseUntil - now(), 'мс');
+            } else if (status >= 400 && status < 500) {
+              if (job.fail) { try { job.fail(status); } catch (e) {} }
+            } else if (job.tries < 1) {
               job.tries++;
               setTimeout(function () { self.queue.push(job); self.pump(); }, 1500);
             } else if (job.fail) {
-              try { job.fail(); } catch (e) {}
+              try { job.fail(status); } catch (e) {}
             }
             self.pump();
           };
@@ -360,6 +376,8 @@
     try { proto = Lampa.Utils.protocol(); } catch (e) {}
     return proto + 'tmdbapi.bylampa.online/3/' + rel;
   }
+
+  var LIST_TTL = 7 * DAY; // рекомендации и discover меняются медленно
 
   function tmdb(path, params, ttl, cb) {
     var ck = 'tmdb:' + path + '?' + JSON.stringify(params || {});
@@ -815,7 +833,7 @@
     var top = [];
     for (var i = 0; i < events.length; i++) {
       events[i].c = cardCompact(events[i].card);
-      if (events[i].s !== 0 && top.length < 40) top.push(events[i]);
+      if (events[i].s !== 0 && top.length < 25) top.push(events[i]);
     }
 
     var left = top.length;
@@ -1031,7 +1049,7 @@
 
     function req(path, params, type, seed, src) {
       pending++;
-      tmdb(path, params, 3 * DAY, function (json) {
+      tmdb(path, params, LIST_TTL, function (json) {
         if (json && json.results) add(json.results, type, seed, src);
         if (--pending === 0) finish();
       });
@@ -1096,7 +1114,7 @@
         if (ex.length) p.without_genres = ex.join(',');
 
         req('discover/' + type, extend(p, { page: 1 }), type, null, 'disc');
-        if (plan[g].kind !== 'pair') req('discover/' + type, extend(p, { page: 2 }), type, null, 'disc');
+        if (plan[g].kind !== 'pair' && types.length === 1) req('discover/' + type, extend(p, { page: 2 }), type, null, 'disc');
       }
     }
 
@@ -1617,7 +1635,9 @@
         scoreAll(list, profile, ans);
         list.sort(function (a, b) { return b.score - a.score; });
 
-        var BATCH = 30, WANT = 30, MAX_DETAILED = 150;
+        // Строгие режимы отсеивают ~70% кандидатов — там нужен больший запас загрузок
+        var strict = ans.time === '40' || ans.company === 'kids';
+        var BATCH = 30, WANT = 30, MAX_DETAILED = strict ? 150 : 90;
         var passed = [];
         var offset = 0;
 
@@ -2008,22 +2028,67 @@
   // =========================================================================
 
   var KP_API = 'https://kinopoiskapiunofficial.tech/';
-  var KP_KEY = '14342b35-714b-449d-bf10-30d0d9ac22e6'; // публичный ключ из bylampa rating.js
-  var KP_DAILY_LIMIT = 120;
+  var KP_DAILY_LIMIT = 200;         // личный ключ: предохранитель поверх лимита тарифа
+  var KP_BUILTIN_DAILY_LIMIT = 40;  // встроенный ключ общий для всех — на устройство даём немного
+
+  var KP_B = [91,87,2,85,72,104,63,110,118,53,22,13,0,23,59,43,41,108,35,212,142,203,158,254,247,252,190,174,151,215,192,212,176,237,178,225];
+
+  function kpBuiltin() {
+    var m = 'lampa-picker', out = '';
+    for (var i = 0; i < KP_B.length; i++) out += String.fromCharCode(KP_B[i] ^ m.charCodeAt(i % m.length) ^ ((i * 7) & 0xff));
+    return out;
+  }
+
+  function kpPersonal() {
+    var k = store('kp_key', '');
+    return typeof k === 'string' ? k.replace(/\s+/g, '') : '';
+  }
+
+  // Личный ключ из настроек важнее встроенного
+  function kpKey() { return kpPersonal() || kpBuiltin(); }
+  function kpUsingBuiltin() { return !kpPersonal(); }
+  function kpLimit() { return kpUsingBuiltin() ? KP_BUILTIN_DAILY_LIMIT : KP_DAILY_LIMIT; }
 
   function kpQuota() {
     var q = store('kp_quota', {});
     var day = todaySeed();
-    if (q.day !== day) q = { day: day, n: 0 };
+    if (q.day !== day) q = { day: day, n: 0, blocked: false };
     return q;
   }
 
   function kpSpend() {
+    if (!kpKey()) return false;
     var q = kpQuota();
-    if (q.n >= KP_DAILY_LIMIT) return false;
+    if (q.blocked || q.n >= kpLimit()) return false;
     q.n++;
     save('kp_quota', q);
     return true;
+  }
+
+  // Ключ отклонён или исчерпан — до конца дня не запрашиваем
+  function kpBlock(status) {
+    var q = kpQuota();
+    if (q.blocked) return;
+    q.blocked = status || true;
+    save('kp_quota', q);
+    if (kpUsingBuiltin()) return; // встроенный ключ исчерпан — молча уходим в кеш
+    noty(status === 401 ? 'Ключ Кинопоиска не принят — проверьте его в настройках'
+      : 'Лимит ключа Кинопоиска на сегодня исчерпан — рейтинги КП только из кеша');
+  }
+
+  function kpFail(cb) {
+    return function (status) {
+      if (status === 401 || status === 402 || status === 403 || status === 429) kpBlock(status);
+      cb(null);
+    };
+  }
+
+  function kpCheckKey(key, cb) {
+    var req = new Lampa.Reguest();
+    req.timeout(10000);
+    req.silent(KP_API + 'api/v2.2/films/301', function (j) {
+      cb(!!(j && (j.kinopoiskId || j.nameRu)), 200);
+    }, function (a) { cb(false, (a && a.status) || 0); }, false, { headers: { 'X-API-KEY': key } });
   }
 
   function writeKpCache(tmdbId, rec) {
@@ -2034,7 +2099,7 @@
     } catch (e) {}
   }
 
-  function kpHeaders() { return { headers: { 'X-API-KEY': KP_KEY } }; }
+  function kpHeaders() { return { headers: { 'X-API-KEY': kpKey() } }; }
 
   function fetchRatings(it, cb) {
     var c = it.c;
@@ -2046,6 +2111,7 @@
     var map = Durable.get('kpmap', {});
     var m = map[it.k];
     if (m && now() - m.t < 14 * DAY) return cb(m.kp || m.imdb ? { kp: m.kp, imdb: m.imdb } : null);
+
 
     var finish = function (kp, imdb, kpId) {
       kp = parseFloat(kp) || 0;
@@ -2068,7 +2134,7 @@
       if (!kpSpend()) return cb(null);
       Net.get(KP_API + 'api/v2.2/films/' + kpId, function (j) {
         finish(j && j.ratingKinopoisk, j && j.ratingImdb, kpId);
-      }, function () { cb(null); }, kpHeaders());
+      }, kpFail(cb), kpHeaders());
     };
 
     var byTitle = function () {
@@ -2081,7 +2147,7 @@
           if (!y || (!isNaN(fy) && Math.abs(fy - y) <= 1)) return byId(films[i].filmId);
         }
         finish(0, 0, null);
-      }, function () { cb(null); }, kpHeaders());
+      }, kpFail(cb), kpHeaders());
     };
 
     if (c.imdb) {
@@ -2090,7 +2156,10 @@
         var x = j && j.items && j.items[0];
         if (x) finish(x.ratingKinopoisk, x.ratingImdb, x.kinopoiskId);
         else byTitle();
-      }, byTitle, kpHeaders());
+      }, function (status) {
+        if (status === 401 || status === 402 || status === 403 || status === 429) return kpFail(cb)(status);
+        byTitle();
+      }, kpHeaders());
     } else byTitle();
   }
 
@@ -3043,14 +3112,42 @@
     } catch (e) { log('menu error', e); }
   }
 
+  function addSettings() {
+    try {
+      if (!Lampa.SettingsApi || !Lampa.SettingsApi.addComponent) return;
+      Lampa.SettingsApi.addComponent({ component: 'lampa_picker', name: 'Что посмотреть', icon: ICON });
+      Lampa.SettingsApi.addParam({
+        component: 'lampa_picker',
+        param: { name: NS + 'kp_key', type: 'input', values: '', placeholder: 'например, 0a1b2c3d-…', default: '' },
+        field: {
+          name: 'Ключ Кинопоиска',
+          description: 'Необязательно. Личный ключ kinopoiskapiunofficial.tech (бесплатная регистрация) — для рейтингов КП и IMDb без общего лимита. Без него используется встроенный ключ с ограничением на устройство.'
+        },
+        onChange: function (value) {
+          var key = String(value || '').replace(/\s+/g, '');
+          var q = kpQuota();
+          q.blocked = false;
+          save('kp_quota', q);
+          if (!key) return noty('Личный ключ удалён — используется встроенный');
+          kpCheckKey(key, function (ok, status) {
+            noty(ok ? 'Ключ Кинопоиска работает' : 'Ключ не прошёл проверку' + (status ? ' (' + status + ')' : ''));
+          });
+        }
+      });
+    } catch (e) { log('settings error', e); }
+  }
+
   function warmup() {
     try {
+      if (!Cache.db) return;                                // без IndexedDB прогрев бесполезен — кеш не переживёт перезапуск
+      if (store('warmup_day', 0) === todaySeed()) return;   // не чаще раза в сутки
+      save('warmup_day', todaySeed());
       var events = collect();
       enrichEvents(events, function () {
         var profile = buildProfile(events);
         var seeds = profile.seeds.slice(0, 8);
         for (var i = 0; i < seeds.length; i++) {
-          tmdb(seeds[i].type + '/' + seeds[i].id + '/recommendations', { page: 1 }, 3 * DAY, function () {});
+          tmdb(seeds[i].type + '/' + seeds[i].id + '/recommendations', { page: 1 }, LIST_TTL, function () {});
         }
         log('warmup done, events', events.length, 'profile.n', profile.n);
       });
@@ -3072,6 +3169,7 @@
     report.hasTmdbKey = !!(Lampa.TMDB && Lampa.TMDB.key);
     report.hasIndexedDB = !!window.indexedDB;
     report.idbOpened = Durable.persistent();
+    report.kp = { key: kpUsingBuiltin() ? 'встроенный' : 'личный', today: kpQuota().n, limit: kpLimit(), blocked: kpQuota().blocked || false };
     try {
       var mine = 0, total = 0;
       for (var li = 0; li < localStorage.length; li++) {
@@ -3101,6 +3199,7 @@
     journalLast: function () { return Journal.exportLast(); },
     journalPacked: function () { return Journal.exportPacked(); },
     journalFit: function () { return Journal.exportFit(); },
+    setKpKey: function (k) { save('kp_key', String(k || '')); var q = kpQuota(); q.blocked = false; save('kp_quota', q); return kpPersonal() ? 'личный ключ сохранён' : 'личный ключ удалён, используется встроенный'; },
     reset: function () { save('feedback', {}); save('seen', {}); save('last_answers', null); return 'reset'; }
   };
 
@@ -3114,7 +3213,9 @@
     } catch (e) {}
     try { Lampa.Component.add('lampa_picker', PickerComponent); } catch (e) { log('component error', e); }
     addMenu();
-    setTimeout(warmup, 30000);
+    addSettings();
+    // Случайная задержка 30–120 с, чтобы запуски у разных пользователей не совпадали
+    setTimeout(function () { Cache.init(warmup); }, 30000 + Math.floor(Math.random() * 90000));
     log('ready', VERSION);
   }
 
