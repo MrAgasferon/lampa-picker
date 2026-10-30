@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.7.0';
+  var VERSION = '0.7.1';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -688,6 +688,20 @@
   // Обратная связь (только локально)
   // =========================================================================
 
+  // Причины «Не то»: что показываем и как это влияет на профиль
+  var REJECT_REASONS = [
+    { r: 'mood', title: 'Не под настроение', subtitle: 'Фильм может и хороший, но не сейчас' },
+    { r: 'genre', title: 'Не мой жанр', subtitle: 'Такое вообще не смотрю' },
+    { r: 'old', title: 'Слишком старое' },
+    { r: 'company', title: 'Не для этой компании' },
+    { r: 'meh', title: 'Не интересно' },
+    { r: '', title: 'Пропустить' }
+  ];
+  var REJECT_SIGNAL = { mood: 0, company: 0, old: 0, genre: -0.3, meh: -0.2 };
+  var REJECT_GENRE_MIN = 2;      // жанр штрафуется со второго отказа «не мой жанр»
+  var REJECT_GENRE_STEP = 0.3;   // за каждый отказ сверх первого
+  var REJECT_OLD_MIN = 2;        // порог по годам — со второго «слишком старое»
+
   function feedback() {
     var fb = store('feedback', {});
     fb.rejected = fb.rejected || {};
@@ -814,7 +828,12 @@
     var fb = feedback();
     // Открыл из подборки = «удачная рекомендация»: заметный плюс, может стать опорным фильмом
     each(fb.opened, function (rec) { if (rec && rec.card) put(rec.card, 0.5, 'opened'); });
-    each(fb.rejected, function (rec) { if (rec && rec.card) put(rec.card, -0.2, 'rejected'); });
+    // Сила минуса зависит от причины: «не под настроение» и «не для компании» о вкусе ничего не говорят
+    each(fb.rejected, function (rec) {
+      if (!rec || !rec.card) return;
+      var rs = REJECT_SIGNAL[rec.r];
+      put(rec.card, typeof rs === 'number' ? rs : -0.2, 'rejected');
+    });
     each(fb.seen, function (rec) { if (rec && rec.card) put(rec.card, 0, 'seen'); });
 
     if (dirty) save('seen', seen);
@@ -960,6 +979,33 @@
         profile.yearFloor = decs[dd];
         if (acc90 >= decTotal * 0.9) break;
       }
+    }
+
+    // Явные причины отказов: «не мой жанр» и «слишком старое» — только при повторе
+    var rej = feedback().rejected, gRej = {}, oldYears = [];
+    each(rej, function (rec) {
+      if (!rec || !rec.card || !rec.r) return;
+      if (rec.r === 'genre') {
+        var gs = normGenres(rec.card.genre_ids || []);
+        for (var gi = 0; gi < gs.length; gi++) gRej[gs[gi]] = (gRej[gs[gi]] || 0) + 1;
+      } else if (rec.r === 'old') {
+        var oy = parseInt(String(rec.card.release_date || rec.card.first_air_date || '').slice(0, 4), 10);
+        if (!isNaN(oy)) oldYears.push(oy);
+      }
+    });
+    profile.rejGenres = {};
+    profile.f.genre = profile.f.genre || {};
+    each(gRej, function (cntG, g) {
+      if (cntG < REJECT_GENRE_MIN) return;
+      var pen = REJECT_GENRE_STEP * (cntG - 1);
+      profile.f.genre[g] = clamp((profile.f.genre[g] || 0) - pen, -1, 1);
+      profile.rejGenres[g] = cntG;
+    });
+    if (oldYears.length >= REJECT_OLD_MIN) {
+      oldYears.sort(function (a, b) { return b - a; });
+      // Второй по свежести отвергнутый год — граница; одиночный отказ её не двигает
+      var oldFloor = Math.floor(oldYears[REJECT_OLD_MIN - 1] / 10) * 10 + 10;
+      if (!profile.yearFloor || oldFloor > profile.yearFloor) { profile.yearFloor = oldFloor; profile.yearFloorBy = 'rejects'; }
     }
 
     var seeds = events.filter(function (e) { return e.s > 0.25; });
@@ -1783,6 +1829,8 @@
       events: profile.n,
       animShare: round3(profile.animShare),
       yearFloor: profile.yearFloor,
+      yearFloorBy: profile.yearFloorBy || null,
+      rejGenres: profile.rejGenres && Object.keys(profile.rejGenres).length ? profile.rejGenres : null,
       genres: topOf(profile.f.genre, 6, function (g) { return GENRE_NAMES[g]; }),
       dislikedGenres: topOf((function () {
         var neg = {};
@@ -1901,6 +1949,7 @@
           var row = [x.sec, x.act];
           if (x.title) row.push(short(x.title, 22));
           if (x.act === 'more') row.push(x.opened ? 1 : 0);
+          if (x.why) row.push(x.why);
           return row;
         })
       };
@@ -1952,6 +2001,7 @@
           var row = [x.sec, x.act];
           if (x.title) row.push(short(x.title, 18));
           if (x.act === 'more') row.push(x.opened ? 1 : 0);
+          if (x.why) row.push(x.why);
           return row;
         })
       };
@@ -2840,7 +2890,7 @@
 
       var actions = $('<div class="pkr-actions"></div>');
       actions.append(button('play', 'Открыть', 'pkr-btn--primary', function () { if (current) openIt(current); }));
-      actions.append(button('close', 'Не то', '', function () { dismiss('reject'); }));
+      actions.append(button('close', 'Не то', '', function () { askReject(); }));
       actions.append(button('check', 'Уже видел', '', function () { dismiss('seen'); }));
 
       var footer = $('<div class="pkr-actions pkr-actions--footer"></div>');
@@ -2928,15 +2978,33 @@
       }
     }
 
-    function dismiss(kind) {
+    // «Не то» сначала спрашивает причину; «Назад» в меню — отмена
+    function askReject() {
+      if (!current) return;
+      var it = current;
+      if (!Lampa.Select || !Lampa.Select.show) return dismiss('reject', '');
+      var back = function () { Lampa.Controller.toggle('content'); };
+      Lampa.Select.show({
+        title: 'Почему не то?',
+        items: REJECT_REASONS.map(function (x) { return { title: x.title, subtitle: x.subtitle, r: x.r }; }),
+        onSelect: function (a) { back(); current = it; dismiss('reject', a.r || ''); },
+        onBack: back
+      });
+    }
+
+    function dismiss(kind, reason) {
       if (!current) return;
       var it = current;
       var idx = state.page.indexOf(it);
       var fb = feedback();
-      if (kind === 'reject') fb.rejected[it.k] = { t: now(), card: miniCard(it.c) };
+      if (kind === 'reject') {
+        var rec = { t: now(), card: miniCard(it.c) };
+        if (reason) { rec.r = reason; rec.m = ans.mood; rec.co = ans.company; }
+        fb.rejected[it.k] = rec;
+      }
       else fb.seen[it.k] = { t: now(), card: miniCard(it.c) };
       saveFeedback(fb);
-      Journal.action(state.journal, kind === 'reject' ? 'reject' : 'seen', it);
+      Journal.action(state.journal, kind === 'reject' ? 'reject' : 'seen', it, kind === 'reject' && reason ? { why: reason } : null);
       state.logged = true;
       noty(kind === 'reject' ? 'Скрыто на 90 дней' : 'Отмечено как просмотренное');
 
