@@ -10,7 +10,11 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.7.1';
+  var VERSION = '0.7.2';
+
+  // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
+  var FEEDBACK_URL = '';
+  var FEEDBACK_DAILY = 5;
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -2114,6 +2118,56 @@
   function canShare() { return !!(navigator.share); }
 
   // =========================================================================
+  // Отправка журнала автору (Apps Script). Только по кнопке, с необязательным комментарием.
+  // =========================================================================
+
+  function feedbackLeft() {
+    var q = store('fb_sent', {});
+    if (q.day !== todaySeed()) q = { day: todaySeed(), n: 0 };
+    return Math.max(0, FEEDBACK_DAILY - q.n);
+  }
+
+  function postText(url, body) {
+    if (window.fetch) {
+      return fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: body, redirect: 'follow' })
+        .then(function (r) { return r.text(); });
+    }
+    return new Promise(function (resolve, reject) {
+      var x = new XMLHttpRequest();
+      x.open('POST', url, true);
+      x.setRequestHeader('Content-Type', 'text/plain;charset=utf-8');
+      x.timeout = 30000;
+      x.onload = function () { resolve(x.responseText); };
+      x.onerror = x.ontimeout = function () { reject(new Error('net')); };
+      x.send(body);
+    });
+  }
+
+  function sendFeedback(comment) {
+    var text = Journal.exportText();
+    var n = Journal.list().length;
+    return gzipB64(text).then(function (b64) {
+      var body = JSON.stringify({
+        f: b64 ? 'LPJ1' : 'LPJ0',
+        v: VERSION,
+        n: n,
+        c: String(comment || '').slice(0, 1000),
+        j: b64 ? 'LPJ1:' + b64 : text.slice(0, 300000)
+      });
+      return postText(FEEDBACK_URL, body);
+    }).then(function (resp) {
+      var r = null;
+      try { r = JSON.parse(resp); } catch (e) {}
+      if (!r || !r.ok) throw new Error((r && r.error) || 'bad response');
+      var q = store('fb_sent', {});
+      if (q.day !== todaySeed()) q = { day: todaySeed(), n: 0 };
+      q.n++;
+      save('fb_sent', q);
+      return r;
+    });
+  }
+
+  // =========================================================================
   // Рейтинги КП и IMDb для видимых карточек
   // Схема как у rating.js: поиск на kinopoiskapiunofficial по imdb_id, запасной — по названию.
   // Результат пишется в кеш rating.js (kp_rating) — он не будет запрашивать повторно.
@@ -2334,6 +2388,7 @@
     list: '<path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/>',
     copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
     download: '<path d="M12 3v12M7 10l5 5 5-5M4 21h16"/>',
+    send: '<path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/>',
     share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5l6.8 4M15.4 6.5l-6.8 4"/>',
     trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
     star: '<path d="M12 2l2.9 6.26L21.5 9l-5 4.73L17.8 21 12 17.27 6.2 21l1.3-7.27L2.5 9l6.6-.74L12 2z"/>'
@@ -3068,6 +3123,7 @@
       wrap.append('<div class="pkr-j__sub">Сессий: ' + list.length + '. ' +
         '«Скопировать журнал» берёт последние подборы — сколько поместится в одно сообщение мессенджера (обычно 3–4), в сжатом виде. ' +
         '«Последний подбор текстом» — читаемый вариант одной сессии. ' +
+        (FEEDBACK_URL ? '«Отправить автору» передаёт весь журнал и ваш комментарий: ответы, показанные фильмы, ваши действия и названия любимых фильмов из профиля. Имени, аккаунта и IP плагин не передаёт. ' : '') +
         (Durable.persistent() ? 'Хранится только на этом устройстве.' : 'IndexedDB недоступен — журнал живёт до перезапуска.') + '</div>');
 
       var actions = $('<div class="pkr-actions"></div>');
@@ -3085,6 +3141,7 @@
           copyText(Journal.exportLast(), function () { noty('Скопировано: последний подбор'); },
             function () { noty('Не удалось скопировать в буфер'); });
         }));
+        if (FEEDBACK_URL) actions.append(button('send', 'Отправить автору', '', function () { askFeedback(); }));
         if (canShare()) actions.append(button('share', 'Поделиться', '', function () {
           try {
             Journal.exportFit().then(function (r) {
@@ -3113,6 +3170,32 @@
 
       setBody(wrap);
       refresh(actions.find('.selector').eq(0));
+    }
+
+    // Комментарий через клавиатуру Lampa. Пустой ввод — отправка без комментария, «Назад» — отмена.
+    function askFeedback() {
+      if (!feedbackLeft()) return noty('На сегодня лимит отправок исчерпан');
+      var restore = function () {
+        if (view === 'journal') {
+          try { if (Lampa.Controller.enabled().name !== 'content') Lampa.Controller.toggle('content'); } catch (e) {}
+        }
+      };
+      var go = function (comment) {
+        setTimeout(restore, 0);
+        noty('Отправляю…');
+        sendFeedback(comment).then(function () {
+          noty('Отправлено, спасибо!');
+        }, function (e) {
+          log('feedback error', e);
+          noty('Не получилось отправить — попробуйте позже');
+        });
+      };
+      if (!Lampa.Input || !Lampa.Input.edit) return go('');
+      Lampa.Input.edit({ title: 'Комментарий (необязательно)', value: '', free: true, nosave: true }, go);
+      // «Назад» в клавиатуре колбэк не вызывает и отдаёт фокус настройкам — возвращаем его сами
+      var poll = setInterval(function () {
+        if (!$('.settings-input').length) { clearInterval(poll); restore(); }
+      }, 300);
     }
 
     function leaveJournal() {
