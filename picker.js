@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.7.3';
+  var VERSION = '0.7.4';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = '';
@@ -2615,17 +2615,58 @@
 
     function focusable() { return html; }
 
-    // Влево/вправо по ряду постеров — строго к соседней карточке. Навигатор Lampa выбирает по геометрии
-    // и с карточки может уйти на широкий блок описания над рядом.
-    function moveCard(dir) {
-      if (view !== 'results' || !last || !$(last).hasClass('pkr-card')) return false;
-      var idx = -1;
-      for (var i = 0; i < cardEls.length; i++) if (cardEls[i][0] === last) idx = i;
-      if (idx < 0) return false;
-      var next = cardEls[idx + dir];
-      if (next) { Lampa.Controller.collectionFocus(next[0], focusable()); return true; }
-      if (dir < 0) { Lampa.Controller.toggle('menu'); return true; }
-      return true;                                    // правый край ряда — остаёмся
+    // Экран выдачи — строгие уровни: описание → кнопки → постеры → нижний ряд.
+    // Влево/вправо только внутри уровня, вверх/вниз — на соседний уровень. Элементы Lampa не задействуем,
+    // кроме выхода в меню (влево с первого элемента) и в шапку (вверх с верхнего уровня).
+    var lineMemo = {};
+
+    function navLines() {
+      if (view !== 'results' || !html) return null;
+      var groups = [
+        ['descr', html.find('.pkr-hero__descr.selector')],
+        ['actions', html.find('.pkr-actions').not('.pkr-actions--footer').find('.selector')],
+        ['cards', html.find('.pkr-row .pkr-card.selector')],
+        ['footer', html.find('.pkr-actions--footer .selector')]
+      ];
+      var out = [];
+      for (var i = 0; i < groups.length; i++) if (groups[i][1].length) out.push({ key: groups[i][0], els: groups[i][1].toArray() });
+      return out;
+    }
+
+    function navFocus(el) { Lampa.Controller.collectionFocus(el, focusable()); }
+
+    function lineMove(dir) {
+      var lines = navLines();
+      if (!lines || !last) return false;
+      var li = -1, pi = -1;
+      for (var i = 0; i < lines.length && li < 0; i++) {
+        var p = lines[i].els.indexOf(last);
+        if (p > -1) { li = i; pi = p; }
+      }
+      if (li < 0) return false;
+      var line = lines[li];
+
+      if (dir === 'left' || dir === 'right') {
+        var next = line.els[pi + (dir === 'left' ? -1 : 1)];
+        if (next) { lineMemo[line.key] = pi + (dir === 'left' ? -1 : 1); navFocus(next); }
+        else if (dir === 'left') Lampa.Controller.toggle('menu');
+        return true;                                      // правый край — остаёмся
+      }
+
+      lineMemo[line.key] = pi;
+      var tl = lines[li + (dir === 'up' ? -1 : 1)];
+      if (!tl) {
+        if (dir === 'up') Lampa.Controller.toggle('head');
+        return true;                                      // нижний уровень — остаёмся
+      }
+      var target = null;
+      if (tl.key === 'cards') {
+        // В ряд постеров — на тот фильм, что сейчас в описании
+        for (var c = 0; c < tl.els.length; c++) if ($(tl.els[c]).hasClass('is-active')) target = tl.els[c];
+      }
+      if (!target) target = tl.els[Math.min(lineMemo[tl.key] || 0, tl.els.length - 1)];
+      navFocus(target);
+      return true;
     }
 
     // Высота экрана: от верха компонента до низа окна
@@ -3000,6 +3041,7 @@
       if (!state.page.length) return renderEmpty();
       if (state.page.indexOf(current) < 0) current = state.page[0];
 
+      lineMemo = {};
       var wrap = $('<div class="pkr-res"></div>');
       var bg = $('<div class="pkr-bg"><div class="pkr-bg__img"></div><div class="pkr-bg__img"></div><div class="pkr-bg__shade"></div></div>');
       bgA = bg.find('.pkr-bg__img').eq(0);
@@ -3293,16 +3335,17 @@
           Lampa.Controller.collectionFocus(last || false, focusable());
         },
         left: function () {
-          if (moveCard(-1)) return;
+          if (lineMove('left')) return;
           if (Navigator.canmove('left')) Navigator.move('left');
           else Lampa.Controller.toggle('menu');
         },
-        right: function () { if (!moveCard(1)) Navigator.move('right'); },
+        right: function () { if (!lineMove('right')) Navigator.move('right'); },
         up: function () {
+          if (lineMove('up')) return;
           if (Navigator.canmove('up')) Navigator.move('up');
           else Lampa.Controller.toggle('head');
         },
-        down: function () { if (Navigator.canmove('down')) Navigator.move('down'); },
+        down: function () { if (!lineMove('down') && Navigator.canmove('down')) Navigator.move('down'); },
         back: function () { self.back(); }
       });
       Lampa.Controller.toggle('content');
