@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.6.2';
+  var VERSION = '0.6.3';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -2049,10 +2049,16 @@
   function kpUsingBuiltin() { return !kpPersonal(); }
   function kpLimit() { return kpUsingBuiltin() ? KP_BUILTIN_DAILY_LIMIT : KP_DAILY_LIMIT; }
 
+  // Счётчик привязан к дню и к ключу: смена ключа — новый счёт
+  function kpKeyTag() {
+    var k = kpKey();
+    return (kpUsingBuiltin() ? 'b' : 'p') + k.slice(-4);
+  }
+
   function kpQuota() {
     var q = store('kp_quota', {});
-    var day = todaySeed();
-    if (q.day !== day) q = { day: day, n: 0, blocked: false };
+    var day = todaySeed(), tag = kpKeyTag();
+    if (q.day !== day || q.key !== tag) q = { day: day, key: tag, n: 0, blocked: false };
     return q;
   }
 
