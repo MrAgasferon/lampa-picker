@@ -10,10 +10,10 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.7.2';
+  var VERSION = '0.7.3';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
-  var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
+  var FEEDBACK_URL = '';
   var FEEDBACK_DAILY = 5;
   var NS = 'picker_';
   var DAY = 864e5;
@@ -2534,6 +2534,16 @@
     '.pkr-empty__text{opacity:.55;margin:.6em auto 1.8em;max-width:30em;line-height:1.4}',
 
     /* Телефон */
+    // Низкий экран (ТВ-приставки часто отдают 960×540): компактнее, чтобы описание и постеры помещались вместе
+    '.pkr-res.is-compact .pkr-hero{padding-top:.3em}',
+    '.pkr-res.is-compact .pkr-hero__title{font-size:2em}',
+    '.pkr-res.is-compact .pkr-hero__meta{margin-top:.5em}',
+    '.pkr-res.is-compact .pkr-hero__reason{margin-top:.35em;-webkit-line-clamp:1}',
+    '.pkr-res.is-compact .pkr-hero__descr{margin-top:.35em}',
+    '.pkr-res.is-compact .pkr-hero__more{margin-top:.15em;padding:.3em .8em}',
+    '.pkr-res.is-compact .pkr-actions{margin:.6em 0 .7em}',
+    '.pkr-res.is-compact .pkr-row{padding-top:.3em}',
+    '.pkr-res.is-compact .pkr-hero{min-height:0}',
     '@media (max-width: 767px){',
     '.pkr{padding:1em 1em 4em}',
     '.pkr-q{font-size:1.7em}',
@@ -2605,6 +2615,19 @@
 
     function focusable() { return html; }
 
+    // Влево/вправо по ряду постеров — строго к соседней карточке. Навигатор Lampa выбирает по геометрии
+    // и с карточки может уйти на широкий блок описания над рядом.
+    function moveCard(dir) {
+      if (view !== 'results' || !last || !$(last).hasClass('pkr-card')) return false;
+      var idx = -1;
+      for (var i = 0; i < cardEls.length; i++) if (cardEls[i][0] === last) idx = i;
+      if (idx < 0) return false;
+      var next = cardEls[idx + dir];
+      if (next) { Lampa.Controller.collectionFocus(next[0], focusable()); return true; }
+      if (dir < 0) { Lampa.Controller.toggle('menu'); return true; }
+      return true;                                    // правый край ряда — остаёмся
+    }
+
     // Высота экрана: от верха компонента до низа окна
     function fit() {
       try {
@@ -2619,6 +2642,7 @@
         lastWidth = w;
         heroMinH = 0;
         if (heroEl) heroEl.css('min-height', '');
+        if (view === 'results') { measurePage(); if (current) setCurrent(current); sizeCards(); }
       }
     }
 
@@ -2641,6 +2665,35 @@
       heroEl.css('min-height', heroMinH + 'px');
     }
 
+    function isCompact() {
+      try {
+        if ((window.innerWidth || 0) < 768) return false;
+        var fs = parseFloat(window.getComputedStyle(html[0]).fontSize) || 16;
+        return scroller[0].clientHeight / fs < 42;
+      } catch (e) { return false; }
+    }
+
+    // Широкий экран (ТВ): постеры такого размера, чтобы блок описания и ряд карточек помещались вместе
+    function sizeCards() {
+      try {
+        if (!cardEls.length || !heroEl) return;
+        for (var i = 0; i < cardEls.length; i++) cardEls[i].css('width', '');
+        if ((window.innerWidth || 0) < 768) return;     // телефон: свой макет со свайпом
+        var vh = scroller[0].clientHeight;
+        if (!vh) return;
+        var card = cardEls[0], im = card.find('.pkr-card__img');
+        var imgH = im.outerHeight();
+        var below = card.outerHeight() - imgH;          // название и год под постером
+        var gap = card.offset().top - heroEl.offset().top;
+        var avail = vh - gap - below - Math.round(vh * 0.08);
+        if (imgH <= avail) return;
+        var minW = Math.round(vh * 0.26 / 1.5);          // постер не ниже четверти экрана — иначе не разглядеть
+        var w = Math.max(minW, Math.floor(Math.max(avail, 0) / 1.5));
+        w += im.outerWidth() ? card.outerWidth() - im.outerWidth() : 0;   // поля карточки: ширина задаётся вместе с ними
+        for (var j = 0; j < cardEls.length; j++) cardEls[j].css('width', w + 'px');
+      } catch (e) {}
+    }
+
     function holdHeroHeight() {
       if (!heroEl || heroEl.find('.pkr-hero__descr.is-open').length) return;
       var hh = heroEl[0].offsetHeight;
@@ -2659,7 +2712,18 @@
         var pad = Math.round(vh * 0.12);
         var target = null;
 
-        if (el.closest('.pkr-hero, .pkr-actions:not(.pkr-actions--footer), .pkr-tiles, .pkr-last').length && top < vh * 0.6) target = 0;
+        if (el.hasClass('pkr-card') && heroEl && heroEl.closest('html').length) {
+          // Постеры: показываем ряд целиком, но блок описания с рейтингами не уводим за верх экрана
+          var base = scroller.offset().top - sc.scrollTop;
+          var heroTop = heroEl.offset().top - base;
+          var meta = heroEl.find('.pkr-hero__meta');
+          var metaTop = meta.length ? meta.offset().top - base : heroTop;
+          var small = Math.round(vh * 0.04);
+          var need = top + h - vh + small;
+          // Сначала пытаемся сохранить всё описание; если не влезает — жертвуем заголовком, но не рейтингами
+          target = Math.max(0, Math.min(need, need <= heroTop - small ? heroTop - small : metaTop - small));
+        }
+        else if (el.closest('.pkr-hero, .pkr-actions:not(.pkr-actions--footer), .pkr-tiles, .pkr-last').length && top < vh * 0.6) target = 0;
         else if (top < sc.scrollTop + pad) target = top - pad;
         else if (top + h > sc.scrollTop + vh - pad) target = top + h - vh + pad;
 
@@ -2989,8 +3053,10 @@
 
       wrap.append(content);
       setBody(wrap);
+      wrap.toggleClass('is-compact', isCompact());
       measurePage();
       setCurrent(current);
+      sizeCards();
 
       if (!state.logged) {
         Journal.shown(state.journal, state.page, state.pageNo || 1);
@@ -3227,10 +3293,11 @@
           Lampa.Controller.collectionFocus(last || false, focusable());
         },
         left: function () {
+          if (moveCard(-1)) return;
           if (Navigator.canmove('left')) Navigator.move('left');
           else Lampa.Controller.toggle('menu');
         },
-        right: function () { Navigator.move('right'); },
+        right: function () { if (!moveCard(1)) Navigator.move('right'); },
         up: function () {
           if (Navigator.canmove('up')) Navigator.move('up');
           else Lampa.Controller.toggle('head');
