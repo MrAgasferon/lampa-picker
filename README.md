@@ -72,7 +72,7 @@
 2. Вставьте адрес плагина:
 
    ```
-   https://<user>.github.io/<repo>/picker.js
+   https://mragasferon.github.io/lampa-picker/picker.js
    ```
 
 3. Перезапустите Lampa. В меню появится пункт **«Что посмотреть»**.
