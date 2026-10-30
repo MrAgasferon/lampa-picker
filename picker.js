@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.5.3';
+  var VERSION = '0.5.5';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -1856,23 +1856,82 @@
       return txt;
     },
 
-    // Весь журнал, сжатый gzip + base64. Возвращает Promise со строкой или null, если сжатие недоступно
+    // Весь журнал, сжатый gzip + base64 (для консоли). Promise со строкой или null
     exportPacked: function () {
-      var text = this.exportText();
-      if (typeof CompressionStream === 'undefined' || typeof Blob === 'undefined' || typeof Response === 'undefined') {
-        return Promise.resolve(null);
-      }
-      try {
-        var stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
-        return new Response(stream).arrayBuffer().then(function (buf) {
-          var bytes = new Uint8Array(buf);
-          var bin = '';
-          for (var i = 0; i < bytes.length; i += 0x8000) {
-            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-          }
-          return 'LPJ1:' + btoa(bin);
-        })['catch'](function () { return null; });
-      } catch (e) { return Promise.resolve(null); }
+      return gzipB64(this.exportText()).then(function (b) { return b ? 'LPJ1:' + b : null; });
+    },
+
+    // Одна сессия в плотном виде: числа ×100 целыми, причины — только у свежей, профиль — если изменился
+    compactEntry: function (e, withReasons, prevProfile) {
+      var i100 = function (x) { return typeof x === 'number' ? Math.round(x * 100) : 0; };
+      var short = function (t, n) { t = String(t || ''); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
+      var p = e.profile || {};
+      var pr = {
+        an: p.animShare, yf: p.yearFloor,
+        g: (p.genres || []).slice(0, 6), dg: (p.dislikedGenres || []).slice(0, 3),
+        s: (p.seeds || []).slice(0, 5).map(function (x) { return short(x, 22); })
+      };
+      var c = e.counts || {};
+      var o = {
+        at: String(e.at || '').slice(0, 16), v: e.v, ans: e.answers, wk: e.wkey,
+        cnt: [c.events, c.pool, c.prefiltered, c.detailed, c.final],
+        src: e.sources, dr: e.dropped,
+        // название, год, тип+источник, флаги, score, q, an, m, n, s, f, y (×100), tmdb/kp/imdb (×10), голоса, cert, стр/поз[, причина]
+        sh: (e.shown || []).map(function (it) {
+          var row = [short(it.title, 24), it.year, (it.k || '').charAt(0) + String(it.src || '').charAt(0),
+            (it.anim ? 'A' : '') + (it.wath ? 'W' : '') + (it.coll ? 'C' : ''),
+            i100(it.score), i100(it.q), i100(it.an), i100(it.m), i100(it.n), i100(it.s), i100(it.f), i100(it.y),
+            i100((it.tmdb || 0) / 10), i100((it.kp || 0) / 10), i100((it.imdb || 0) / 10), it.votes || 0,
+            it.cert || '', it.page + '/' + it.pos];
+          if (withReasons) row.push(short(it.reason, 30));
+          return row;
+        }),
+        act: (e.actions || []).map(function (x) {
+          var row = [x.sec, x.act];
+          if (x.title) row.push(short(x.title, 18));
+          if (x.act === 'more') row.push(x.opened ? 1 : 0);
+          return row;
+        })
+      };
+      var key = JSON.stringify(pr);
+      if (key !== prevProfile) o.pr = pr;
+      return { o: o, prof: key };
+    },
+
+    // Вариант А: свежие подборы, сколько влезет в одно сообщение (≤ 3900 символов).
+    // Promise → { text, sessions, total, packed }
+    exportFit: function () {
+      var self = this;
+      var all = self.list();
+      var total = all.length;
+      var plain = function () {
+        return { text: self.exportLast(), sessions: total ? 1 : 0, total: total, packed: false };
+      };
+      if (!total) return Promise.resolve({ text: '', sessions: 0, total: 0, packed: false });
+
+      var build = function (n) {
+        var out = [], prev = null;
+        for (var i = 0; i < n; i++) {
+          var r = self.compactEntry(all[total - 1 - i], i === 0, prev);
+          out.push(r.o);
+          prev = r.prof;
+        }
+        return JSON.stringify({ f: 'LPJ2', v: VERSION, kpq: kpQuota().n, mood: MoodsApi.state ? 1 : 0, s: out });
+      };
+
+      var best = null;
+      var step = function (n) {
+        if (n > total) return Promise.resolve(best);
+        return gzipB64(build(n)).then(function (b) {
+          if (b === null) return null;
+          var text = 'LPJ2:' + b;
+          if (text.length > 3900) return best;
+          best = { text: text, sessions: n, total: total, packed: true };
+          return step(n + 1);
+        });
+      };
+
+      return step(1).then(function (res) { return res || plain(); }, function () { return plain(); });
     },
 
     exportText: function () {
@@ -1891,6 +1950,24 @@
       return lines.join('\n');
     }
   };
+
+  // gzip + base64 через CompressionStream. Promise со строкой или null, если сжатие недоступно
+  function gzipB64(text) {
+    if (typeof CompressionStream === 'undefined' || typeof Blob === 'undefined' || typeof Response === 'undefined') {
+      return Promise.resolve(null);
+    }
+    try {
+      var stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+      return new Response(stream).arrayBuffer().then(function (buf) {
+        var bytes = new Uint8Array(buf);
+        var bin = '';
+        for (var i = 0; i < bytes.length; i += 0x8000) {
+          bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(bin);
+      })['catch'](function () { return null; });
+    } catch (e) { return Promise.resolve(null); }
+  }
 
   function copyText(text, ok, fail) {
     var legacy = function () {
@@ -2168,8 +2245,8 @@
     '.pkr-bg__shade{position:absolute;left:0;top:0;right:0;bottom:0;background:linear-gradient(90deg,rgba(0,0,0,.88) 0%,rgba(0,0,0,.55) 45%,rgba(0,0,0,.15) 100%)}',
     '.pkr-content{position:relative;z-index:1}',
     '.pkr-hero{min-height:13.5em;padding:1em 0 0;max-width:44em}',
-    '.pkr-hero__title{font-size:2.6em;font-weight:700;line-height:1.1;text-shadow:0 .1em .5em rgba(0,0,0,.5)}',
-    '.pkr-hero__orig{opacity:.55;margin-top:.35em}',
+    '.pkr-hero__title{font-size:2.6em;font-weight:700;line-height:1.1;text-shadow:0 .1em .5em rgba(0,0,0,.5);overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}',
+    '.pkr-hero__orig{opacity:.55;margin-top:.35em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
     '.pkr-hero__meta{margin-top:.9em;line-height:1}',
     '.pkr-b{display:inline-block;padding:.32em .6em;border-radius:.4em;background:rgba(255,255,255,.15);font-size:.85em;font-weight:600;margin:0 .45em .45em 0;vertical-align:middle;white-space:nowrap}',
     '.pkr-b--match{background:#21c063;color:#062a12}',
@@ -2181,14 +2258,15 @@
     '.pkr-mood i{font-style:normal;opacity:.7;margin-right:.45em;vertical-align:middle}',
     '.pkr-mood b{display:inline-block;width:3.6em;height:.35em;border-radius:.2em;background:rgba(255,255,255,.15);vertical-align:middle;overflow:hidden}',
     '.pkr-mood b span{display:block;height:100%;background:#ffd166;border-radius:.2em}',
-    '.pkr-hero__reason{margin-top:.55em;font-size:1.08em;color:#ffd166;line-height:1.35}',
+    '.pkr-hero__reason{margin-top:.55em;font-size:1.08em;color:#ffd166;line-height:1.35;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}',
     '.pkr-hero__reason svg{width:1.05em;height:1.05em;vertical-align:-.12em;margin-right:.45em}',
     '.pkr-hero__descr{margin-top:.6em;border-radius:.5em;transition:background-color .15s}',
-    '.pkr-hero__text{opacity:.75;line-height:1.45;max-height:2.9em;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}',
-    '.pkr-hero__more{display:none;font-size:.85em;font-weight:600;color:#ffd166;margin-top:.35em;padding:.5em .9em;border-radius:2em;background:rgba(255,209,102,.12)}',
-    '.pkr-hero__descr.is-long .pkr-hero__more{display:inline-block}',
-    '.pkr-hero__descr.is-long{cursor:pointer;margin-left:-.5em;margin-right:-.5em;padding:.3em .5em}',
-    '.pkr-hero__descr.is-open .pkr-hero__text{max-height:none;display:block;-webkit-line-clamp:unset;opacity:.9}',
+    '.pkr-hero__text{opacity:.75;line-height:1.45;min-height:2.9em;max-height:2.9em;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}',
+    '.pkr-hero__more{display:inline-block;visibility:hidden;font-size:.85em;font-weight:600;color:#ffd166;margin-top:.35em;padding:.5em .9em;border-radius:2em;background:rgba(255,209,102,.12)}',
+    '.pkr-hero__descr.is-long .pkr-hero__more{visibility:visible}',
+    '.pkr-hero__descr{margin-left:-.5em;margin-right:-.5em;padding:.3em .5em}',
+    '.pkr-hero__descr.is-long{cursor:pointer}',
+    '.pkr-hero__descr.is-open .pkr-hero__text{max-height:none;min-height:0;display:block;-webkit-line-clamp:unset;opacity:.9}',
     '.pkr-hero__descr.focus{background:rgba(255,255,255,.1)}',
     '.pkr-debug{margin-top:.6em;font-family:monospace;font-size:.78em;opacity:.55}',
     '.pkr-note{font-size:.82em;opacity:.5;margin:.2em 0 .8em}',
@@ -2243,7 +2321,7 @@
     '.pkr-bg{left:-1em;right:-1em;top:-1em;height:24em}',
     '.pkr-hero{min-height:0;padding-top:.6em}',
     '.pkr-hero__title{font-size:1.75em}',
-    '.pkr-hero__text{max-height:4.35em;-webkit-line-clamp:3}',
+    '.pkr-hero__text{min-height:4.35em;max-height:4.35em;-webkit-line-clamp:3}',
     '.pkr-hero__more{min-height:44px;line-height:28px;padding:8px 18px;margin-top:.5em;box-sizing:border-box}',
     '.pkr-row{margin:0 -1em;padding:.7em .65em .4em;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}',
     '.pkr-card{width:38%;padding:0 .35em}',
@@ -2297,6 +2375,7 @@
     var state = null;
     var current = null;       // карточка, показанная в блоке описания
     var heroEl, bgA, bgB, bgFront = 0, cardEls = [];
+    var heroMinH = 0, lastWidth = 0;
     var stageEl = null;
 
     // ---- служебное
@@ -2310,6 +2389,40 @@
         var h = (window.innerHeight || document.documentElement.clientHeight) - Math.max(0, top);
         if (h > 100) html.css('height', h + 'px');
       } catch (e) {}
+      // Изменилась ширина — переносы строк другие, высоту блока описания пересчитываем.
+      // Высоту не трогаем: в мобильных браузерах resize приходит и при скрытии адресной строки
+      var w = window.innerWidth || 0;
+      if (w !== lastWidth) {
+        lastWidth = w;
+        heroMinH = 0;
+        if (heroEl) heroEl.css('min-height', '');
+      }
+    }
+
+    // Заранее меряем блок описания для всех карточек страницы — с запасом под плашки КП и IMDb,
+    // которые приходят позже. Тогда сетка не сдвигается ни при переходе, ни при загрузке рейтингов
+    function measurePage() {
+      if (!heroEl || !state) return;
+      for (var i = 0; i < state.page.length; i++) {
+        var it = state.page[i];
+        var kp = it.kp, im = it.imdbR;
+        if (!kp) it.kp = 9.9;
+        if (!im) it.imdbR = 9.9;
+        heroEl.html(heroHtml(it));
+        it.kp = kp; it.imdbR = im;
+        var t = heroEl.find('.pkr-hero__text')[0];
+        if (t && t.scrollHeight > t.clientHeight + 2) heroEl.find('.pkr-hero__descr').addClass('is-long');
+        var hh = heroEl[0].offsetHeight;
+        if (hh > heroMinH) heroMinH = hh;
+      }
+      heroEl.css('min-height', heroMinH + 'px');
+    }
+
+    function holdHeroHeight() {
+      if (!heroEl || heroEl.find('.pkr-hero__descr.is-open').length) return;
+      var hh = heroEl[0].offsetHeight;
+      if (hh > heroMinH) heroMinH = hh;
+      heroEl.css('min-height', heroMinH + 'px');
     }
 
     // Прокрутка к элементу в фокусе (для пульта)
@@ -2499,7 +2612,7 @@
       }
       if (it.reason) h += '<div class="pkr-hero__reason">' + svg('sparkle') + esc(it.reason) + '</div>';
       var descr = c.card && c.card.overview;
-      if (descr) h += '<div class="pkr-hero__descr"><div class="pkr-hero__text">' + esc(descr) + '</div><div class="pkr-hero__more"><span>Читать полностью</span> ▾</div></div>';
+      h += '<div class="pkr-hero__descr"><div class="pkr-hero__text">' + esc(descr || '') + '</div><div class="pkr-hero__more"><span>Читать полностью</span> ▾</div></div>';
 
       if (isDebug() && it.parts) {
         var p = it.parts;
@@ -2540,6 +2653,7 @@
         lastToggle = now();
         var open = !d.hasClass('is-open');
         d.toggleClass('is-open', open);
+        heroEl.css('min-height', open ? '' : heroMinH + 'px');
         d.find('.pkr-hero__more').html('<span>' + (open ? 'Свернуть' : 'Читать полностью') + '</span> ' + (open ? '▴' : '▾'));
         if (state) Journal.action(state.journal, open ? 'descr_open' : 'descr_close', current);
       };
@@ -2557,6 +2671,7 @@
       current = it;
       heroEl.html(heroHtml(it));
       bindDescr();
+      holdHeroHeight();
       for (var i = 0; i < cardEls.length; i++) cardEls[i].toggleClass('is-active', state.page[i] === it);
       setBackdrop(it);
     }
@@ -2650,6 +2765,7 @@
 
       wrap.append(content);
       setBody(wrap);
+      measurePage();
       setCurrent(current);
 
       if (!state.logged) {
@@ -2687,7 +2803,7 @@
             if (badge.length) badge.text(txt);
             else cardEls[idx].find('.pkr-card__img').append('<div class="pkr-card__rate">' + txt + '</div>');
             if (it.kp) cardEls[idx].find('.pkr-card__rate').addClass('is-kp');
-            if (current === it && !heroEl.find(".pkr-hero__descr.is-open").length) { heroEl.html(heroHtml(it)); bindDescr(); }
+            if (current === it && !heroEl.find(".pkr-hero__descr.is-open").length) { heroEl.html(heroHtml(it)); bindDescr(); holdHeroHeight(); }
           });
         })(page[i]);
       }
@@ -2758,32 +2874,35 @@
       view = 'journal';
       var list = Journal.list();
       var text = Journal.exportText();
-      var lastText = Journal.exportLast();
-
+      
       var wrap = $('<div class="pkr-journal"></div>');
       wrap.append('<div class="pkr-step">Что посмотреть</div>');
       wrap.append('<div class="pkr-j__title">Журнал подборов</div>');
       wrap.append('<div class="pkr-j__sub">Сессий: ' + list.length + '. ' +
-        '«Последний подбор» помещается в одно сообщение (' + lastText.length + ' симв.). ' +
-        '«Весь журнал» сжат (gzip + base64) — для разбора разработчиком. ' +
+        '«Скопировать журнал» берёт последние подборы — сколько поместится в одно сообщение мессенджера (обычно 3–4), в сжатом виде. ' +
+        '«Последний подбор текстом» — читаемый вариант одной сессии. ' +
         (Durable.persistent() ? 'Хранится только на этом устройстве.' : 'IndexedDB недоступен — журнал живёт до перезапуска.') + '</div>');
 
       var actions = $('<div class="pkr-actions"></div>');
       if (list.length) {
-        actions.append(button('copy', 'Последний подбор', 'pkr-btn--primary', function () {
+        actions.append(button('copy', 'Скопировать журнал', 'pkr-btn--primary', function () {
+          Journal.exportFit().then(function (r) {
+            copyText(r.text, function () {
+              noty(r.packed
+                ? 'Скопировано: ' + r.sessions + ' из ' + r.total + ' подборов, ' + r.text.length + ' симв.'
+                : 'Сжатие недоступно — скопирован последний подбор текстом');
+            }, function () { noty('Не удалось скопировать в буфер'); });
+          });
+        }));
+        actions.append(button('copy', 'Последний подбор текстом', '', function () {
           copyText(Journal.exportLast(), function () { noty('Скопировано: последний подбор'); },
             function () { noty('Не удалось скопировать в буфер'); });
         }));
-        actions.append(button('copy', 'Весь журнал (сжато)', '', function () {
-          Journal.exportPacked().then(function (packed) {
-            if (!packed) return noty('Сжатие не поддерживается на этом устройстве — используйте «Последний подбор»');
-            copyText(packed, function () { noty('Скопировано: ' + list.length + ' сессий, ' + packed.length + ' симв.'); },
-              function () { noty('Не удалось скопировать в буфер'); });
-          });
-        }));
         if (canShare()) actions.append(button('share', 'Поделиться', '', function () {
           try {
-            navigator.share({ title: 'Журнал подборщика Lampa', text: Journal.exportLast() })['catch'](function () {});
+            Journal.exportFit().then(function (r) {
+              navigator.share({ title: 'Журнал подборщика Lampa', text: r.text })['catch'](function () {});
+            });
           } catch (e) { noty('Поделиться не получилось'); }
         }));
       }
@@ -2981,6 +3100,7 @@
     journal: function () { var t = Journal.exportText(); console.log(t); return t; },
     journalLast: function () { return Journal.exportLast(); },
     journalPacked: function () { return Journal.exportPacked(); },
+    journalFit: function () { return Journal.exportFit(); },
     reset: function () { save('feedback', {}); save('seen', {}); save('last_answers', null); return 'reset'; }
   };
 
