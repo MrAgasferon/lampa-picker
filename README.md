@@ -6,7 +6,7 @@
 
 **Три вопроса пультом — пять вариантов, которые подходят именно вам.**
 
-![version](https://img.shields.io/badge/версия-0.7.2-e50914?style=flat-square)
+![version](https://img.shields.io/badge/версия-0.7.4-e50914?style=flat-square)
 ![lampa](https://img.shields.io/badge/Lampa%20·%20ByLampa-поддерживается-1f6feb?style=flat-square)
 ![privacy](https://img.shields.io/badge/данные-только%20на%20устройстве-2ea043?style=flat-square)
 
