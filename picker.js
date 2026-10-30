@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.6.3';
+  var VERSION = '0.7.0';
   var NS = 'picker_';
   var DAY = 864e5;
 
@@ -459,78 +459,105 @@
   }
 
   // =========================================================================
-  // Шкалы настроения (amodb через прокси ByLampa, если доступно)
+  // Шкалы настроения (метаданные CUB)
   // =========================================================================
 
-  var MOOD_ALIASES = {
-    fear: ['fear', 'scary', 'horror', 'страх', 'тревож'],
-    humor: ['humor', 'humour', 'funny', 'comedy', 'юмор', 'смеш'],
-    sadness: ['sad', 'грус', 'печал'],
-    violence: ['violen', 'gore', 'blood', 'насили', 'жесто', 'агресс'],
-    action: ['action', 'экшн', 'динами'],
-    pace: ['pace', 'tempo', 'темп'],
-    profanity: ['profan', 'swear', 'language', 'брань', 'лексик', 'мат'],
-    tension: ['tension', 'suspense', 'tense', 'напряж'],
-    romance: ['roman', 'love', 'романт', 'любов']
-  };
+  // Шкалы содержания из CUB: тот же источник, что показывает сама Lampa в карточке фильма
+  // (блок «Метаданные» и теги настроения). Есть только для фильмов.
+  var MoodsApi = { state: null, asked: 0, got: 0 };
+  var CUB_META_N = 20;              // запрашиваем только для финалистов
+  var CUB_META_DEADLINE = 6000;     // подбор не ждёт CUB дольше
+  var CUB_EMPTY_TTL = 7 * DAY;      // «данных нет» перепроверяем раз в неделю
 
-  // Формат ответа не задокументирован — собираем все числовые шкалы 0–10 (или 0–100) на глубине до 3
-  function parseMoods(raw) {
-    if (!raw || typeof raw !== 'object') return null;
-    var flat = {};
-    var walk = function (o, depth, prefix) {
-      if (!o || depth > 3) return;
-      if (Object.prototype.toString.call(o) === '[object Array]') {
-        for (var i = 0; i < o.length; i++) {
-          var e = o[i];
-          if (e && typeof e === 'object') {
-            var name = e.name || e.key || e.mood || e.title || e.id;
-            var val = e.value !== undefined ? e.value : (e.score !== undefined ? e.score : e.rating);
-            if (name && typeof val === 'number') flat[String(name).toLowerCase()] = val;
-            else walk(e, depth + 1, prefix);
-          }
-        }
-        return;
-      }
-      each(o, function (v, k) {
-        if (typeof v === 'number') flat[(prefix + k).toLowerCase()] = v;
-        else if (v && typeof v === 'object') walk(v, depth + 1, k + '.');
-      });
-    };
-    walk(raw, 0, '');
-
-    var out = {}, found = 0;
-    var max = 0;
-    each(flat, function (v) { if (v > max) max = v; });
-    var scale = max > 10 ? 10 : 1; // проценты → 0–10
-    each(MOOD_ALIASES, function (al, key) {
-      each(flat, function (v, name) {
-        if (out[key] !== undefined) return;
-        for (var i = 0; i < al.length; i++) {
-          if (name.indexOf(al[i]) > -1 && name.indexOf('id') !== 0) { out[key] = clamp(v / scale, 0, 10); found++; return; }
-        }
-      });
-    });
-    return found ? out : null;
+  function cubMetaOff() {
+    try { return !!(window.lampa_settings && window.lampa_settings.disable_features && window.lampa_settings.disable_features.metadata); }
+    catch (e) { return false; }
   }
 
-  var MoodsApi = { state: null };
+  function cubMetaUrl(id) {
+    var proto = 'https://';
+    try { if (Lampa.Utils && Lampa.Utils.protocol) proto = Lampa.Utils.protocol(); } catch (e) {}
+    var dom = (Lampa.Manifest && Lampa.Manifest.cub_domain) || 'cub.best';
+    return proto + dom + '/api/ai/video-view/' + id + '/metadata?type=movie';
+  }
 
-  // Пробный запрос раз в сутки: отдаёт ли прокси пользователя эндпоинт /moods
-  function probeMoods(cb) {
-    var cached = store('moods_probe', {});
-    if (cached.day === todaySeed() && typeof cached.ok === 'boolean') {
-      MoodsApi.state = cached.ok;
-      return cb(cached.ok);
+  // review: [{name, values[], avg 0–10}], moods: [{name, percent}]
+  function parseCubMeta(j) {
+    if (!j || j.status !== 'completed' || !j.review || !j.review.length) return null;
+    var out = {}, n = 0;
+    for (var i = 0; i < j.review.length; i++) {
+      var m = j.review[i];
+      if (m && m.name && typeof m.avg === 'number') { out[String(m.name).toLowerCase()] = clamp(m.avg, 0, 10); n++; }
     }
-    tmdb('movie/550/moods', {}, DAY, function (raw) {
-      var parsed = parseMoods(raw);
-      var ok = !!parsed;
-      MoodsApi.state = ok;
-      save('moods_probe', { day: todaySeed(), ok: ok, sample: raw ? JSON.stringify(raw).slice(0, 600) : null });
-      log('moods probe', ok, raw);
-      cb(ok);
+    return n ? out : null;
+  }
+
+  // Отдельная маленькая очередь: CUB не должен занимать слоты TMDB и Кинопоиска
+  var CubNet = {
+    queue: [], active: 0, max: 2,
+    get: function (url, ok, fail) { this.queue.push({ url: url, ok: ok, fail: fail }); this.pump(); },
+    pump: function () {
+      var self = this;
+      while (self.active < self.max && self.queue.length) {
+        (function (job) {
+          self.active++;
+          var settled = false;
+          var end = function (fn, arg) {
+            if (settled) return; settled = true;
+            self.active--;
+            try { fn && fn(arg); } catch (e) { log('cub callback error', e); }
+            self.pump();
+          };
+          var req = new Lampa.Reguest();
+          req.timeout(5000);
+          req.silent(job.url, function (j) { end(job.ok, j); }, function (a) { end(job.fail, (a && a.status) || 0); });
+          setTimeout(function () { end(job.fail, 0); }, 6000); // страховка, если таймаут Reguest не сработал
+        })(self.queue.shift());
+      }
+    },
+    drop: function () { this.queue = []; }
+  };
+
+  function cubMeta(id, cb) {
+    var ck = 'cub:' + id;
+    Cache.get(ck, 30 * DAY, function (hit) {
+      if (hit && (hit.s || now() - (hit.at || 0) < CUB_EMPTY_TTL)) return cb(hit.s || null, true);
+      CubNet.get(cubMetaUrl(id), function (j) {
+        if (j && typeof j === 'object' && j.status) {
+          var sc = parseCubMeta(j);
+          Cache.set(ck, { s: sc, at: now() });
+          cb(sc, false);
+        } else cb(null, false);
+      }, function () { cb(null, false); });
     });
+  }
+
+  // Подтягивает шкалы для лучших фильмов списка; не ждёт дольше CUB_META_DEADLINE
+  function attachCubMeta(list, cb) {
+    var fired = false;
+    var finish = function () { if (fired) return; fired = true; cb(); };
+    if (cubMetaOff()) { MoodsApi.state = false; return finish(); }
+    var todo = list.filter(function (it) { return it.c && it.c.type === 'movie' && !it.c.moods; })
+      .sort(function (a, b) { return b.score - a.score; }).slice(0, CUB_META_N);
+    MoodsApi.asked = todo.length; MoodsApi.got = 0;
+    for (var k = 0; k < list.length; k++) if (list[k].c && list[k].c.moods) MoodsApi.got++;
+    if (!todo.length) { MoodsApi.state = MoodsApi.got > 0; return finish(); }
+    var left = todo.length;
+    setTimeout(function () { if (!fired) { log('cub meta deadline, left', left); CubNet.drop(); } finish(); }, CUB_META_DEADLINE);
+    for (var i = 0; i < todo.length; i++) {
+      (function (it) {
+        cubMeta(it.id, function (sc) {
+          if (sc && !fired) { it.c.moods = sc; MoodsApi.got++; }
+          if (--left === 0) { MoodsApi.state = MoodsApi.got > 0; finish(); }
+        });
+      })(todo[i]);
+    }
+  }
+
+  // Совместимость: раньше здесь была суточная проба прокси, теперь проверка не нужна
+  function probeMoods(cb) {
+    MoodsApi.state = cubMetaOff() ? false : null;
+    cb(!cubMetaOff());
   }
 
   function mv(c, key) {
@@ -596,8 +623,7 @@
       names: names,
       lang: d.original_language || '',
       cert: certOf(type, d),
-      moods: d.moods ? parseMoods(d.moods) : null,
-      moodsRaw: d.moods ? JSON.stringify(d.moods).slice(0, 400) : null,
+      moods: null,
       coll: d.belongs_to_collection ? d.belongs_to_collection.id : null,
       imdb: (d.external_ids && d.external_ids.imdb_id) || d.imdb_id || null,
       va: d.vote_average || 0,
@@ -622,7 +648,6 @@
     var append = type === 'movie'
       ? 'keywords,credits,release_dates,external_ids'
       : 'keywords,credits,content_ratings,external_ids';
-    if (MoodsApi.state === true) append += ',moods';
     tmdb(type + '/' + id, { append_to_response: append }, 30 * DAY, function (d) {
       cb(d && d.id ? compact(type, d) : null);
     });
@@ -1224,7 +1249,7 @@
       typeof profile.animShare === 'number' && profile.animShare < 0.2) return 'anim_format';
 
     if (ans.company === 'kids') {
-      if (c.moods && ((mv(c, 'fear') || 0) > 6 || (mv(c, 'violence') || 0) > 5 || (mv(c, 'profanity') || 0) > 3)) return 'kids_moods';
+      if (c.moods && ((mv(c, 'fear') || 0) > 6 || (mv(c, 'violence') || 0) > 5 || (mv(c, 'profanity') || 0) > 3 || (mv(c, 'sex') || 0) > 2)) return 'kids_moods';
       if (!kidsOk(c.cert)) return 'kids_cert';
       if (c.genres.indexOf(27) > -1 || c.genres.indexOf(10752) > -1) return 'kids_genre';
     }
@@ -1660,6 +1685,23 @@
 
         var afterDetails = function () {
           scoreAll(passed, profile, ans);
+          stage('Уточняю настроение');
+          attachCubMeta(passed, function () {
+            if (!alive()) return;
+            // Шкалы пришли после фильтров — для детей проверяем ещё раз
+            if (ans.company === 'kids') {
+              passed = passed.filter(function (it) {
+                var r = postReason(it, ans, profile);
+                if (r) { stats[r] = (stats[r] || 0) + 1; return false; }
+                return true;
+              });
+            }
+            finishPick();
+          });
+        };
+
+        var finishPick = function () {
+          scoreAll(passed, profile, ans);
           franchiseFilter(passed, events, ans, stats, profile, function (finalList) {
           if (!alive()) return;
           var top = list.slice(0, offset);
@@ -1674,7 +1716,7 @@
             profile: profile, wkey: wkey, cold: profile.n < 5
           };
           st.journal = Journal.begin(ans, {
-            wkey: wkey, ms: now() - started, moods: MoodsApi.state,
+            wkey: wkey, ms: now() - started, moods: MoodsApi.state, cub: [MoodsApi.got, MoodsApi.asked],
             counts: { events: events.length, profile: profile.n, pool: Object.keys(pool).length - 1, prefiltered: list.length, detailed: top.length, final: finalList.length },
             sources: pool.__src,
             dropped: stats,
@@ -1963,7 +2005,7 @@
         sessions: a.length,
         ua: (navigator.userAgent || '').slice(0, 120),
         kpQuotaToday: kpQuota().n,
-        moodsProbe: store('moods_probe', {})
+        cubMeta: { off: cubMetaOff(), got: MoodsApi.got, asked: MoodsApi.asked }
       };
       var lines = [JSON.stringify(head)];
       for (var i = 0; i < a.length; i++) lines.push(JSON.stringify(a[i]));
@@ -2276,6 +2318,7 @@
 
     /* Мастер */
     '.pkr-step{font-size:.8em;letter-spacing:.18em;text-transform:uppercase;opacity:.5}',
+    '.pkr-ver{margin-left:.6em;letter-spacing:.05em;text-transform:none;opacity:.7}',
     '.pkr-dots{margin-top:.7em;line-height:0}',
     '.pkr-dots span{display:inline-block;width:2.4em;height:.25em;border-radius:.2em;background:rgba(255,255,255,.18);margin-right:.4em;transition:background-color .3s}',
     '.pkr-dots span.on{background:#fff}',
@@ -2557,7 +2600,8 @@
       var dots = '';
       for (var i = 0; i < STEPS.length; i++) dots += '<span class="' + (i <= n ? 'on' : '') + '"></span>';
 
-      wrap.append('<div class="pkr-step">Что посмотреть · шаг ' + (n + 1) + ' из ' + STEPS.length + '</div>');
+      wrap.append('<div class="pkr-step">Что посмотреть · шаг ' + (n + 1) + ' из ' + STEPS.length +
+        (n === 0 ? '<span class="pkr-ver">v' + VERSION + '</span>' : '') + '</div>');
       wrap.append('<div class="pkr-dots">' + dots + '</div>');
       wrap.append('<div class="pkr-q">' + esc(def.q) + '</div>');
 
@@ -2673,7 +2717,7 @@
       h += '<div class="pkr-hero__meta">' + meta + '</div>';
 
       if (c.moods) {
-        var labels = { humor: 'Юмор', romance: 'Романтика', fear: 'Страх', tension: 'Напряжение', violence: 'Насилие', sadness: 'Грусть', action: 'Экшн', pace: 'Темп', profanity: 'Брань' };
+        var labels = { humor: 'Юмор', romance: 'Романтика', fear: 'Страх', tension: 'Напряжение', violence: 'Насилие', sadness: 'Грусть', action: 'Экшн', pace: 'Темп', profanity: 'Лексика', sex: 'Откровенность' };
         var sc = [];
         each(labels, function (lbl, key) { if (typeof c.moods[key] === 'number') sc.push({ l: lbl, v: c.moods[key] }); });
         sc.sort(function (a, b) { return b.v - a.v; });
@@ -2951,7 +2995,7 @@
       var text = Journal.exportText();
       
       var wrap = $('<div class="pkr-journal"></div>');
-      wrap.append('<div class="pkr-step">Что посмотреть</div>');
+      wrap.append('<div class="pkr-step">Что посмотреть<span class="pkr-ver">v' + VERSION + '</span></div>');
       wrap.append('<div class="pkr-j__title">Журнал подборов</div>');
       wrap.append('<div class="pkr-j__sub">Сессий: ' + list.length + '. ' +
         '«Скопировать журнал» берёт последние подборы — сколько поместится в одно сообщение мессенджера (обычно 3–4), в сжатом виде. ' +
@@ -3124,6 +3168,11 @@
       Lampa.SettingsApi.addComponent({ component: 'lampa_picker', name: 'Что посмотреть', icon: ICON });
       Lampa.SettingsApi.addParam({
         component: 'lampa_picker',
+        param: { name: NS + 'about', type: 'static' },
+        field: { name: 'Версия ' + VERSION, description: 'Подборщик фильмов и сериалов на вечер' }
+      });
+      Lampa.SettingsApi.addParam({
+        component: 'lampa_picker',
         param: { name: NS + 'kp_key', type: 'input', values: '', placeholder: 'например, 0a1b2c3d-…', default: '' },
         field: {
           name: 'Ключ Кинопоиска',
@@ -3185,7 +3234,10 @@
       }
       report.localStorage = { pluginChars: mine, totalChars: total, totalPctOf5M: Math.round(total / 50000) };
     } catch (e) {}
-    probeMoods(function (ok) { console.log('[Picker] moods endpoint:', ok ? 'доступен' : 'нет', store('moods_probe', {})); });
+    if (cubMetaOff()) console.log('[Picker] CUB metadata: отключено в сборке');
+    else CubNet.get(cubMetaUrl(603), function (j) {
+      console.log('[Picker] CUB metadata:', j && j.status === 'completed' ? 'OK' : 'нет данных', parseCubMeta(j));
+    }, function (st) { console.log('[Picker] CUB metadata: FAIL', st); });
 
     console.log('[Picker] diag', report);
     tmdb('movie/27205', {}, 0, function (d) {
