@@ -13,7 +13,7 @@
   var VERSION = '0.7.4';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
-  var FEEDBACK_URL = '';
+  var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
   var FEEDBACK_DAILY = 5;
   var NS = 'picker_';
   var DAY = 864e5;
