@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.8.0';
+  var VERSION = '0.8.1';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
@@ -132,7 +132,8 @@
     relax: { title: 'Расслабиться', w: { 35: 1, 10749: 0.8, 10402: 0.6, 12: 0.4, 14: 0.3, 18: 0.1, 28: -0.3, 9648: -0.3, 80: -0.5, 53: -0.8, 10752: -0.8, 27: -1 } },
     laugh: { title: 'Посмеяться', w: { 35: 1, 10402: 0.2, 12: 0.1, 18: -0.2, 53: -0.4, 10752: -0.6, 27: -0.6 }, req: 35 },
     nerves: { title: 'Пощекотать нервы', w: { 53: 1, 27: 1, 9648: 0.8, 80: 0.7, 28: 0.5, 878: 0.3, 35: -0.3, 10749: -0.3, 16: -0.3, 10751: -0.8 } },
-    think: { title: 'Подумать', w: { 99: 1, 18: 0.8, 878: 0.8, 9648: 0.8, 36: 0.8, 10752: 0.5, 80: 0.4, 35: -0.2, 16: -0.2, 10751: -0.6 } },
+    // Драма в TMDB стоит у половины кино — сама по себе «думающим» фильм не делает
+    think: { title: 'Подумать', w: { 878: 0.8, 9648: 0.8, 36: 0.8, 99: 0.6, 10752: 0.5, 18: 0.5, 80: 0.4, 35: -0.5, 16: -0.3, 27: -0.8, 10751: -0.8, 10749: -0.2, 10402: -0.3 } },
     surprise: { title: 'Удиви меня', w: {} }
   };
 
@@ -470,7 +471,7 @@
   // (блок «Метаданные» и теги настроения). Есть только для фильмов.
   var MoodsApi = { state: null, asked: 0, got: 0 };
   var CUB_META_N = 20;              // запрашиваем только для финалистов
-  var CUB_META_DEADLINE = 6000;     // подбор не ждёт CUB дольше
+  var CUB_META_DEADLINE = 5000;     // подбор не ждёт CUB дольше
   var CUB_EMPTY_TTL = 7 * DAY;      // «данных нет» перепроверяем раз в неделю
 
   function cubMetaOff() {
@@ -1446,7 +1447,7 @@
         if (gw > maxPos) maxPos = gw;
         if (gw < 0) neg += gw;
       }
-      m = 0.3 + 0.7 * maxPos + 0.5 * neg;
+      m = 0.3 + 0.7 * maxPos + neg;   // штрафы — полностью: комедия или ужасы портят «Подумать» целиком
       if (mood.req && c.genres.indexOf(mood.req) < 0) m = Math.min(m, 0.15);
     }
 
@@ -1469,11 +1470,13 @@
 
     return clamp(m, 0, 1);
   }
-  function novelty(c, profile) {
+  // Незнакомый жанр — главная новизна только в «Удиви меня»; в остальных настроениях она почти не тянет
+  function novelty(c, profile, ans) {
+    var gw = ans && ans.mood === 'surprise' ? 0.6 : 0.15;
     var n = 0;
     var f = featuresOf(c);
     for (var i = 0; i < f.genre.length; i++) {
-      if (profile.recentGenres.indexOf(f.genre[i]) < 0) { n += 0.6; break; }
+      if (profile.recentGenres.indexOf(f.genre[i]) < 0) { n += gw; break; }
     }
     if (f.decade.length && profile.recentDecades.indexOf(f.decade[0]) < 0) n += 0.2;
     var y = parseInt(c.year, 10);
@@ -1569,6 +1572,8 @@
     return '';
   }
 
+  var DISLIKE_AT = -0.6, DISLIKE_MULT = 0.6;
+
   function scoreAll(items, profile, ans) {
     var pw = pickWeights(ans, profile);
     var w = pw.w;
@@ -1592,7 +1597,7 @@
         q: qq.q, r: qq.r, rc: qq.corr, rb: qq.boost,
         a: aa.a, best: aa.best,
         m: moodScore(c, ans),
-        n: novelty(c, profile),
+        n: novelty(c, profile, ans),
         s: it.wath ? 1 : Math.min(it.seedHits / 3, 1)
       };
       it.parts = parts;
@@ -1623,9 +1628,15 @@
       // Настроение — множитель: «Позже» или высокий рейтинг не вытащат фильм, который не подходит под запрос
       var rest = 1 - w.m;
       var base = (w.q * pt.q + w.a * pt.an + w.n * pt.n + w.s * pt.s) / (rest > 0 ? rest : 1);
-      var moodGate = w.m > 0 ? 0.35 + 0.65 * pt.m : 1;
+      var moodGate = w.m > 0 ? 0.15 + 0.85 * pt.m : 1;
+      // Нелюбимый жанр (заметный минус в профиле) — отдельный множитель; «Позже» — явный выбор, не трогаем
+      pt.d = 1;
+      if (!x.wath) {
+        var gs = x.c.genres || [];
+        for (var dg = 0; dg < gs.length; dg++) if ((profile.f.genre || {})[gs[dg]] <= DISLIKE_AT) { pt.d = DISLIKE_MULT; break; }
+      }
       pt.y = x.wath ? 1 : yearFactor(x.c, profile, ans); // «Позже» — явный выбор, годы не штрафуем
-      x.score = base * moodGate * (0.3 + 0.7 * pt.f) * pt.y;
+      x.score = base * moodGate * (0.3 + 0.7 * pt.f) * pt.y * pt.d;
       x.reason = reasonOf(x, pt, w, profile, ans);
     }
 
@@ -1815,10 +1826,19 @@
           });
         };
 
+        var kpBefore = 0;
         var afterDetails = function () {
           scoreAll(passed, profile, ans);
-          stage('Уточняю настроение');
-          attachCubMeta(passed, function () {
+          stage('Уточняю настроение и рейтинги');
+          // Шкалы CUB и оценки КП — одновременно: ждём не дольше самого долгого из двух (~5 с)
+          kpBefore = kpQuota().n;
+          var pending = 2;
+          var both = function () { if (--pending === 0) afterExtras(); };
+          attachCubMeta(passed, both);
+          attachRatings(passed, both);
+        };
+
+        var afterExtras = function () {
             if (!alive()) return;
             // Шкалы пришли после фильтров — для детей проверяем ещё раз
             if (ans.company === 'kids') {
@@ -1829,17 +1849,11 @@
               });
             }
             finishPick();
-          });
         };
 
         var finishPick = function () {
           scoreAll(passed, profile, ans);
           franchiseFilter(passed, events, ans, stats, profile, function (finalList) {
-          if (!alive()) return;
-          scoreAll(finalList, profile, ans);
-          var kpBefore = kpQuota().n;
-          stage('Сверяю с Кинопоиском');
-          attachRatings(finalList, function () {
           if (!alive()) return;
           var top = list.slice(0, offset);
           var wkey = scoreAll(finalList, profile, ans);
@@ -1863,7 +1877,6 @@
             top: finalList.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).map(journalItem)
           });
           if (h.done) h.done(st);
-          });
           });
         };
 
@@ -1896,7 +1909,7 @@
       kp: it.kp || null,
       imdb: it.imdbR || null,
       rsrc: it.rt ? it.rt.src : null,
-      rc: round3(p.rc), rb: round3(p.rb),
+      rc: round3(p.rc), rb: round3(p.rb), d: p.d === 1 || p.d === undefined ? undefined : round3(p.d),
       score: round3(it.score),
       q: round3(p.q), a: round3(p.a), an: round3(p.an), m: round3(p.m), n: round3(p.n), s: round3(p.s), f: round3(p.f), y: round3(p.y),
       src: it.src || null,
@@ -2302,7 +2315,7 @@
 
   // Отдельная очередь КП: не мешает TMDB, короткий таймаут, без повторов.
   // Два сетевых сбоя подряд (источник недоступен) — час только кеш.
-  var KP_TIMEOUT = 6000, KP_OFF_FOR = 3600 * 1000;
+  var KP_TIMEOUT = 4500, KP_OFF_FOR = 3600 * 1000;
   var kpRunCap = 0;           // потолок квоты на время текущего подбора (0 — нет)
   var kpNetFails = 0;
   var KpNet = {
@@ -2330,7 +2343,7 @@
           var req = new Lampa.Reguest();
           req.timeout(KP_TIMEOUT);
           req.silent(job.url, function (j) { kpNetFails = 0; end(job.ok, j); }, function (a) { onFail((a && a.status) || 0); }, false, job.opts);
-          setTimeout(function () { if (!settled) onFail(0); }, KP_TIMEOUT + 1000);
+          setTimeout(function () { if (!settled) onFail(0); }, KP_TIMEOUT + 300);
         })(self.queue.shift());
       }
     }
@@ -2453,7 +2466,7 @@
   }
 
   // Оценки для финалистов перед окончательным порядком: кеш, затем запросы. Подбор ждёт не дольше дедлайна.
-  var KP_FINALISTS = 20, KP_DEADLINE = 8000;
+  var KP_FINALISTS = 20, KP_DEADLINE = 5000;
   // Запросов на один подбор: встроенный ключ общий и маленький — не выжигаем его за раз
   var KP_RUN_BUDGET_BUILTIN = 12, KP_RUN_BUDGET_PERSONAL = 40;
 
@@ -3304,7 +3317,12 @@
         (function (it) {
           if (it.ratingsTried) return;
           it.ratingsTried = true;
-          fetchRatings(it, function (r) {
+          // Встроенный ключ маленький: плагин тратит его на финалистов, плашки дальше — только из кеша
+          var getR = kpUsingBuiltin() ? function (x, cb) {
+            var cr = x.c ? cachedRatings(x.c, x.k) : null;
+            cb(cr ? { kp: cr.kp, imdb: cr.imdb, src: 'cache' } : null);
+          } : fetchRatings;
+          getR(it, function (r) {
             if (!r) return;
             it.kp = r.kp || it.kp || 0;
             it.imdbR = r.imdb || it.imdbR || 0;
