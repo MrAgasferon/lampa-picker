@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.7.6';
+  var VERSION = '0.8.0';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
@@ -1352,23 +1352,62 @@
     try { return Lampa.Storage.cache('kp_rating', 500, {}) || {}; } catch (e) { return {}; }
   }
 
-  function quality(c, C, kp) {
-    var ratings = [];
-    if (c.va > 0) ratings.push(c.va);
-    var rec = kp[c.id];
-    if (rec) {
-      if (parseFloat(rec.kp) > 0) ratings.push(parseFloat(rec.kp));
-      if (parseFloat(rec.imdb) > 0) ratings.push(parseFloat(rec.imdb));
-    }
-    if (!ratings.length) return { q: 0, r: 0 };
-    var R = 0;
-    for (var i = 0; i < ratings.length; i++) R += ratings[i];
-    R /= ratings.length;
+  // ---- КП и IMDb в оценке качества: поправка к TMDB, а не замена.
+  // Шкалы смещены, поэтому учитываем, насколько фильм на КП/IMDb лучше или хуже обычного при таком рейтинге TMDB.
+  // Нет оценки — поправка 0, фильм идёт ровно по TMDB.
+  var RATE_ALPHA_MIN = 0.15;   // вес поправки при большом числе голосов TMDB
+  var RATE_ALPHA_MAX = 0.30;   // ... и при малом (TMDB ненадёжен)
+  var RATE_KP_SHARE = 2 / 3;   // КП : IMDb = 2 : 1
+  var RATE_DEF_OFF = { kp: -0.2, imdb: 0.1 };  // смещение к TMDB по умолчанию, пока своих данных мало
+  var RATE_OFF_PRIOR = 20;     // «вес» значения по умолчанию в числе наблюдений
 
+  // Оценки из кеша: rating.js (kp_rating) и свой kpmap. Без сети.
+  function cachedRatings(c, k) {
+    var rec = kpCache()[c.id];
+    if (rec && (parseFloat(rec.kp) > 0 || parseFloat(rec.imdb) > 0)) return { kp: parseFloat(rec.kp) || 0, imdb: parseFloat(rec.imdb) || 0 };
+    var m = Durable.get('kpmap', {})[k];
+    if (m && now() - m.t < 14 * DAY && (m.kp || m.imdb)) return { kp: m.kp || 0, imdb: m.imdb || 0 };
+    return null;
+  }
+
+  // Среднее смещение КП−TMDB и IMDb−TMDB по накопленным данным, сжатое к значению по умолчанию
+  function ratingOffsets(items) {
+    var acc = { kp: [0, 0], imdb: [0, 0] };
+    var add = function (va, kp, im) {
+      if (!(va > 0)) return;
+      if (kp > 0) { acc.kp[0] += kp - va; acc.kp[1]++; }
+      if (im > 0) { acc.imdb[0] += im - va; acc.imdb[1]++; }
+    };
+    each(Durable.get('kpmap', {}), function (m) { if (m) add(m.va, m.kp, m.imdb); });
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it.rt && it.c && it.rt.src === 'cache') add(it.c.va, it.rt.kp, it.rt.imdb);
+    }
+    var off = {};
+    each(acc, function (a, k) { off[k] = (a[0] + RATE_DEF_OFF[k] * RATE_OFF_PRIOR) / (a[1] + RATE_OFF_PRIOR); });
+    off.n = acc.kp[1];
+    return off;
+  }
+
+  function quality(c, C, rt, off) {
+    if (!(c.va > 0)) return { q: 0, r: 0, corr: 0, boost: 0 };
     var m = c.type === 'tv' ? 200 : 500;
     var v = c.vc || 0;
-    var wr = (v / (v + m)) * R + (m / (v + m)) * C;
-    return { q: clamp((wr - 5.5) / 3.0, 0, 1), r: R, kp: rec ? parseFloat(rec.kp) || 0 : 0, imdb: rec ? parseFloat(rec.imdb) || 0 : 0 };
+    var wr = (v / (v + m)) * c.va + (m / (v + m)) * C;
+
+    // Поправка в пунктах рейтинга
+    var corr = 0, kp = rt ? rt.kp || 0 : 0, im = rt ? rt.imdb || 0 : 0;
+    var dk = kp > 0 ? kp - c.va - off.kp : null;
+    var di = im > 0 ? im - c.va - off.imdb : null;
+    if (dk !== null && di !== null) corr = RATE_KP_SHARE * dk + (1 - RATE_KP_SHARE) * di;
+    else if (dk !== null) corr = dk;
+    else if (di !== null) corr = di;
+    corr = clamp(corr, -2, 2);
+    // Чем меньше голосов на TMDB, тем больше доверяем КП/IMDb
+    var alpha = RATE_ALPHA_MIN + (RATE_ALPHA_MAX - RATE_ALPHA_MIN) * (m / (v + m));
+    var boost = alpha * corr;
+
+    return { q: clamp((wr + boost - 5.5) / 3.0, 0, 1), r: c.va, corr: corr, boost: boost, kp: kp, imdb: im };
   }
 
   function affinity(c, profile) {
@@ -1493,6 +1532,8 @@
       if (it.seeds.length > 1) return 'Похож на «' + it.seeds[0] + '» и «' + it.seeds[1] + '»';
       return 'Похож на «' + it.seeds[0] + '»';
     }
+    // КП заметно поднял фильм
+    if (parts.rb >= 0.15 && it.kp >= 7.5) return 'Высоко на Кинопоиске: ' + it.kp.toFixed(1).replace('.', ',');
 
     var contrib = [
       { k: 's', v: Math.max(w.s, 0.25) * parts.s }, // «Похож на» — самое понятное объяснение
@@ -1531,7 +1572,11 @@
   function scoreAll(items, profile, ans) {
     var pw = pickWeights(ans, profile);
     var w = pw.w;
-    var kp = kpCache();
+    for (var i0 = 0; i0 < items.length; i0++) {
+      var it0 = items[i0];
+      if (!it0.rt && it0.c) { var cr = cachedRatings(it0.c, it0.k); if (cr) { cr.src = 'cache'; it0.rt = cr; } }
+    }
+    var off = ratingOffsets(items);
 
     var sumVa = 0, nVa = 0;
     for (var i = 0; i < items.length; i++) if (items[i].c && items[i].c.vc > 0) { sumVa += items[i].c.va; nVa++; }
@@ -1541,18 +1586,18 @@
     for (var j = 0; j < items.length; j++) {
       var it = items[j];
       var c = it.c;
-      var qq = quality(c, C, kp);
+      var qq = quality(c, C, it.rt, off);
       var aa = affinity(c, profile);
       var parts = {
-        q: qq.q, r: qq.r,
+        q: qq.q, r: qq.r, rc: qq.corr, rb: qq.boost,
         a: aa.a, best: aa.best,
         m: moodScore(c, ans),
         n: novelty(c, profile),
         s: it.wath ? 1 : Math.min(it.seedHits / 3, 1)
       };
       it.parts = parts;
-      it.kp = qq.kp;
-      it.imdbR = qq.imdb;
+      if (qq.kp) it.kp = qq.kp;
+      if (qq.imdb) it.imdbR = qq.imdb;
     }
 
     // Совпадение растягиваем на диапазон текущего списка: иначе все в 0,65–0,76 и вклад тонет
@@ -1791,9 +1836,15 @@
           scoreAll(passed, profile, ans);
           franchiseFilter(passed, events, ans, stats, profile, function (finalList) {
           if (!alive()) return;
+          scoreAll(finalList, profile, ans);
+          var kpBefore = kpQuota().n;
+          stage('Сверяю с Кинопоиском');
+          attachRatings(finalList, function () {
+          if (!alive()) return;
           var top = list.slice(0, offset);
           var wkey = scoreAll(finalList, profile, ans);
           jitter(finalList);
+          var kpReq = Math.max(0, kpQuota().n - kpBefore);
 
           log('events', events.length, 'profile.n', profile.n, 'pool', Object.keys(pool).length - 1,
             'prefiltered', list.length, 'final', finalList.length, 'ms', now() - started);
@@ -1804,6 +1855,7 @@
           };
           st.journal = Journal.begin(ans, {
             wkey: wkey, ms: now() - started, moods: MoodsApi.state, cub: [MoodsApi.got, MoodsApi.asked],
+            kp: { req: kpReq, off: kpOffline(), rated: finalList.filter(function (x) { return x.rt; }).length },
             counts: { events: events.length, profile: profile.n, pool: Object.keys(pool).length - 1, prefiltered: list.length, detailed: top.length, final: finalList.length },
             sources: pool.__src,
             dropped: stats,
@@ -1811,6 +1863,7 @@
             top: finalList.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).map(journalItem)
           });
           if (h.done) h.done(st);
+          });
           });
         };
 
@@ -1842,6 +1895,8 @@
       votes: c.vc || 0,
       kp: it.kp || null,
       imdb: it.imdbR || null,
+      rsrc: it.rt ? it.rt.src : null,
+      rc: round3(p.rc), rb: round3(p.rb),
       score: round3(it.score),
       q: round3(p.q), a: round3(p.a), an: round3(p.an), m: round3(p.m), n: round3(p.n), s: round3(p.s), f: round3(p.f), y: round3(p.y),
       src: it.src || null,
@@ -2245,10 +2300,55 @@
     return q;
   }
 
-  function kpSpend() {
-    if (!kpKey()) return false;
+  // Отдельная очередь КП: не мешает TMDB, короткий таймаут, без повторов.
+  // Два сетевых сбоя подряд (источник недоступен) — час только кеш.
+  var KP_TIMEOUT = 6000, KP_OFF_FOR = 3600 * 1000;
+  var kpRunCap = 0;           // потолок квоты на время текущего подбора (0 — нет)
+  var kpNetFails = 0;
+  var KpNet = {
+    queue: [], active: 0, max: 3,
+    get: function (url, ok, fail, opts) { this.queue.push({ url: url, ok: ok, fail: fail, opts: opts }); this.pump(); },
+    pump: function () {
+      var self = this;
+      while (self.active < self.max && self.queue.length) {
+        (function (job) {
+          self.active++;
+          var settled = false;
+          var end = function (fn, arg) {
+            if (settled) return; settled = true;
+            self.active--;
+            try { fn && fn(arg); } catch (e) { log('kp callback error', e); }
+            self.pump();
+          };
+          var onFail = function (status) {
+            if (!status) { if (++kpNetFails >= 2) { save('kp_off', now() + KP_OFF_FOR); self.queue = []; log('kp offline for 1h'); } }
+            else kpNetFails = 0;
+            end(job.fail, status);
+          };
+          // Списываем квоту в момент отправки: отменённые из очереди запросы не считаются
+          if (!kpSpend()) return end(job.fail, -1);
+          var req = new Lampa.Reguest();
+          req.timeout(KP_TIMEOUT);
+          req.silent(job.url, function (j) { kpNetFails = 0; end(job.ok, j); }, function (a) { onFail((a && a.status) || 0); }, false, job.opts);
+          setTimeout(function () { if (!settled) onFail(0); }, KP_TIMEOUT + 1000);
+        })(self.queue.shift());
+      }
+    }
+  };
+
+  function kpOffline() { return store('kp_off', 0) > now(); }
+
+  // Можно ли ещё запрашивать (без списания)
+  function kpCan() {
+    if (!kpKey() || kpOffline()) return false;
     var q = kpQuota();
-    if (q.blocked || q.n >= kpLimit()) return false;
+    return !q.blocked && q.n < kpLimit() && !(kpRunCap && q.n >= kpRunCap);
+  }
+
+  function kpSpend() {
+    if (!kpKey() || kpOffline()) return false;
+    var q = kpQuota();
+    if (q.blocked || q.n >= kpLimit() || (kpRunCap && q.n >= kpRunCap)) return false;
     q.n++;
     save('kp_quota', q);
     return true;
@@ -2294,19 +2394,19 @@
     var c = it.c;
     var cached = kpCache()[c.id];
     if (cached && (parseFloat(cached.kp) > 0 || parseFloat(cached.imdb) > 0)) {
-      return cb({ kp: parseFloat(cached.kp) || 0, imdb: parseFloat(cached.imdb) || 0 });
+      return cb({ kp: parseFloat(cached.kp) || 0, imdb: parseFloat(cached.imdb) || 0, src: 'cache' });
     }
 
     var map = Durable.get('kpmap', {});
     var m = map[it.k];
-    if (m && now() - m.t < 14 * DAY) return cb(m.kp || m.imdb ? { kp: m.kp, imdb: m.imdb } : null);
+    if (m && now() - m.t < 14 * DAY) return cb(m.kp || m.imdb ? { kp: m.kp, imdb: m.imdb, src: 'cache' } : null);
 
 
     var finish = function (kp, imdb, kpId) {
       kp = parseFloat(kp) || 0;
       imdb = parseFloat(imdb) || 0;
       var mp = Durable.get('kpmap', {});
-      mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now() };
+      mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now(), va: c.va || 0 };
       var keys = Object.keys(mp);
       if (keys.length > 1500) {
         keys.sort(function (a, b) { return mp[a].t - mp[b].t; });
@@ -2315,20 +2415,20 @@
       Durable.set('kpmap', mp);
       if (kp || imdb) {
         writeKpCache(c.id, { kp: kp, imdb: imdb, timestamp: now() });
-        cb({ kp: kp, imdb: imdb });
+        cb({ kp: kp, imdb: imdb, src: 'net' });
       } else cb(null);
     };
 
     var byId = function (kpId) {
-      if (!kpSpend()) return cb(null);
-      Net.get(KP_API + 'api/v2.2/films/' + kpId, function (j) {
+      if (!kpCan()) return cb(null);
+      KpNet.get(KP_API + 'api/v2.2/films/' + kpId, function (j) {
         finish(j && j.ratingKinopoisk, j && j.ratingImdb, kpId);
       }, kpFail(cb), kpHeaders());
     };
 
     var byTitle = function () {
-      if (!c.title || !kpSpend()) return cb(null);
-      Net.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(c.original || c.title), function (j) {
+      if (!c.title || !kpCan()) return cb(null);
+      KpNet.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(c.original || c.title), function (j) {
         var films = (j && j.films) || [];
         var y = parseInt(c.year, 10);
         for (var i = 0; i < films.length; i++) {
@@ -2340,16 +2440,61 @@
     };
 
     if (c.imdb) {
-      if (!kpSpend()) return cb(null);
-      Net.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
+      if (!kpCan()) return cb(null);
+      KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
         var x = j && j.items && j.items[0];
         if (x) finish(x.ratingKinopoisk, x.ratingImdb, x.kinopoiskId);
         else byTitle();
       }, function (status) {
-        if (status === 401 || status === 402 || status === 403 || status === 429) return kpFail(cb)(status);
+        if (status === 401 || status === 402 || status === 403 || status === 429 || status <= 0) return kpFail(cb)(status);
         byTitle();
       }, kpHeaders());
     } else byTitle();
+  }
+
+  // Оценки для финалистов перед окончательным порядком: кеш, затем запросы. Подбор ждёт не дольше дедлайна.
+  var KP_FINALISTS = 20, KP_DEADLINE = 8000;
+  // Запросов на один подбор: встроенный ключ общий и маленький — не выжигаем его за раз
+  var KP_RUN_BUDGET_BUILTIN = 12, KP_RUN_BUDGET_PERSONAL = 40;
+
+  function attachRatings(list, cb) {
+    var fired = false;
+    var finish = function () {
+      if (fired) return;
+      fired = true;
+      kpRunCap = 0;
+      KpNet.queue = [];          // не дождались — не тратим квоту на хвост
+      cb();
+    };
+    var todo = list.slice().sort(function (a, b) { return b.score - a.score; })
+      .slice(0, KP_FINALISTS).filter(function (it) { return it.c && !it.rt && !it.kpTried; });
+    if (!todo.length || !kpCan()) return finish();
+    var q0 = kpQuota().n;
+    var budget = kpUsingBuiltin() ? KP_RUN_BUDGET_BUILTIN : KP_RUN_BUDGET_PERSONAL;
+    kpRunCap = q0 + budget;
+    setTimeout(finish, KP_DEADLINE);
+    // По очереди от лучшего к худшему, по 3 фильма одновременно: бюджет уходит на верх списка целиком
+    var idx = 0, running = 0;
+    var next = function () {
+      if (fired) return;
+      if ((idx >= todo.length || !kpCan()) && !running) return finish();
+      while (running < 3 && idx < todo.length && kpCan()) {
+        (function (it) {
+          running++;
+          it.kpTried = true;
+          fetchRatings(it, function (r) {
+            if (r) {
+              it.rt = { kp: r.kp || 0, imdb: r.imdb || 0, src: r.src || 'net' };
+              if (r.kp) it.kp = r.kp;
+              if (r.imdb) it.imdbR = r.imdb;
+            }
+            running--;
+            next();
+          });
+        })(todo[idx++]);
+      }
+    };
+    next();
   }
 
   // =========================================================================
@@ -3522,7 +3667,7 @@
     report.hasTmdbKey = !!(Lampa.TMDB && Lampa.TMDB.key);
     report.hasIndexedDB = !!window.indexedDB;
     report.idbOpened = Durable.persistent();
-    report.kp = { key: kpUsingBuiltin() ? 'встроенный' : 'личный', today: kpQuota().n, limit: kpLimit(), blocked: kpQuota().blocked || false };
+    report.kp = { key: kpUsingBuiltin() ? 'встроенный' : 'личный', today: kpQuota().n, limit: kpLimit(), blocked: kpQuota().blocked || false, offlineUntil: kpOffline() ? new Date(store('kp_off', 0)).toISOString() : null };
     try {
       var mine = 0, total = 0;
       for (var li = 0; li < localStorage.length; li++) {
