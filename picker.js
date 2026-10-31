@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.7.4';
+  var VERSION = '0.7.6';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
@@ -787,6 +787,40 @@
     return null;
   }
 
+  // Начат ли сериал: последняя серия онлайн-просмотра или прогресс первых серий первого сезона
+  function seriesStarted(card) {
+    if (!card) return false;
+    var names = uniq([card.original_name, card.original_title, card.name, card.title].filter(Boolean));
+    var last = {};
+    try {
+      last = Lampa.Storage.get('online_watched_last', '{}') || {};
+      if (typeof last === 'string') last = JSON.parse(last);
+    } catch (e) { last = {}; }
+    var fv = fileView();
+    for (var i = 0; i < names.length; i++) {
+      try {
+        var lw = last[Lampa.Utils.hash(names[i])];
+        if (lw && (lw.episode || lw.season)) return true;
+        for (var ep = 1; ep <= 3; ep++) {
+          var h = Lampa.Utils.hash([1, '', ep, names[i]].join(''));
+          var v = null;
+          try { v = Lampa.Timeline.view(h); } catch (e) {}
+          if ((v && v.percent > 0) || (fv[h] && (fv[h].percent > 0 || fv[h].time > 0))) return true;
+        }
+      } catch (e) {}
+    }
+    return false;
+  }
+
+  // Начат ли просмотр карточки любого типа
+  function startedAny(r, type) {
+    if (type === 'tv') return seriesStarted(r);
+    var p = progress(extend(r, { method: 'movie' }));
+    return !!(p && (p.percent > 0 || p.time > 0));
+  }
+
+  var OPENED_HIDE = 3 * DAY;  // открытое из подборки, но не начатое — не повторяем 3 дня
+
   function finished(v) {
     return v.percent >= 85 || (v.duration - v.time) <= 600;
   }
@@ -1244,6 +1278,7 @@
       // Уже открывали в Lampa: прогресс мог не распознаться, повторно не предлагаем
       else if (!ex[events[i].k] && (f.history || f.continued)) ex[events[i].k] = 'history';
     }
+    each(fb.opened, function (v, k) { if (!ex[k] && v && t - v.t < OPENED_HIDE) ex[k] = 'opened'; });
     each(fb.seen, function (v, k) { ex[k] = 'seen'; });
     each(fb.rejected, function (v, k) { if (v && t - v.t < 90 * DAY) ex[k] = 'rejected'; });
     return ex;
@@ -1261,6 +1296,8 @@
       if (k === '__src') return;
       if (ex[k]) return bump(ex[k]);
       var r = it.r || {};
+      // Начатое (в том числе онлайн, мимо истории Lampa) не предлагаем никогда
+      if (startedAny(r, it.type)) return bump('started');
       var date = r.release_date || r.first_air_date || '';
       if (!it.wath) {
         if (date && date > today) return bump('future');
