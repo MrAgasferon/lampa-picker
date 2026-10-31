@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.8.2';
+  var VERSION = '0.9.1';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
@@ -133,7 +133,7 @@
     laugh: { title: 'Посмеяться', w: { 35: 1, 10402: 0.2, 12: 0.1, 18: -0.2, 53: -0.4, 10752: -0.6, 27: -0.6 }, req: 35 },
     nerves: { title: 'Пощекотать нервы', w: { 53: 1, 27: 1, 9648: 0.8, 80: 0.7, 28: 0.5, 878: 0.3, 35: -0.3, 10749: -0.3, 16: -0.3, 10751: -0.8 } },
     // Драма в TMDB стоит у половины кино — сама по себе «думающим» фильм не делает
-    think: { title: 'Подумать', w: { 878: 0.8, 9648: 0.8, 36: 0.8, 99: 0.6, 10752: 0.5, 18: 0.5, 80: 0.4, 35: -0.5, 16: -0.3, 27: -0.8, 10751: -0.8, 10749: -0.2, 10402: -0.3 } },
+    think: { title: 'Подумать', w: { 878: 0.8, 9648: 0.8, 36: 0.8, 99: 0.6, 10752: 0.5, 18: 0.5, 80: 0.4, 35: -0.5, 16: -0.3, 27: -0.8, 10751: -0.8, 10749: -0.2, 10402: -0.3, 28: -0.5, 12: -0.3 } },
     surprise: { title: 'Удиви меня', w: {} }
   };
 
@@ -868,7 +868,13 @@
 
     var fb = feedback();
     // Открыл из подборки = «удачная рекомендация»: заметный плюс, может стать опорным фильмом
-    each(fb.opened, function (rec) { if (rec && rec.card) put(rec.card, 0.5, 'opened'); });
+    each(fb.opened, function (rec, k) {
+      if (!rec || !rec.card) return;
+      // Открыл, а потом отклонил — отказ отменяет «удачную рекомендацию»
+      var rj = fb.rejected[k];
+      if (rj && rj.t >= rec.t) return;
+      put(rec.card, 0.5, 'opened');
+    });
     // Сила минуса зависит от причины: «не под настроение» и «не для компании» о вкусе ничего не говорят
     each(fb.rejected, function (rec) {
       if (!rec || !rec.card) return;
@@ -1137,6 +1143,16 @@
     return uniq(out);
   }
 
+  var TASTE_KW = 6, TASTE_DIR = 3, TASTE_CAST = 4;
+
+  // Сильнейшие положительные признаки профиля (id), не меньше порога
+  function topPositive(map, n, min) {
+    var arr = [];
+    each(map || {}, function (v, k) { if (v >= min) arr.push([k, v]); });
+    arr.sort(function (a, b) { return b[1] - a[1]; });
+    return arr.slice(0, n).map(function (x) { return x[0]; });
+  }
+
   function gatherPool(profile, events, ans, cb) {
     var pool = {};
     var pending = 1; // защитная единица: снимается после постановки всех запросов
@@ -1243,7 +1259,34 @@
       }
     }
 
-    // 4. Закладки «Позже»
+    // 4. По вкусу, а не по жанру: ключевые слова любимых фильмов и любимые режиссёры/актёры.
+    //    Даёт личные кандидаты в настроениях, где опорных фильмов почти нет.
+    var tasteBase = function (type) {
+      var tp = { sort_by: 'popularity.desc', 'vote_count.gte': type === 'tv' ? 100 : (short ? 150 : 200), 'vote_average.gte': 6, page: 1 };
+      if (floor) tp[type === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = floor + '-01-01';
+      if (type === 'movie' && limited) {
+        var tl = short ? 45 : parseInt(ans.time, 10) + 10;
+        if (!isNaN(tl)) tp['with_runtime.lte'] = tl;
+      }
+      if (type === 'tv' && short) tp['with_runtime.lte'] = 35;
+      if (type === 'tv' && ans.time === 'series') tp['with_runtime.lte'] = 60;
+      var tex = moodExclude(ans, type);
+      if (tex.length) tp.without_genres = tex.join(',');
+      return tp;
+    };
+    var kws = topPositive(profile.f.keyword, TASTE_KW, 0.3);
+    if (kws.length >= 2) {
+      for (var tk = 0; tk < types.length; tk++) {
+        req('discover/' + types[tk], extend(tasteBase(types[tk]), { with_keywords: kws.join('|') }), types[tk], null, 'kw');
+      }
+    }
+    // with_people есть только у фильмов
+    var ppl = uniq(topPositive(profile.f.director, TASTE_DIR, 0.3).concat(topPositive(profile.f.cast, TASTE_CAST, 0.3)));
+    if (ppl.length && types.indexOf('movie') > -1) {
+      req('discover/movie', extend(tasteBase('movie'), { with_people: ppl.join('|'), 'vote_count.gte': short ? 100 : 150 }), 'movie', null, 'ppl');
+    }
+
+    // 5. Закладки «Позже»
     for (var e = 0; e < events.length; e++) {
       var ev = events[e];
       var intent = false;
@@ -1360,6 +1403,8 @@
   // Нет оценки — поправка 0, фильм идёт ровно по TMDB.
   var RATE_ALPHA_MIN = 0.15;   // вес поправки при большом числе голосов TMDB
   var RATE_ALPHA_MAX = 0.30;   // ... и при малом (TMDB ненадёжен)
+  var RATE_FRESH_VOTES = 3000; // «свежий» — меньше стольких голосов на TMDB
+  var RATE_FRESH_EXTRA = 0.3;   // добавка к весу поправки для свежих при расхождении ≥ 1,5 пункта
   var RATE_KP_SHARE = 2 / 3;   // КП : IMDb = 2 : 1
   var RATE_DEF_OFF = { kp: -0.2, imdb: 0.1 };  // смещение к TMDB по умолчанию, пока своих данных мало
   var RATE_OFF_PRIOR = 20;     // «вес» значения по умолчанию в числе наблюдений
@@ -1405,9 +1450,12 @@
     if (dk !== null && di !== null) corr = RATE_KP_SHARE * dk + (1 - RATE_KP_SHARE) * di;
     else if (dk !== null) corr = dk;
     else if (di !== null) corr = di;
-    corr = clamp(corr, -2, 2);
+    corr = clamp(corr, -2.5, 2.5);
     // Чем меньше голосов на TMDB, тем больше доверяем КП/IMDb
     var alpha = RATE_ALPHA_MIN + (RATE_ALPHA_MAX - RATE_ALPHA_MIN) * (m / (v + m));
+    // Свежий фильм (мало голосов) и сильное расхождение: TMDB обычно завышен первыми голосами — доверяем КП ещё больше
+    var fresh = v < RATE_FRESH_VOTES ? (RATE_FRESH_VOTES - v) / RATE_FRESH_VOTES : 0;
+    alpha += RATE_FRESH_EXTRA * fresh * clamp(Math.abs(corr) - 0.5, 0, 1);
     var boost = alpha * corr;
 
     return { q: clamp((wr + boost - 5.5) / 3.0, 0, 1), r: c.va, corr: corr, boost: boost, kp: kp, imdb: im };
@@ -1533,10 +1581,20 @@
   function reasonOf(it, parts, w, profile, ans) {
     var c = it.c;
     if (it.wath) return 'Из вашего списка «Позже»';
+    if (it.src === 'franchise') return 'Первая непросмотренная часть серии';
+    // Найден по любимому режиссёру или актёру — называем его
+    if (it.src === 'ppl' && !(it.seedHits >= 1)) {
+      var pd = (c.dir || []).filter(function (id) { return (profile.f.director || {})[id] > 0; });
+      if (pd.length) { var pdn = profile.names['p' + pd[0]] || c.names['p' + pd[0]]; if (pdn) return (c.type === 'tv' ? 'Автор ' : 'Режиссёр ') + pdn; }
+      var pc = (c.cast || []).filter(function (id) { return (profile.f.cast || {})[id] > 0; });
+      if (pc.length) { var pcn = c.names['p' + pc[0]] || profile.names['p' + pc[0]]; if (pcn) return 'С ' + pcn; }
+    }
     if (it.seedHits >= 1 && it.seeds.length && it.seeds[0]) {
       if (it.seeds.length > 1) return 'Похож на «' + it.seeds[0] + '» и «' + it.seeds[1] + '»';
       return 'Похож на «' + it.seeds[0] + '»';
     }
+    // Найден по ключевым словам любимых фильмов (если сильнее нет режиссёра или актёра)
+    if (it.src === 'kw' && !(parts.best && (parts.best.type === 'director' || parts.best.type === 'cast'))) return 'Темы, как в ваших любимых фильмах';
     // КП заметно поднял фильм
     if (parts.rb >= 0.15 && it.kp >= 7.5) return 'Высоко на Кинопоиске: ' + it.kp.toFixed(1).replace('.', ',');
 
@@ -1562,7 +1620,10 @@
           if (an) return 'С ' + an;
         }
         // Жанр как причина — только если он реально выделяется в профиле
-        if (b.type === 'genre' && GENRE_NAMES[b.id] && profile.f.genre[b.id] >= 0.6) return 'Ваш жанр: ' + GENRE_NAMES[b.id].toLowerCase();
+        // ...и подходит под настроение: «Ваш жанр: драма» у триллера в «нервах» звучит странно
+        var mw = ans && MOODS[ans.mood] && MOODS[ans.mood].w;
+        var fitsMood = !mw || !Object.keys(mw).length || (mw[b.id] || 0) >= 0.3;
+        if (b.type === 'genre' && GENRE_NAMES[b.id] && profile.f.genre[b.id] >= 0.6 && fitsMood) return 'Ваш жанр: ' + GENRE_NAMES[b.id].toLowerCase();
       }
       if (k !== 'q' && ans && parts.m >= 0.8) {
         var mr = moodReason(c, ans);
@@ -1756,7 +1817,8 @@
           if (!inList) {
             additions.push({
               k: keyOf('movie', next.id), id: next.id, type: 'movie', r: next,
-              seedHits: best.seedHits, seeds: best.seeds, wath: false, src: 'franchise'
+              // «Похож на …» относилось к другой части — не переносим
+              seedHits: 0, seeds: [], wath: false, src: 'franchise'
             });
           }
         }
