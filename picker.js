@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.8.1';
+  var VERSION = '0.8.2';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
@@ -579,7 +579,9 @@
 
     if (ans.mood === 'relax') m = 1 - 0.09 * z(f) - 0.07 * z(v) - 0.05 * z(t) - 0.04 * z(sd) + 0.04 * z(h) + 0.03 * z(r);
     else if (ans.mood === 'laugh') m = (h === null ? 0.5 : h / 10 * 1.2) - 0.04 * z(f) - 0.03 * z(sd);
-    else if (ans.mood === 'nerves') m = Math.max(z(f), z(t)) / 10 * 0.85 + z(a) / 10 * 0.25;
+    // Напряжение есть не у всех фильмов, а страх у триллеров без хоррора низкий: берём максимум из страха,
+    // напряжения и насилия плюс половину темпа
+    else if (ans.mood === 'nerves') m = clamp((Math.max(z(f), z(t), z(v)) + 0.5 * z(mv(c, 'pace'))) / 8, 0, 1) * 0.85 + z(a) / 10 * 0.25;
     else if (ans.mood === 'think') m = 0.75 - 0.05 * z(a) - 0.04 * z(h) + 0.03 * z(sd);
     else return null;
 
@@ -1778,6 +1780,8 @@
     var alive = function () { return token === runToken; };
     var stage = function (t) { if (h.stage && alive()) h.stage(t); };
     var started = now();
+    var tm = {};                                     // время этапов, мс — для журнала
+    var mark = function (k) { tm[k] = now() - started; };
 
     save('last_answers', ans);
     stage('Изучаю вашу историю');
@@ -1791,10 +1795,12 @@
     enrichEvents(events, function () {
       if (!alive()) return;
       var profile = buildProfile(events);
+      mark('profile');
       stage('Ищу кандидатов');
 
       gatherPool(profile, events, ans, function (pool) {
         if (!alive()) return;
+        mark('pool');
         var stats = {};
         var list = prefilter(pool, events, ans, stats);
 
@@ -1828,6 +1834,7 @@
 
         var kpBefore = 0;
         var afterDetails = function () {
+          mark('details');
           scoreAll(passed, profile, ans);
           stage('Уточняю настроение и рейтинги');
           // Шкалы CUB и оценки КП — одновременно: ждём не дольше самого долгого из двух (~5 с)
@@ -1840,6 +1847,7 @@
 
         var afterExtras = function () {
             if (!alive()) return;
+            mark('extras');
             // Шкалы пришли после фильтров — для детей проверяем ещё раз
             if (ans.company === 'kids') {
               passed = passed.filter(function (it) {
@@ -1868,7 +1876,7 @@
             profile: profile, wkey: wkey, cold: profile.n < 5
           };
           st.journal = Journal.begin(ans, {
-            wkey: wkey, ms: now() - started, moods: MoodsApi.state, cub: [MoodsApi.got, MoodsApi.asked],
+            wkey: wkey, ms: now() - started, tm: tm, moods: MoodsApi.state, cub: [MoodsApi.got, MoodsApi.asked],
             kp: { req: kpReq, off: kpOffline(), rated: finalList.filter(function (x) { return x.rt; }).length },
             counts: { events: events.length, profile: profile.n, pool: Object.keys(pool).length - 1, prefiltered: list.length, detailed: top.length, final: finalList.length },
             sources: pool.__src,
