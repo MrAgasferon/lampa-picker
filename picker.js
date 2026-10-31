@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.10.0';
+  var VERSION = '0.10.1';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
@@ -813,7 +813,7 @@
   function lampaCard(r) {
     var c = {
       id: r.id, poster_path: r.poster_path, backdrop_path: r.backdrop_path, overview: r.overview,
-      vote_average: r.vote_average, genre_ids: r.genre_ids, original_language: r.original_language, source: 'tmdb'
+      vote_average: r.vote_average, vote_count: r.vote_count, genre_ids: r.genre_ids, original_language: r.original_language, source: 'tmdb'
     };
     if (r.__type === 'tv') { c.name = r.name; c.original_name = r.original_name; c.first_air_date = r.first_air_date; }
     else { c.title = r.title; c.original_title = r.original_title; c.release_date = r.release_date; }
@@ -900,6 +900,11 @@
     return v.percent >= 85 || (v.duration - v.time) <= 600;
   }
 
+  var CLASSIC_RATING = 8.0;     // такие старые фильмы не опускают границу по годам
+  var LIKE_BATCH = 6;            // столько «Нравится» за день — уже пачка
+  var LIKE_BATCH_HISTORY = 30;   // ...и сглаживаем её, только если остальной истории не меньше
+  var SEED_BATCH_SHARE = 0.4;    // доля опорных фильмов, которую может занять такая пачка
+
   function collect() {
     var map = {};
     var flags = {};
@@ -963,6 +968,26 @@
       e.flags = flags[k] || {};
       events.push(e);
     });
+
+    // Пачка «Нравится» за один день (экран «Настроить вкус» или ручная разметка) при большой истории —
+    // это рассказ о вкусе в целом, а не свежий интерес: даём ей «среднюю» дату истории,
+    // иначе десяток отметок перевешивает сотни событий
+    var byDay = {};
+    for (var bi = 0; bi < events.length; bi++) {
+      var be = events[bi];
+      if (!be.flags.like) continue;
+      var dk = Math.floor(be.date / DAY);
+      (byDay[dk] = byDay[dk] || []).push(be);
+    }
+    var batch = [];
+    each(byDay, function (list) { if (list.length >= LIKE_BATCH) batch = batch.concat(list); });
+    if (batch.length && events.length - batch.length >= LIKE_BATCH_HISTORY) {
+      var dates = [];
+      for (var di = 0; di < events.length; di++) if (batch.indexOf(events[di]) < 0) dates.push(events[di].date);
+      dates.sort(function (a, b) { return a - b; });
+      var mid = dates[Math.floor(dates.length / 2)];
+      for (var bj = 0; bj < batch.length; bj++) { batch[bj].date = Math.min(batch[bj].date, mid); batch[bj].batch = true; }
+    }
 
     return events;
   }
@@ -1034,6 +1059,7 @@
     }
 
     var profile = { n: n, f: {}, names: names };
+    for (var lb = 0; lb < events.length; lb++) if (events[lb].batch) profile.likeBatch = (profile.likeBatch || 0) + 1;
 
     each(acc, function (vals, t) {
       var out = {}, max = 0;
@@ -1081,6 +1107,8 @@
     for (var di = 0; di < events.length; di++) {
       var de = events[di];
       if (!(de.s > 0) || !de.c || !de.c.year) continue;
+      // Классика с очень высоким рейтингом: «понравился шедевр» ≠ «смотрю старое»
+      if ((de.c.va || 0) >= CLASSIC_RATING && parseInt(de.c.year, 10) < new Date().getFullYear() - 25) continue;
       var dy = parseInt(de.c.year, 10);
       if (isNaN(dy)) continue;
       var dk = Math.floor(dy / 10) * 10;
@@ -1129,7 +1157,13 @@
 
     var seeds = events.filter(function (e) { return e.s > 0.25; });
     seeds.sort(function (a, b) { return b.s * decay(b.date) - a.s * decay(a.date); });
-    profile.seeds = seeds.slice(0, 15);
+    // Пачка отметок не занимает все опорные места
+    var seedMax = 15, batchMax = Math.round(seedMax * SEED_BATCH_SHARE), nb = 0, picked = [];
+    for (var sx = 0; sx < seeds.length && picked.length < seedMax; sx++) {
+      if (seeds[sx].batch) { if (nb >= batchMax) continue; nb++; }
+      picked.push(seeds[sx]);
+    }
+    profile.seeds = picked;
 
     var recent = events.filter(function (e) { return e.s > 0; })
       .sort(function (a, b) { return b.date - a.date; }).slice(0, 10);
@@ -1215,7 +1249,7 @@
     return uniq(out);
   }
 
-  var TASTE_KW = 6, TASTE_DIR = 3, TASTE_CAST = 4;
+  var TASTE_KW = 6, TASTE_DIR = 3, TASTE_CAST = 4, PPL_MIN_RATING = 6.0;
 
   // Сильнейшие положительные признаки профиля (id), не меньше порога
   function topPositive(map, n, min) {
@@ -1355,7 +1389,8 @@
     // with_people есть только у фильмов
     var ppl = uniq(topPositive(profile.f.director, TASTE_DIR, 0.3).concat(topPositive(profile.f.cast, TASTE_CAST, 0.3)));
     if (ppl.length && types.indexOf('movie') > -1) {
-      req('discover/movie', extend(tasteBase('movie'), { with_people: ppl.join('|'), 'vote_count.gte': short ? 100 : 150 }), 'movie', null, 'ppl');
+      // Порог рейтинга для фильмов любимых людей (настраивается отдельно от общего поиска)
+      req('discover/movie', extend(tasteBase('movie'), { with_people: ppl.join('|'), 'vote_count.gte': short ? 100 : 150, 'vote_average.gte': PPL_MIN_RATING }), 'movie', null, 'ppl');
     }
 
     // 5. Закладки «Позже»
@@ -2081,6 +2116,7 @@
       animShare: round3(profile.animShare),
       yearFloor: profile.yearFloor,
       yearFloorBy: profile.yearFloorBy || null,
+      likeBatch: profile.likeBatch || 0,
       rejGenres: profile.rejGenres && Object.keys(profile.rejGenres).length ? profile.rejGenres : null,
       genres: topOf(profile.f.genre, 6, function (g) { return GENRE_NAMES[g]; }),
       dislikedGenres: topOf((function () {
