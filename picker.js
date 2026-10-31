@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.9.1';
+  var VERSION = '0.10.0';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
@@ -754,6 +754,78 @@
       if (r && r.length) return r;
     } catch (e) {}
     return [];
+  }
+
+  // ---- «Настроить вкус»: известные фильмы и сериалы для быстрой отметки «Нравится»
+  var TASTE_PAGE = 24;
+
+  function tasteSources(page) {
+    return [
+      ['movie/top_rated', 'movie'], ['tv/top_rated', 'tv'], ['movie/popular', 'movie'], ['tv/popular', 'tv']
+    ].map(function (x) { return { path: x[0], type: x[1], page: page }; });
+  }
+
+  // Порция кандидатов: чередуем источники, без дублей, без уже отмеченного и не слишком нишевое
+  function tasteBatch(page, seen, cb) {
+    var src = tasteSources(page), left = src.length, lists = [];
+    var done = function () {
+      var out = [], i = 0, more = true;
+      while (more) {
+        more = false;
+        for (var s = 0; s < lists.length; s++) {
+          var it = lists[s][i];
+          if (!it) continue;
+          more = true;
+          var k = keyOf(it.__type, it.id);
+          if (seen[k]) continue;
+          seen[k] = true;
+          if ((it.vote_count || 0) < 1500) continue;
+          if (!it.poster_path) continue;
+          out.push(it);
+        }
+        i++;
+      }
+      cb(out);
+    };
+    for (var j = 0; j < src.length; j++) {
+      (function (sx, idx) {
+        tmdb(sx.path, { page: sx.page }, LIST_TTL, function (json) {
+          lists[idx] = ((json && json.results) || []).map(function (r) { r.__type = sx.type; return r; });
+          if (--left === 0) done();
+        });
+      })(src[j], j);
+    }
+  }
+
+  function isLiked(card) {
+    try { var st = Lampa.Favorite.check(card); return !!(st && st.like); } catch (e) { return false; }
+  }
+
+  function setLiked(card, on) {
+    try {
+      if (on) Lampa.Favorite.add('like', card);
+      else Lampa.Favorite.remove('like', card);
+      return true;
+    } catch (e) { log('favorite error', e); return false; }
+  }
+
+  // Карточка в формате Lampa из ответа TMDB
+  function lampaCard(r) {
+    var c = {
+      id: r.id, poster_path: r.poster_path, backdrop_path: r.backdrop_path, overview: r.overview,
+      vote_average: r.vote_average, genre_ids: r.genre_ids, original_language: r.original_language, source: 'tmdb'
+    };
+    if (r.__type === 'tv') { c.name = r.name; c.original_name = r.original_name; c.first_air_date = r.first_air_date; }
+    else { c.title = r.title; c.original_title = r.original_title; c.release_date = r.release_date; }
+    return c;
+  }
+
+  // Мало данных о вкусе — предлагаем экран сам (один раз)
+  function needsTaste() {
+    if (store('taste_offered', false)) return false;
+    var n = 0;
+    each(['like', 'history', 'book', 'wath', 'viewed'], function (t) { n += favList(t).length; });
+    return n < 5;
   }
 
   var fileViewCache = null;
@@ -2646,6 +2718,7 @@
     play: '<path d="M7 4l13 8-13 8z" fill="currentColor"/>',
     close: '<path d="M6 6l12 12M18 6L6 18"/>',
     check: '<path d="M4 12l5 5L20 6"/>',
+    like: '<path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1 1.1L12 21l7.8-7.5 1-1.1a5.5 5.5 0 0 0 0-7.8z"/>',
     refresh: '<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>',
     sliders: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
     search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/>',
@@ -2809,6 +2882,21 @@
     '.pkr-res.is-compact .pkr-actions{margin:.6em 0 .7em}',
     '.pkr-res.is-compact .pkr-row{padding-top:.3em}',
     '.pkr-res.is-compact .pkr-hero{min-height:0}',
+    '.pkr-taste__sub{opacity:.7;margin:.4em 0 1em;line-height:1.4;max-width:44em}',
+    '.pkr-tgrid{margin:0 -.4em}',
+    '.pkr-tcard{display:inline-block;vertical-align:top;width:9.5em;margin:0 .4em .9em;position:relative}',
+    '.pkr-tcard__img{position:relative;padding-bottom:150%;border-radius:.6em;background:rgba(255,255,255,.06) center/cover no-repeat;transition:transform .15s,opacity .15s;opacity:.8}',
+    '.pkr-tcard__img:after{content:"";position:absolute;left:0;top:0;right:0;bottom:0;border-radius:.6em;border:.2em solid transparent}',
+    '.pkr-tcard.focus .pkr-tcard__img{transform:scale(1.05);opacity:1}',
+    '.pkr-tcard.focus .pkr-tcard__img:after{border-color:#fff}',
+    '.pkr-tcard.is-on .pkr-tcard__img{opacity:1}',
+    '.pkr-tcard.is-on .pkr-tcard__img:after{border-color:#21c063}',
+    '.pkr-tcard__mark{position:absolute;right:.4em;top:.4em;width:1.8em;height:1.8em;border-radius:50%;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center}',
+    '.pkr-tcard__mark svg{width:1.1em;height:1.1em}',
+    '.pkr-tcard.is-on .pkr-tcard__mark{display:-webkit-box;display:flex;background:#21c063}',
+    '.pkr-tcard__name{margin-top:.45em;font-size:.85em;font-weight:600;line-height:1.2;max-height:2.4em;overflow:hidden}',
+    '.pkr-tcard__year{font-size:.75em;opacity:.5}',
+    '.pkr-taste__count{display:inline-block;margin-left:.6em;opacity:.7;vertical-align:middle}',
     '@media (max-width: 767px){',
     '.pkr{padding:1em 1em 4em}',
     '.pkr-q{font-size:1.7em}',
@@ -2823,6 +2911,7 @@
     '.pkr-hero__more{min-height:44px;line-height:28px;padding:8px 18px;margin-top:.5em;box-sizing:border-box}',
     '.pkr-row{margin:0 -1em;padding:.7em .65em .4em;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}',
     '.pkr-card{width:38%;padding:0 .35em}',
+    '.pkr-tcard{width:-webkit-calc(33.33% - .8em);width:calc(33.33% - .8em)}',
     '.pkr-btn{padding:.65em .9em;margin:0 .4em .5em 0;font-size:.92em}','.pkr-actions{margin:1em 0 1.2em}',
     '}'
   ].join('');
@@ -3121,14 +3210,93 @@
       }
       wrap.append(tiles);
 
-      if (n === 0 && Journal.list().length) {
+      if (n === 0) {
         var foot = $('<div class="pkr-wizard__foot"></div>');
-        foot.append(button('list', 'Журнал подборов', 'pkr-btn--ghost', function () { renderJournal(); }));
+        foot.append(button('like', 'Настроить вкус', 'pkr-btn--ghost', function () { renderTaste(); }));
+        if (Journal.list().length) foot.append(button('list', 'Журнал подборов', 'pkr-btn--ghost', function () { renderJournal(); }));
         wrap.append(foot);
       }
 
       setBody(wrap);
       refresh(focusEl);
+    }
+
+    // ---- «Настроить вкус»
+
+    function renderTaste() {
+      view = 'taste';
+      save('taste_offered', true);
+      var seen = {}, page = 1, picked = 0, items = [];
+      var wrap = $('<div class="pkr-taste"></div>');
+      wrap.append('<div class="pkr-step">Что посмотреть</div>');
+      wrap.append('<div class="pkr-q">Что вам понравилось?</div>');
+      wrap.append('<div class="pkr-taste__sub">Отметьте фильмы и сериалы, которые вам зашли — по ним подбор поймёт ваш вкус. ' +
+        'Отмеченное попадёт в ваш список «Нравится» в Lampa, убрать можно повторным нажатием.</div>');
+      var grid = $('<div class="pkr-tgrid"></div>');
+      // Кнопки сверху: до «Готово» не нужно листать всю сетку пультом
+      var foot = $('<div class="pkr-actions"></div>');
+      var count = $('<span class="pkr-taste__count"></span>');
+      var upd = function () { count.text(picked ? 'Отмечено: ' + picked : ''); };
+      foot.append(button('check', 'Готово', 'pkr-btn--primary', function () {
+        if (picked) noty('Добавлено в «Нравится»: ' + picked);
+        renderWizard(0);
+      }));
+      var moreBtn = button('refresh', 'Ещё фильмы', '', function () { load(); });
+      foot.append(moreBtn);
+      foot.append(count);
+      wrap.append(foot);
+      wrap.append(grid);
+      var moreBottom = button('refresh', 'Ещё фильмы', 'pkr-btn--ghost', function () { load(); });
+      wrap.append($('<div class="pkr-actions pkr-actions--footer"></div>').append(moreBottom));
+
+      var tcard = function (r) {
+        var card = lampaCard(r);
+        var on = isLiked(card);
+        var t = r.__type === 'tv' ? r.name : r.title;
+        var y = String(r.release_date || r.first_air_date || '').slice(0, 4);
+        var el = $('<div class="pkr-tcard selector' + (on ? ' is-on' : '') + '">' +
+          '<div class="pkr-tcard__img" style="background-image:url(\'' + img(r.poster_path, 'w342') + '\')">' +
+          '<div class="pkr-tcard__mark">' + svg('check') + '</div></div>' +
+          '<div class="pkr-tcard__name">' + esc(t) + '</div><div class="pkr-tcard__year">' + esc(y + (r.__type === 'tv' ? ' · сериал' : '')) + '</div></div>');
+        var lastT = 0;
+        var tog = function () {
+          if (now() - lastT < 400) return;          // тап может прийти и как hover:enter, и как click
+          lastT = now();
+          var next = !el.hasClass('is-on');
+          if (!setLiked(card, next)) return noty('Не удалось изменить «Нравится»');
+          el.toggleClass('is-on', next);
+          picked += next ? 1 : -1;
+          upd();
+        };
+        el.on('hover:enter', tog);
+        el.on('click', tog);
+        bindFocus(el);
+        return el;
+      };
+
+      var loading = false;
+      var load = function () {
+        if (loading) return;
+        loading = true;
+        var add = function (list) {
+          items = items.concat(list);
+          var chunk = items.splice(0, TASTE_PAGE);
+          var first = null;
+          for (var i = 0; i < chunk.length; i++) { var e = tcard(chunk[i]); if (!first) first = e; grid.append(e); }
+          try { Lampa.Controller.collectionSet(focusable()); } catch (e2) {}
+          loading = false;
+          // Мало осталось — следующая страница источников
+          if (items.length < TASTE_PAGE && page < 5) { page++; tasteBatch(page, seen, function (more) { items = items.concat(more); }); }
+          if (first) refresh(first);
+          else if (!grid.children().length) grid.append('<div class="pkr-j__row">Не удалось загрузить список — проверьте связь с TMDB</div>');
+        };
+        if (items.length >= TASTE_PAGE) return add([]);
+        tasteBatch(page, seen, function (list) { page++; add(list); });
+      };
+
+      setBody(wrap);
+      refresh(foot.find('.selector').eq(0));
+      load();
     }
 
     // ---- загрузка
@@ -3592,6 +3760,7 @@
 
       var preset = object && object.answers;
       if (preset && preset.time && preset.mood && preset.company) { ans = extend(preset, {}); startRun(); }
+      else if (needsTaste()) renderTaste();
       else renderWizard(0);
 
       return this.render();
@@ -3625,6 +3794,7 @@
 
     this.back = function () {
       if (view === 'journal') return leaveJournal();
+      if (view === 'taste') return renderWizard(0);
       if (view === 'wizard' && step > 0) return renderWizard(step - 1);
       if (view === 'loading') { cancelRun(); return renderWizard(STEPS.length - 1); }
       Lampa.Activity.backward();
