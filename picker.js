@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.10.1';
+  var VERSION = '0.10.2';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
@@ -901,6 +901,7 @@
   }
 
   var CLASSIC_RATING = 8.0;     // такие старые фильмы не опускают границу по годам
+  var LIKE_BATCH_WEIGHT = 0.6;  // вес отметки из пачки вместо 1,0
   var LIKE_BATCH = 6;            // столько «Нравится» за день — уже пачка
   var LIKE_BATCH_HISTORY = 30;   // ...и сглаживаем её, только если остальной истории не меньше
   var SEED_BATCH_SHARE = 0.4;    // доля опорных фильмов, которую может занять такая пачка
@@ -986,7 +987,12 @@
       for (var di = 0; di < events.length; di++) if (batch.indexOf(events[di]) < 0) dates.push(events[di].date);
       dates.sort(function (a, b) { return a - b; });
       var mid = dates[Math.floor(dates.length / 2)];
-      for (var bj = 0; bj < batch.length; bj++) { batch[bj].date = Math.min(batch[bj].date, mid); batch[bj].batch = true; }
+      for (var bj = 0; bj < batch.length; bj++) {
+        batch[bj].date = Math.min(batch[bj].date, mid);
+        batch[bj].batch = true;
+        // и вес меньше обычного «Нравится»: пачка не должна перекрывать то, что человек реально смотрит
+        if (batch[bj].s > LIKE_BATCH_WEIGHT) batch[bj].s = LIKE_BATCH_WEIGHT;
+      }
     }
 
     return events;
@@ -1307,7 +1313,7 @@
       var sd = profile.seeds[si];
       if (types.length === 1 && sd.type !== types[0]) continue;
       if (!sd.c) continue;
-      if (MOODS[ans.mood] && moodScore(sd.c, ans) < 0.5) rest.push(sd);
+      if (MOODS[ans.mood] && moodScore(sd.c, ans, profile) < 0.5) rest.push(sd);
       else fits.push(sd);
     }
     // При ограничении по времени рекомендации чаще мимо по длительности — берём меньше
@@ -1590,7 +1596,19 @@
     return { a: clamp((total + 1) / 2, 0, 1), best: best };
   }
 
-  function moodScore(c, ans) {
+  // Вес жанра в настроении с поправкой на вкус: жанр подходит под настроение, но пользователю не близок —
+  // засчитываем наполовину. Таблица настроений общая, подстраивается только итог.
+  var MOOD_TASTE_LOW = 0, MOOD_TASTE_HIGH = 0.2, MOOD_TASTE_MIN = 0.5;
+  function moodTaste(profile, g) {
+    var pg = profile && profile.f && profile.f.genre;
+    if (!pg || !(profile.n >= 10) || typeof pg[g] !== 'number') return 1;
+    var v = pg[g];
+    if (v >= MOOD_TASTE_HIGH) return 1;
+    if (v <= MOOD_TASTE_LOW) return MOOD_TASTE_MIN;
+    return MOOD_TASTE_MIN + (1 - MOOD_TASTE_MIN) * (v - MOOD_TASTE_LOW) / (MOOD_TASTE_HIGH - MOOD_TASTE_LOW);
+  }
+
+  function moodScore(c, ans, profile) {
     var mood = MOODS[ans.mood];
     var m = 0.5;
 
@@ -1601,6 +1619,7 @@
       for (var i = 0; i < c.genres.length; i++) {
         var gw = mood.w[c.genres[i]];
         if (gw === undefined) continue;
+        if (gw > 0) gw *= moodTaste(profile, c.genres[i]);
         if (gw > maxPos) maxPos = gw;
         if (gw < 0) neg += gw;
       }
@@ -1766,7 +1785,7 @@
       var parts = {
         q: qq.q, r: qq.r, rc: qq.corr, rb: qq.boost,
         a: aa.a, best: aa.best,
-        m: moodScore(c, ans),
+        m: moodScore(c, ans, profile),
         n: novelty(c, profile, ans),
         s: it.wath ? 1 : Math.min(it.seedHits / 3, 1)
       };
