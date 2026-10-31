@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.10.2';
+  var VERSION = '0.10.3';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
@@ -3044,7 +3044,49 @@
 
     function navFocus(el) { Lampa.Controller.collectionFocus(el, focusable()); }
 
+    // Остальные экраны (мастер, журнал, «Настроить вкус»): ряды по положению на экране.
+    // Влево/вправо — внутри ряда, вверх/вниз — в соседний ряд, на ближайший по горизонтали элемент.
+    function gridMove(dir) {
+      if (!html || !last || !$(last).closest(html).length) return false;
+      var els = html.find('.selector').toArray().filter(function (e) { return e.offsetParent !== null; });
+      if (!els.length) return false;
+      var info = els.map(function (e) { var r = e.getBoundingClientRect(); return { e: e, top: r.top, cx: r.left + r.width / 2, left: r.left }; });
+      info.sort(function (a, b) { return a.top - b.top || a.left - b.left; });
+      var rows = [];
+      for (var i = 0; i < info.length; i++) {
+        var row = rows[rows.length - 1];
+        if (row && Math.abs(info[i].top - row[0].top) < 12) row.push(info[i]);
+        else rows.push([info[i]]);
+      }
+      for (var r = 0; r < rows.length; r++) rows[r].sort(function (a, b) { return a.left - b.left; });
+      var ri = -1, ci = -1;
+      for (var a = 0; a < rows.length && ri < 0; a++) for (var b = 0; b < rows[a].length; b++) if (rows[a][b].e === last) { ri = a; ci = b; break; }
+      if (ri < 0) return false;
+
+      if (dir === 'left' || dir === 'right') {
+        var n = rows[ri][ci + (dir === 'left' ? -1 : 1)];
+        if (n) navFocus(n.e);
+        else if (dir === 'left') Lampa.Controller.toggle('menu');
+        return true;
+      }
+      var tr = rows[ri + (dir === 'up' ? -1 : 1)];
+      if (!tr) {
+        if (dir === 'up') Lampa.Controller.toggle('head');
+        return true;
+      }
+      // Вернулись туда, откуда пришли (сетка → кнопки → обратно) — на тот же элемент
+      var back = gridHop && gridHop.to === last && gridHop.dir !== dir && $(gridHop.from).closest(html).length ? gridHop.from : null;
+      var cx = rows[ri][ci].cx, best = tr[0];
+      for (var k = 1; k < tr.length; k++) if (Math.abs(tr[k].cx - cx) < Math.abs(best.cx - cx)) best = tr[k];
+      var target = back && tr.some(function (x) { return x.e === back; }) ? back : best.e;
+      gridHop = { from: last, to: target, dir: dir };
+      navFocus(target);
+      return true;
+    }
+    var gridHop = null;
+
     function lineMove(dir) {
+      if (view !== 'results') return gridMove(dir);
       var lines = navLines();
       if (!lines || !last) return false;
       var li = -1, pi = -1;
@@ -3291,18 +3333,24 @@
       // Кнопки сверху: до «Готово» не нужно листать всю сетку пультом
       var foot = $('<div class="pkr-actions"></div>');
       var count = $('<span class="pkr-taste__count"></span>');
-      var upd = function () { count.text(picked ? 'Отмечено: ' + picked : ''); };
-      foot.append(button('check', 'Готово', 'pkr-btn--primary', function () {
+      var upd = function () { html.find('.pkr-taste__count').text(picked ? 'Отмечено: ' + picked : ''); };
+      var finishTaste = function () {
         if (picked) noty('Добавлено в «Нравится»: ' + picked);
         renderWizard(0);
-      }));
+      };
+      foot.append(button('check', 'Готово', 'pkr-btn--primary', function () { finishTaste(); }));
       var moreBtn = button('refresh', 'Ещё фильмы', '', function () { load(); });
       foot.append(moreBtn);
       foot.append(count);
       wrap.append(foot);
       wrap.append(grid);
-      var moreBottom = button('refresh', 'Ещё фильмы', 'pkr-btn--ghost', function () { load(); });
-      wrap.append($('<div class="pkr-actions pkr-actions--footer"></div>').append(moreBottom));
+      // Снизу — те же кнопки, чтобы не возвращаться наверх
+      var count2 = $('<span class="pkr-taste__count"></span>');
+      var foot2 = $('<div class="pkr-actions pkr-actions--footer"></div>');
+      foot2.append(button('check', 'Готово', 'pkr-btn--primary', function () { finishTaste(); }));
+      foot2.append(button('refresh', 'Ещё фильмы', '', function () { load(); }));
+      foot2.append(count2);
+      wrap.append(foot2);
 
       var tcard = function (r) {
         var card = lampaCard(r);
