@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.10.3';
+  var VERSION = '0.10.4';
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
@@ -3120,8 +3120,27 @@
       return true;
     }
 
+    // На телефоне у Lampa поверх контента нижняя панель (в альбомной ориентации — справа).
+    // Даём под неё отступ, иначе нижние кнопки уходят под неё
+    function avoidNavBar() {
+      try {
+        var bar = $('.navigation-bar').filter(function () { return this.offsetParent !== null || $(this).css('display') !== 'none'; })[0];
+        var pb = '', pr = '';
+        if (bar && $(bar).css('display') !== 'none' && $(bar).css('visibility') !== 'hidden') {
+          var r = bar.getBoundingClientRect();
+          var vw = window.innerWidth || 0;
+          if (r.width && r.height) {
+            if (r.width < vw * 0.5) pr = Math.ceil(r.width) + 'px';          // сбоку
+            else pb = Math.ceil(r.height + 16) + 'px';                        // снизу
+          }
+        }
+        body.css({ 'padding-bottom': pb, 'padding-right': pr });
+      } catch (e) {}
+    }
+
     // Высота экрана: от верха компонента до низа окна
     function fit() {
+      avoidNavBar();
       try {
         var top = html.offset() ? html.offset().top : 0;
         var h = (window.innerHeight || document.documentElement.clientHeight) - Math.max(0, top);
