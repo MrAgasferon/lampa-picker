@@ -305,6 +305,16 @@ const CHECKS = [
     const d = (profile.f.genre || {})[18] || 0;
     return { ok: d > -0.6, got: 'вес драмы ' + r2(d) };
   } },
+  { id: 'F8b', title: '«Не мой жанр» по-прежнему учится: три отказа на ужасах опускают ужасы', fn: async () => {
+    const likes = []; for (let i = 0; i < 12; i++) likes.push(card(100 + i));
+    const env = makeEnv({ fav: { like: likes } });
+    const t = env.clock.now, rej = {};
+    [[27], [27, 53], [18, 27]].forEach((g, i) => { rej['movie:' + (910 + i)] = { t, r: 'genre', card: { id: 910 + i, genre_ids: g, method: 'movie' } }; });
+    env.storage.picker_feedback = { rejected: rej, seen: {}, opened: {} };
+    const { profile } = await env.profile();
+    const h = (profile.f.genre || {})[27] || 0, d = (profile.f.genre || {})[18] || 0;
+    return { ok: h <= -0.6 && d > -0.3, got: 'ужасы ' + r2(h) + ', драма ' + r2(d) + ', rejGenres ' + JSON.stringify(profile.rejGenres) };
+  } },
   { id: 'F9', title: 'Дедлайн старого подбора не выбрасывает задания КП нового', fn: async () => {
     const router = (url, p, def) => {
       if (url.indexOf('kinopoiskapiunofficial') > -1) {

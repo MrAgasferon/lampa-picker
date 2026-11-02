@@ -518,14 +518,24 @@
   }
 
   // Контент для детей: сериальный жанр «Детское» или возрастной рейтинг ниже 7 лет
-  function kidsTargeted(c) {
-    if ((c.genres || []).indexOf(10762) > -1) return true;
+  // Детское: жанр «Детское», детский ТВ-рейтинг, либо низкий возраст (RU ≤ 6 / US G) у анимации или семейного.
+  // Один низкий возраст без такого жанра — не признак: 0+/G стоит и у старой классики.
+  // Анимация не считается детской, если пользователь сам заметно её смотрит
+  function kidsTargeted(c, profile) {
+    var g = c.genres || [];
+    if (g.indexOf(10762) > -1) return true;
     var ct = c.cert;
     if (!ct) return false;
     if (ct.us && ['TV-Y', 'TV-Y7', 'TV-Y7-FV'].indexOf(ct.us) > -1) return true;
     var n = parseInt(ct.ru || '', 10);
-    return !isNaN(n) && n <= 6;
+    var young = (!isNaN(n) && n <= 6) || ct.us === 'G';
+    if (!young) return false;
+    var anim = g.indexOf(16) > -1, family = g.indexOf(10751) > -1;
+    if (!anim && !family) return false;
+    if (anim && profile && typeof profile.animShare === 'number' && profile.animShare >= KIDS_ANIM_LOVER) return false;
+    return true;
   }
+  var KIDS_ANIM_LOVER = 0.3;
 
   // 18+: жёсткий контент. Американский рейтинг надёжнее: российский 18+ в TMDB часто стоит у безобидных фильмов
   var HARD_GENRES = [28, 53, 80, 27, 10752];
@@ -1247,17 +1257,37 @@
     }
 
     // Явные причины отказов: «не мой жанр» и «слишком старое» — только при повторе
+    // «Не мой жанр» засчитывается одному жанру фильма — самому нетипичному для пользователя
+    // (драме — только если других жанров нет: она стоит у половины фильмов). Привязка «фильм → жанр»
+    // хранится отдельно и не исчезает вместе с 90-дневными отказами — выученное не забывается
     var rej = feedback().rejected, gRej = {}, oldYears = [];
-    each(rej, function (rec) {
+    var gMap = store('genre_rej', {}), gDirty = false;
+    var baseG = profile.f.genre || {};
+    each(rej, function (rec, k) {
       if (!rec || !rec.card || !rec.r) return;
       if (rec.r === 'genre') {
-        var gs = normGenres(rec.card.genre_ids || []);
-        for (var gi = 0; gi < gs.length; gi++) gRej[gs[gi]] = (gRej[gs[gi]] || 0) + 1;
+        if (gMap[k] === undefined) {
+          var gs = normGenres(rec.card.genre_ids || []);
+          var cand = gs.length > 1 ? gs.filter(function (g) { return g !== 18; }) : gs;
+          var pick = null;
+          for (var gi = 0; gi < cand.length; gi++) {
+            var wv = typeof baseG[cand[gi]] === 'number' ? baseG[cand[gi]] : 0;
+            if (pick === null || wv < pick.w) pick = { g: cand[gi], w: wv };
+          }
+          gMap[k] = pick ? pick.g : null;
+          gDirty = true;
+        }
       } else if (rec.r === 'old') {
         var oy = parseInt(String(rec.card.release_date || rec.card.first_air_date || '').slice(0, 4), 10);
         if (!isNaN(oy)) oldYears.push(oy);
       }
     });
+    if (gDirty) {
+      var gk = Object.keys(gMap);
+      if (gk.length > 300) for (var gx = 0; gx < gk.length - 300; gx++) delete gMap[gk[gx]];
+      save('genre_rej', gMap);
+    }
+    each(gMap, function (g) { if (g !== null && g !== undefined) gRej[g] = (gRej[g] || 0) + 1; });
     profile.rejGenres = {};
     profile.f.genre = profile.f.genre || {};
     each(gRej, function (cntG, g) {
@@ -1610,7 +1640,7 @@
 
     if (c.type === 'movie' && c.runtime && c.runtime <= 45 && (c.vc || 0) < 150) return 'votes';
 
-    if (ans.company !== 'kids' && kidsTargeted(c)) return 'kids_content';
+    if (ans.company !== 'kids' && kidsTargeted(c, profile)) return 'kids_content';
 
     // Смотрят не одни, а анимация пользователю почти не интересна — второму зрителю тем более
     if ((ans.company === 'couple' || ans.company === 'group') && isAnimated(c) && profile && profile.n >= 5 &&
@@ -2671,7 +2701,7 @@
   // =========================================================================
 
   var KP_API = 'https://kinopoiskapiunofficial.tech/';
-  var KP_DAILY_LIMIT = 200;         // личный ключ: предохранитель поверх лимита тарифа
+  var KP_DAILY_LIMIT = 500;         // личный ключ: суточный лимит бесплатного тарифа kinopoiskapiunofficial
   var KP_BUILTIN_DAILY_LIMIT = 40;  // встроенный ключ общий для всех — на устройство даём немного
 
   var KP_B = [91,87,2,85,72,104,63,110,118,53,22,13,0,23,59,43,41,108,35,212,142,203,158,254,247,252,190,174,151,215,192,212,176,237,178,225];
