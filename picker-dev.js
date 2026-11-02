@@ -173,7 +173,9 @@
     thrown: -0.5
   };
 
-  var INTENT_TYPES = ['book', 'wath', 'look', 'scheduled'];
+  // Намерение посмотреть. «Смотрю» (look) сюда не входит: это уже начатое — его не предлагаем
+  var INTENT_TYPES = ['wath', 'book', 'scheduled'];
+  var INTENT_REASON = { wath: 'Из вашего списка «Позже»', book: 'Из ваших закладок', scheduled: 'Из запланированного' };
   var WATCHED_TYPES = ['like', 'viewed', 'thrown'];
 
   // =========================================================================
@@ -424,8 +426,12 @@
   // TMDB через механизм Lampa (наследуем прокси пользователя)
   // =========================================================================
 
+  // Язык данных TMDB — отдельная настройка Lampa (tmdb_lang), не язык интерфейса
   function tmdbLang() {
-    try { return Lampa.Storage.get('language', 'ru') || 'ru'; } catch (e) { return 'ru'; }
+    try {
+      var l = (Lampa.Storage.field && Lampa.Storage.field('tmdb_lang')) || Lampa.Storage.get('tmdb_lang', '');
+      return l || Lampa.Storage.get('language', 'ru') || 'ru';
+    } catch (e) { return 'ru'; }
   }
 
   function tmdbUrl(path, params) {
@@ -450,7 +456,7 @@
   var LIST_TTL = 7 * DAY; // рекомендации и discover меняются медленно
 
   function tmdb(path, params, ttl, cb) {
-    var ck = 'tmdb:' + path + '?' + JSON.stringify(params || {});
+    var ck = 'tmdb:' + tmdbLang() + ':' + path + '?' + JSON.stringify(params || {});
     Cache.get(ck, ttl, function (hit) {
       if (hit) return cb(hit);
       Net.get(tmdbUrl(path, params), function (json) {
@@ -577,7 +583,7 @@
   // Отдельная маленькая очередь: CUB не должен занимать слоты TMDB и Кинопоиска
   var CubNet = {
     queue: [], active: 0, max: 2,
-    get: function (url, ok, fail) { this.queue.push({ url: url, ok: ok, fail: fail }); this.pump(); },
+    get: function (url, ok, fail, ctx) { this.queue.push({ url: url, ok: ok, fail: fail, ctx: ctx }); this.pump(); },
     pump: function () {
       var self = this;
       while (self.active < self.max && self.queue.length) {
@@ -597,10 +603,14 @@
         })(self.queue.shift());
       }
     },
-    drop: function () { this.queue = []; }
+    // Убрать задания одного подбора; без контекста — все
+    drop: function (ctx) {
+      if (!ctx) { this.queue = []; return; }
+      this.queue = this.queue.filter(function (j) { return j.ctx !== ctx; });
+    }
   };
 
-  function cubMeta(id, cb) {
+  function cubMeta(id, cb, ctx) {
     var ck = 'cub:' + id;
     Cache.get(ck, 30 * DAY, function (hit) {
       if (hit && (hit.s || now() - (hit.at || 0) < CUB_EMPTY_TTL)) return cb(hit.s || null, true);
@@ -610,28 +620,35 @@
           Cache.set(ck, { s: sc, at: now() });
           cb(sc, false);
         } else cb(null, false);
-      }, function () { cb(null, false); });
+      }, function () { cb(null, false); }, ctx);
     });
   }
 
   // Подтягивает шкалы для лучших фильмов списка; не ждёт дольше CUB_META_DEADLINE
+  // Счётчики свои у каждого подбора: поздние ответы отменённого подбора не сбивают статистику нового
   function attachCubMeta(list, cb) {
-    var fired = false;
-    var finish = function () { if (fired) return; fired = true; cb(); };
-    if (cubMetaOff()) { MoodsApi.state = false; return finish(); }
+    var fired = false, ctx = {};
+    var st = { got: 0, asked: 0 };
+    var finish = function () {
+      if (fired) return;
+      fired = true;
+      MoodsApi.state = st.got > 0; MoodsApi.got = st.got; MoodsApi.asked = st.asked;
+      cb(st);
+    };
+    if (cubMetaOff()) { MoodsApi.state = false; fired = true; return cb(st); }
     var todo = list.filter(function (it) { return it.c && it.c.type === 'movie' && !it.c.moods; })
       .sort(function (a, b) { return b.score - a.score; }).slice(0, CUB_META_N);
-    MoodsApi.asked = todo.length; MoodsApi.got = 0;
-    for (var k = 0; k < list.length; k++) if (list[k].c && list[k].c.moods) MoodsApi.got++;
-    if (!todo.length) { MoodsApi.state = MoodsApi.got > 0; return finish(); }
+    st.asked = todo.length;
+    for (var k = 0; k < list.length; k++) if (list[k].c && list[k].c.moods) st.got++;
+    if (!todo.length) return finish();
     var left = todo.length;
-    setTimeout(function () { if (!fired) { log('cub meta deadline, left', left); CubNet.drop(); } finish(); }, CUB_META_DEADLINE);
+    setTimeout(function () { if (!fired) { log('cub meta deadline, left', left); CubNet.drop(ctx); } finish(); }, CUB_META_DEADLINE);
     for (var i = 0; i < todo.length; i++) {
       (function (it) {
         cubMeta(it.id, function (sc) {
-          if (sc && !fired) { it.c.moods = sc; MoodsApi.got++; }
-          if (--left === 0) { MoodsApi.state = MoodsApi.got > 0; finish(); }
-        });
+          if (sc && !fired) { it.c.moods = sc; st.got++; }
+          if (--left === 0) finish();
+        }, ctx);
       })(todo[i]);
     }
   }
@@ -1500,13 +1517,14 @@
     // 5. Закладки «Позже»
     for (var e = 0; e < events.length; e++) {
       var ev = events[e];
-      var intent = false;
-      for (var it = 0; it < INTENT_TYPES.length; it++) if (ev.flags[INTENT_TYPES[it]]) intent = true;
+      var intent = null;
+      for (var it = 0; it < INTENT_TYPES.length && !intent; it++) if (ev.flags[INTENT_TYPES[it]]) intent = INTENT_TYPES[it];
       if (!intent || types.indexOf(ev.type) < 0) continue;
       if (!pool[ev.k]) {
         pool[ev.k] = { k: ev.k, id: ev.id, type: ev.type, r: ev.card, seedHits: 0, seeds: [], wath: true, src: 'wath' };
         srcCount.wath = (srcCount.wath || 0) + 1;
       } else pool[ev.k].wath = true;
+      pool[ev.k].list = intent;
     }
 
     if (--pending === 0) finish();
@@ -1532,6 +1550,7 @@
       var f = events[i].flags || {};
       for (var j = 0; j < WATCHED_TYPES.length; j++) if (f[WATCHED_TYPES[j]]) ex[events[i].k] = 'watched';
       if (f.started || f.viewed) ex[events[i].k] = 'watched';
+      else if (f.look) ex[events[i].k] = 'watching';      // «Смотрю» — в процессе
       // Уже открывали в Lampa: прогресс мог не распознаться, повторно не предлагаем
       else if (!ex[events[i].k] && (f.history || f.continued)) ex[events[i].k] = 'history';
     }
@@ -1541,27 +1560,32 @@
     return ex;
   }
 
+  // Проверки до загрузки деталей — общие для пула и для подставленных частей франшиз.
+  // Пустая строка — подходит, иначе причина отсева
+  function preReason(it, ex, ans) {
+    if (ex[it.k]) return ex[it.k];
+    var r = it.r || {};
+    // Начатое (в том числе онлайн, мимо истории Lampa) не предлагаем никогда
+    if (startedAny(r, it.type)) return 'started';
+    if (!it.wath) {
+      var date = r.release_date || r.first_air_date || '';
+      if (date && date > new Date().toISOString().slice(0, 10)) return 'future';
+      var minVotes = it.type === 'tv' ? 100 : (ans.time === '40' ? 150 : 200);
+      if ((r.vote_count || 0) < minVotes) return 'votes';
+    }
+    return '';
+  }
+
   function prefilter(pool, events, ans, stats) {
     var ex = excludedKeys(events);
-    var today = new Date().toISOString().slice(0, 10);
-    var short = ans.time === '40';
     var out = [];
     stats = stats || {};
-    var bump = function (k) { stats[k] = (stats[k] || 0) + 1; };
 
     each(pool, function (it, k) {
       if (k === '__src') return;
-      if (ex[k]) return bump(ex[k]);
-      var r = it.r || {};
-      // Начатое (в том числе онлайн, мимо истории Lampa) не предлагаем никогда
-      if (startedAny(r, it.type)) return bump('started');
-      var date = r.release_date || r.first_air_date || '';
-      if (!it.wath) {
-        if (date && date > today) return bump('future');
-        var minVotes = it.type === 'tv' ? 100 : (short ? 150 : 200);
-        if ((r.vote_count || 0) < minVotes) return bump('votes');
-      }
-      out.push(it);
+      var why = preReason(it, ex, ans);
+      if (why) stats[why] = (stats[why] || 0) + 1;
+      else out.push(it);
     });
     return out;
   }
@@ -1822,7 +1846,7 @@
 
   function reasonOf(it, parts, w, profile, ans) {
     var c = it.c;
-    if (it.wath) return 'Из вашего списка «Позже»';
+    if (it.wath) return INTENT_REASON[it.list] || INTENT_REASON.wath;
     if (it.src === 'franchise') return 'Первая непросмотренная часть серии';
     // Найден по любимому режиссёру или актёру — называем его
     if (it.src === 'ppl' && !(it.seedHits >= 1)) {
@@ -2018,6 +2042,14 @@
     var done = function () {
       if (--left > 0) return;
       var kept = list.filter(function (it) { return !drop[it.k]; });
+      // Подставленная часть проходит те же проверки, что и пул: не начата, не исключена, достаточно голосов
+      additions = additions.filter(function (ad) {
+        var why = preReason(ad, ex, ans);
+        if (!why) return true;
+        stats[why] = (stats[why] || 0) + 1;
+        if (ad.fallback) kept.push(ad.fallback);           // начало серии не подошло — остаётся лучшая часть
+        return false;
+      });
       if (!additions.length) return cb(kept);
       detailsMany(additions, function () {
         var kids = ans.company === 'kids';
@@ -2027,7 +2059,7 @@
           if (r) {
             stats[r] = (stats[r] || 0) + 1;
             // Начало серии не подошло — оставляем лучшую часть, что прошла все проверки пула
-            if (kids && additions[a].fallback) kept.push(additions[a].fallback);
+            if (additions[a].fallback) kept.push(additions[a].fallback);
           }
           else kept.push(additions[a]);
         }
@@ -2163,7 +2195,9 @@
         };
 
         var kpBefore = 0;
+        var cubStat = { got: 0, asked: 0 };
         var afterDetails = function () {
+          if (!alive()) return;                       // отменённый подбор не тратит квоту КП и слоты CUB
           mark('details');
           scoreAll(passed, profile, ans);
           stage('Уточняю настроение и рейтинги');
@@ -2171,7 +2205,7 @@
           kpBefore = kpQuota().n;
           var pending = 2;
           var both = function () { if (--pending === 0) afterExtras(); };
-          attachCubMeta(passed, both);
+          attachCubMeta(passed, function (x) { if (x) cubStat = x; both(); });
           attachRatings(passed, both);
         };
 
@@ -2215,7 +2249,7 @@
             profile: profile, wkey: wkey, cold: profile.n < 5
           };
           st.journal = Journal.begin(ans, {
-            wkey: wkey, ms: now() - started, tm: tm, moods: MoodsApi.state, cub: [MoodsApi.got, MoodsApi.asked],
+            wkey: wkey, ms: now() - started, tm: tm, moods: cubStat.got > 0, cub: [cubStat.got, cubStat.asked],
             kp: { req: kpReq, off: kpOffline(), rated: finalList.filter(function (x) { return x.rt; }).length },
             counts: { events: events.length, profile: profile.n, pool: Object.keys(pool).length - 1, prefiltered: list.length, detailed: top.length, final: finalList.length },
             sources: pool.__src,
@@ -2581,10 +2615,19 @@
     return Math.max(0, FEEDBACK_DAILY - q.n);
   }
 
+  var FEEDBACK_TIMEOUT = 30000;
+
   function postText(url, body) {
     if (window.fetch) {
-      return fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: body, redirect: 'follow' })
-        .then(function (r) { return r.text(); });
+      // У fetch нет таймаута: при зависшей сети пользователь иначе видит «Отправляю…» без итога
+      return new Promise(function (resolve, reject) {
+        var done = false;
+        var t = setTimeout(function () { if (!done) { done = true; reject(new Error('timeout')); } }, FEEDBACK_TIMEOUT);
+        fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: body, redirect: 'follow' })
+          .then(function (r) { return r.text(); })
+          .then(function (txt) { if (!done) { done = true; clearTimeout(t); resolve(txt); } },
+            function (e) { if (!done) { done = true; clearTimeout(t); reject(e); } });
+      });
     }
     return new Promise(function (resolve, reject) {
       var x = new XMLHttpRequest();
@@ -2665,11 +2708,22 @@
   // Отдельная очередь КП: не мешает TMDB, короткий таймаут, без повторов.
   // Два сетевых сбоя подряд (источник недоступен) — час только кеш.
   var KP_TIMEOUT = 4500, KP_OFF_FOR = 3600 * 1000;
-  var kpRunCap = 0;           // потолок квоты на время текущего подбора (0 — нет)
+  // Контекст подбора для КП: свой потолок квоты и флаг «закончен». Задания очереди помечены контекстом,
+  // поэтому дедлайн одного подбора не трогает задания другого, а поздние шаги закончившегося не уходят в сеть
+  function kpContext() {
+    return { cap: kpQuota().n + (kpUsingBuiltin() ? KP_RUN_BUDGET_BUILTIN : KP_RUN_BUDGET_PERSONAL), done: false };
+  }
   var kpNetFails = 0;
   var KpNet = {
     queue: [], active: 0, max: 3,
-    get: function (url, ok, fail, opts) { this.queue.push({ url: url, ok: ok, fail: fail, opts: opts }); this.pump(); },
+    get: function (url, ok, fail, opts, ctx) { this.queue.push({ url: url, ok: ok, fail: fail, opts: opts, ctx: ctx }); this.pump(); },
+    // Убрать из очереди задания одного подбора (их колбэки получают отказ)
+    dropCtx: function (ctx) {
+      var keep = [], gone = [];
+      for (var i = 0; i < this.queue.length; i++) (this.queue[i].ctx === ctx ? gone : keep).push(this.queue[i]);
+      this.queue = keep;
+      for (var j = 0; j < gone.length; j++) { try { gone[j].fail && gone[j].fail(-1); } catch (e) {} }
+    },
     pump: function () {
       var self = this;
       while (self.active < self.max && self.queue.length) {
@@ -2688,7 +2742,7 @@
             end(job.fail, status);
           };
           // Списываем квоту в момент отправки: отменённые из очереди запросы не считаются
-          if (!kpSpend()) return end(job.fail, -1);
+          if (!kpSpend(job.ctx)) return end(job.fail, -1);
           var req = new Lampa.Reguest();
           req.timeout(KP_TIMEOUT);
           req.silent(job.url, function (j) { kpNetFails = 0; end(job.ok, j); }, function (a) { onFail((a && a.status) || 0); }, false, job.opts);
@@ -2700,17 +2754,21 @@
 
   function kpOffline() { return store('kp_off', 0) > now(); }
 
+  var KP_PAUSE_429 = 60000;
+  var kpPauseUntil = 0;           // в памяти: пауза короткая, переживать перезапуск ей незачем
+  function kpPause() { kpPauseUntil = now() + KP_PAUSE_429; log('kp 429, pause', KP_PAUSE_429); }
+
   // Можно ли ещё запрашивать (без списания)
-  function kpCan() {
-    if (!kpKey() || kpOffline()) return false;
+  function kpCan(ctx) {
+    if (!kpKey() || kpOffline() || kpPauseUntil > now()) return false;
+    if (ctx && ctx.done) return false;
     var q = kpQuota();
-    return !q.blocked && q.n < kpLimit() && !(kpRunCap && q.n >= kpRunCap);
+    return !q.blocked && q.n < kpLimit() && !(ctx && q.n >= ctx.cap);
   }
 
-  function kpSpend() {
-    if (!kpKey() || kpOffline()) return false;
+  function kpSpend(ctx) {
+    if (!kpCan(ctx)) return false;
     var q = kpQuota();
-    if (q.blocked || q.n >= kpLimit() || (kpRunCap && q.n >= kpRunCap)) return false;
     q.n++;
     save('kp_quota', q);
     return true;
@@ -2729,7 +2787,9 @@
 
   function kpFail(cb) {
     return function (status) {
-      if (status === 401 || status === 402 || status === 403 || status === 429) kpBlock(status);
+      // 429 — лимит запросов в секунду, а не суточная квота: короткая пауза, а не блок до конца дня
+      if (status === 429) kpPause();
+      else if (status === 401 || status === 402 || status === 403) kpBlock(status);
       cb(null);
     };
   }
@@ -2752,7 +2812,7 @@
 
   function kpHeaders() { return { headers: { 'X-API-KEY': kpKey() } }; }
 
-  function fetchRatings(it, cb) {
+  function fetchRatings(it, cb, ctx) {
     var c = it.c;
     var cached = kpCache()[c.id];
     if (cached && (parseFloat(cached.kp) > 0 || parseFloat(cached.imdb) > 0)) {
@@ -2785,14 +2845,14 @@
     };
 
     var byId = function (kpId) {
-      if (!kpCan()) return cb(null);
+      if (!kpCan(ctx)) return cb(null);
       KpNet.get(KP_API + 'api/v2.2/films/' + kpId, function (j) {
         finish(j && j.ratingKinopoisk, j && j.ratingImdb, kpId, kpAgeOf(j));
-      }, kpFail(cb), kpHeaders());
+      }, kpFail(cb), kpHeaders(), ctx);
     };
 
     var byTitle = function () {
-      if (!c.title || !kpCan()) return cb(null);
+      if (!c.title || !kpCan(ctx)) return cb(null);
       KpNet.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(c.original || c.title), function (j) {
         var films = (j && j.films) || [];
         var y = parseInt(c.year, 10);
@@ -2801,11 +2861,11 @@
           if (!y || (!isNaN(fy) && Math.abs(fy - y) <= 1)) return byId(films[i].filmId);
         }
         finish(0, 0, null);
-      }, kpFail(cb), kpHeaders());
+      }, kpFail(cb), kpHeaders(), ctx);
     };
 
     if (c.imdb) {
-      if (!kpCan()) return cb(null);
+      if (!kpCan(ctx)) return cb(null);
       KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
         var x = j && j.items && j.items[0];
         if (x) finish(x.ratingKinopoisk, x.ratingImdb, x.kinopoiskId);
@@ -2813,7 +2873,7 @@
       }, function (status) {
         if (status === 401 || status === 402 || status === 403 || status === 429 || status <= 0) return kpFail(cb)(status);
         byTitle();
-      }, kpHeaders());
+      }, kpHeaders(), ctx);
     } else byTitle();
   }
 
@@ -2825,7 +2885,7 @@
   }
 
   // Возраст по КП для одного фильма: из kpmap, иначе запрос карточки КП (id берём из kpmap или ищем по imdb)
-  function kpAge(it, cb) {
+  function kpAge(it, cb, ctx) {
     var mp = Durable.get('kpmap', {});
     var m = mp[it.k];
     if (m && typeof m.age === 'number') return cb(m.age);
@@ -2838,21 +2898,21 @@
       cb(age);
     };
     var byId = function (id) {
-      if (!kpCan()) return cb(null);
+      if (!kpCan(ctx)) return cb(null);
       KpNet.get(KP_API + 'api/v2.2/films/' + id, function (j) {
         var age = kpAgeOf(j);
         if (age === null) return cb(null);
         save(id, age);
-      }, function () { cb(null); }, kpHeaders());
+      }, function () { cb(null); }, kpHeaders(), ctx);
     };
     if (m && m.id) return byId(m.id);
     var c = it.c || {};
-    if (!c.imdb || !kpCan()) return cb(null);          // поиск по названию ради возраста не тратим
+    if (!c.imdb || !kpCan(ctx)) return cb(null);          // поиск по названию ради возраста не тратим
     KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
       var x = j && j.items && j.items[0];
       if (x && x.kinopoiskId) byId(x.kinopoiskId);
       else cb(null);
-    }, function () { cb(null); }, kpHeaders());
+    }, function () { cb(null); }, kpHeaders(), ctx);
   }
 
   // «С детьми»: возраст КП для лучших кандидатов. У TMDB часто есть только американский рейтинг,
@@ -2861,12 +2921,12 @@
 
   function attachKidsAge(list, cb) {
     var fired = false;
-    var finish = function () { if (!fired) { fired = true; kpRunCap = 0; cb(); } };
+    // Тот же бюджет на подбор, что и у оценок: встроенный ключ общий
+    var ctx = kpContext();
+    var finish = function () { if (!fired) { fired = true; ctx.done = true; KpNet.dropCtx(ctx); cb(); } };
     var todo = list.filter(function (it) { return it.c && it.c.type === 'movie' && it.c.kpAge === undefined; })
       .sort(function (a, b) { return b.score - a.score; }).slice(0, KIDS_AGE_N);
-    if (!todo.length || !kpCan()) return finish();
-    // Тот же бюджет на подбор, что и у оценок: встроенный ключ общий
-    kpRunCap = kpQuota().n + (kpUsingBuiltin() ? KP_RUN_BUDGET_BUILTIN : KP_RUN_BUDGET_PERSONAL);
+    if (!todo.length || !kpCan(ctx)) return finish();
     setTimeout(finish, KIDS_AGE_DEADLINE);
     var idx = 0, running = 0;
     var next = function () {
@@ -2879,7 +2939,7 @@
             if (typeof age === 'number') it.c.kpAge = age;
             running--;
             next();
-          });
+          }, ctx);
         })(todo[idx++]);
       }
     };
@@ -2893,26 +2953,24 @@
 
   function attachRatings(list, cb) {
     var fired = false;
+    var ctx = kpContext();
     var finish = function () {
       if (fired) return;
       fired = true;
-      kpRunCap = 0;
-      KpNet.queue = [];          // не дождались — не тратим квоту на хвост
+      ctx.done = true;
+      KpNet.dropCtx(ctx);        // не дождались — не тратим квоту на хвост; чужие задания не трогаем
       cb();
     };
     var todo = list.slice().sort(function (a, b) { return b.score - a.score; })
       .slice(0, KP_FINALISTS).filter(function (it) { return it.c && !it.rt && !it.kpTried; });
-    if (!todo.length || !kpCan()) return finish();
-    var q0 = kpQuota().n;
-    var budget = kpUsingBuiltin() ? KP_RUN_BUDGET_BUILTIN : KP_RUN_BUDGET_PERSONAL;
-    kpRunCap = q0 + budget;
+    if (!todo.length || !kpCan(ctx)) return finish();
     setTimeout(finish, KP_DEADLINE);
     // По очереди от лучшего к худшему, по 3 фильма одновременно: бюджет уходит на верх списка целиком
     var idx = 0, running = 0;
     var next = function () {
       if (fired) return;
-      if ((idx >= todo.length || !kpCan()) && !running) return finish();
-      while (running < 3 && idx < todo.length && kpCan()) {
+      if ((idx >= todo.length || !kpCan(ctx)) && !running) return finish();
+      while (running < 3 && idx < todo.length && kpCan(ctx)) {
         (function (it) {
           running++;
           it.kpTried = true;
@@ -2924,7 +2982,7 @@
             }
             running--;
             next();
-          });
+          }, ctx);
         })(todo[idx++]);
       }
     };
@@ -3879,6 +3937,14 @@
       content.append(actions);
 
       if (state.cold) content.append('<div class="pkr-note">Истории просмотров пока мало — подбор в основном по рейтингу и настроению</div>');
+      // Встроенный ключ КП общий и маленький — когда он на сегодня кончился, подсказываем про личный (раз в день)
+      try {
+        var kq = kpQuota();
+        if (kpUsingBuiltin() && (kq.blocked || kq.n >= kpLimit()) && store('kp_hint_day', 0) !== todaySeed()) {
+          save('kp_hint_day', todaySeed());
+          content.append('<div class="pkr-note">Рейтинги Кинопоиска на сегодня закончились. Свой бесплатный ключ снимает ограничение: Настройки → ' + esc(TITLE) + ' → Ключ Кинопоиска</div>');
+        }
+      } catch (e) {}
 
       var row = $('<div class="pkr-row"></div>');
       cardEls = [];
@@ -4083,7 +4149,10 @@
     }
 
     // Комментарий через клавиатуру Lampa. Пустой ввод — отправка без комментария, «Назад» — отмена.
+    var feedbackSending = false;
+
     function askFeedback() {
+      if (feedbackSending) return noty('Журнал уже отправляется');
       if (!feedbackLeft()) return noty('На сегодня лимит отправок исчерпан');
       var restore = function () {
         if (view === 'journal') {
@@ -4092,10 +4161,14 @@
       };
       var go = function (comment) {
         setTimeout(restore, 0);
+        if (feedbackSending) return;
+        feedbackSending = true;
         noty('Отправляю…');
         sendFeedback(comment).then(function () {
+          feedbackSending = false;
           noty('Отправлено, спасибо!');
         }, function (e) {
+          feedbackSending = false;
           log('feedback error', e);
           noty('Не получилось отправить — попробуйте позже');
         });
