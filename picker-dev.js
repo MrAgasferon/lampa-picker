@@ -2020,9 +2020,15 @@
       var kept = list.filter(function (it) { return !drop[it.k]; });
       if (!additions.length) return cb(kept);
       detailsMany(additions, function () {
+        var kids = ans.company === 'kids';
         for (var a = 0; a < additions.length; a++) {
-          var r = postReason(additions[a], ans, profileRef);
-          if (r) stats[r] = (stats[r] || 0) + 1;
+          // С детьми у добавленной части нет шкал CUB и возраста КП — проверяем по строгому правилу
+          var r = postReason(additions[a], ans, profileRef, kids);
+          if (r) {
+            stats[r] = (stats[r] || 0) + 1;
+            // Начало серии не подошло — оставляем лучшую часть, что прошла все проверки пула
+            if (kids && additions[a].fallback) kept.push(additions[a].fallback);
+          }
           else kept.push(additions[a]);
         }
         cb(kept);
@@ -2049,22 +2055,21 @@
 
         var inList = false;
         if (next) for (var q = 0; q < items.length; q++) if (items[q].id === next.id) inList = true;
-        // С детьми не подставляем часть, которая не прошла проверки пула (шкалы CUB, рейтинг) — оставляем лучшую из прошедших
-        var keepBest = next && !inList && ans.company === 'kids';
 
         for (var j = 0; j < items.length; j++) {
           var it = items[j];
-          var keep = !blocked && (keepBest ? it === best : (next ? it.id === next.id : (parts.length === 0 && it === best)));
+          var keep = !blocked && (next ? it.id === next.id : (parts.length === 0 && it === best));
           if (!keep) { drop[it.k] = true; stats.franchise = (stats.franchise || 0) + 1; }
         }
 
         // Нужная часть не в списке — подставляем её вместо лучшего представителя франшизы
-        if (!blocked && next && !keepBest) {
+        if (!blocked && next) {
           if (!inList) {
             additions.push({
               k: keyOf('movie', next.id), id: next.id, type: 'movie', r: next,
               // «Похож на …» относилось к другой части — не переносим
-              seedHits: 0, seeds: [], wath: false, src: 'franchise'
+              seedHits: 0, seeds: [], wath: false, src: 'franchise',
+              fallback: best                                  // если начало серии не пройдёт проверки
             });
           }
         }
