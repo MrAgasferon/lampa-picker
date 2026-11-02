@@ -10,7 +10,10 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.10.4';
+  var VERSION = '0.11.0';
+  // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
+  var DEV = /-dev$/.test(VERSION);
+  var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
 
   // Адрес веб-приложения Google Apps Script для «Отправить автору». Пусто — кнопки нет.
   var FEEDBACK_URL = 'https://script.google.com/macros/s/AKfycbwfDLlJYpeW7Hnq6pD3-90wNWoTWjqJuRup7l2EHpMbB8qcGDJWKszei1Twyd1BhwB1/exec';
@@ -151,8 +154,14 @@
     think: { q: 0.40, a: 0.30, m: 0.15, n: 0.05, s: 0.10 },
     surprise: { q: 0.30, a: 0.20, m: 0.00, n: 0.40, s: 0.10 },
     group: { q: 0.40, a: 0.15, m: 0.30, n: 0.05, s: 0.10 },
-    cold: { q: 0.55, a: 0.10, m: 0.30, n: 0.05, s: 0.00 }
+    cold: { q: 0.55, a: 0.10, m: 0.30, n: 0.05, s: 0.00 },
+    // С детьми вкус взрослого почти не важен — важно, что подходит детям
+    kids: { q: 0.40, a: 0.15, m: 0.35, n: 0.05, s: 0.05 }
   };
+
+  // «С детьми»: что тянет вверх и что вниз (поверх настроения)
+  var KIDS_PLUS = [10751, 16, 12, 14];
+  var KIDS_MINUS = [53, 80, 9648, 10752, 27];
 
   var AFFINITY_COEF = { genre: 0.30, keyword: 0.25, director: 0.15, cast: 0.15, decade: 0.08, lang: 0.07 };
 
@@ -164,7 +173,9 @@
     thrown: -0.5
   };
 
-  var INTENT_TYPES = ['book', 'wath', 'look', 'scheduled'];
+  // Намерение посмотреть. «Смотрю» (look) сюда не входит: это уже начатое — его не предлагаем
+  var INTENT_TYPES = ['wath', 'book', 'scheduled'];
+  var INTENT_REASON = { wath: 'Из вашего списка «Позже»', book: 'Из ваших закладок', scheduled: 'Из запланированного' };
   var WATCHED_TYPES = ['like', 'viewed', 'thrown'];
 
   // =========================================================================
@@ -178,6 +189,8 @@
     max: 4,
     pauseUntil: 0,
     pauseTimer: null,
+    oks: 0,          // счётчики для подбора: отличить «ничего не нашлось» от «нет связи»
+    netFails: 0,
 
     get: function (url, ok, fail, opts) {
       this.queue.push({ url: url, ok: ok, fail: fail, opts: opts, tries: 0 });
@@ -196,14 +209,26 @@
           self.active++;
           var req = new Lampa.Reguest();
           req.timeout(15000);
+          // Страховка: другой плагин может перехватить ответ Lampa.Reguest, и тогда колбэк не придёт никогда —
+          // слот очереди занят навсегда. Через 17 с считаем запрос неудачным
+          var settled = false;
+          var guard = setTimeout(function () { failed({ status: 0 }); }, 17000);
           var done = function (json) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(guard);
             self.active--;
+            self.oks++;
             try { job.ok(json); } catch (e) { log('callback error', e); }
             self.pump();
           };
           var failed = function (a) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(guard);
             self.active--;
             var status = (a && a.status) || 0;
+            if (!status || status >= 500) self.netFails++;
             if (status === 429 && job.tries < 3) {
               job.tries++;
               self.pauseUntil = now() + Math.min(30000, 2000 * Math.pow(2, job.tries));
@@ -230,11 +255,42 @@
   // Кеш: IndexedDB с запасным вариантом в памяти
   // =========================================================================
 
+  var CACHE_MEM_MAX = 400;          // записей в памяти; источник правды — IndexedDB
+  var CACHE_IDB_MAX_AGE = 35 * DAY;  // старше — удаляется при суточной чистке
+
   var Cache = {
     db: null,
     mem: {},
+    order: [],
     opened: false,
     waiting: [],
+
+    // Память ограничена: самые давние ключи вытесняются
+    remember: function (key, rec) {
+      if (!this.mem[key]) this.order.push(key);
+      this.mem[key] = rec;
+      while (this.order.length > CACHE_MEM_MAX) delete this.mem[this.order.shift()];
+    },
+
+    // Раз в сутки: удалить из IndexedDB просроченное и сырые детали старого формата (до 0.11)
+    sweep: function () {
+      var self = this;
+      self.init(function () {
+        if (!self.db) return;
+        try {
+          var lim = now() - CACHE_IDB_MAX_AGE, removed = 0;
+          var cur = self.db.transaction('kv', 'readwrite').objectStore('kv').openCursor();
+          cur.onsuccess = function (e) {
+            var c = e.target.result;
+            if (!c) { if (removed) log('cache sweep, removed', removed); return; }
+            var k = String(c.key), v = c.value;
+            var legacy = k.indexOf('tmdb:') === 0 && k.indexOf('append_to_response') > -1;
+            if (k.indexOf('durable:') !== 0 && (legacy || !v || !(v.t > lim))) { c['delete'](); removed++; }
+            c['continue']();
+          };
+        } catch (e) { log('cache sweep error', e); }
+      });
+    },
 
     init: function (cb) {
       var self = this;
@@ -243,6 +299,7 @@
       if (self.waiting.length > 1) return;
 
       var done = function () {
+        if (self.opened) return;
         self.opened = true;
         var w = self.waiting;
         self.waiting = [];
@@ -252,10 +309,17 @@
       try {
         if (!window.indexedDB) return done();
         var req = window.indexedDB.open('lampa_picker', 1);
+        // Бывает, что open не отвечает вовсе (известная ошибка WebKit) — тогда работаем на памяти
+        var guard = setTimeout(function () { log('idb open timeout'); done(); }, 3000);
         req.onupgradeneeded = function (e) { e.target.result.createObjectStore('kv'); };
-        req.onsuccess = function (e) { self.db = e.target.result; done(); };
-        req.onerror = function () { done(); };
-        req.onblocked = function () { done(); };
+        req.onsuccess = function (e) {
+          clearTimeout(guard);
+          if (self.opened) { try { e.target.result.close(); } catch (x) {} return; }   // опоздал — уже работаем без базы
+          self.db = e.target.result;
+          done();
+        };
+        req.onerror = function () { clearTimeout(guard); done(); };
+        req.onblocked = function () { clearTimeout(guard); done(); };
       } catch (e) { done(); }
     },
 
@@ -269,7 +333,7 @@
           var r = self.db.transaction('kv', 'readonly').objectStore('kv').get(key);
           r.onsuccess = function () {
             var x = r.result;
-            if (x) { self.mem[key] = x; cb(now() - x.t < ttl ? x.v : null); }
+            if (x) { self.remember(key, x); cb(now() - x.t < ttl ? x.v : null); }
             else cb(null);
           };
           r.onerror = function () { cb(null); };
@@ -279,7 +343,7 @@
 
     set: function (key, val) {
       var rec = { t: now(), v: val };
-      this.mem[key] = rec;
+      this.remember(key, rec);
       if (!this.db) return;
       try { this.db.transaction('kv', 'readwrite').objectStore('kv').put(rec, key); } catch (e) {}
     }
@@ -362,9 +426,16 @@
   // TMDB через механизм Lampa (наследуем прокси пользователя)
   // =========================================================================
 
+  // Язык данных TMDB — отдельная настройка Lampa (tmdb_lang), не язык интерфейса
+  function tmdbLang() {
+    try {
+      var l = (Lampa.Storage.field && Lampa.Storage.field('tmdb_lang')) || Lampa.Storage.get('tmdb_lang', '');
+      return l || Lampa.Storage.get('language', 'ru') || 'ru';
+    } catch (e) { return 'ru'; }
+  }
+
   function tmdbUrl(path, params) {
-    var lang = 'ru';
-    try { lang = Lampa.Storage.get('language', 'ru') || 'ru'; } catch (e) {}
+    var lang = tmdbLang();
 
     var q = [];
     each(params || {}, function (v, k) { q.push(k + '=' + encodeURIComponent(v)); });
@@ -385,7 +456,7 @@
   var LIST_TTL = 7 * DAY; // рекомендации и discover меняются медленно
 
   function tmdb(path, params, ttl, cb) {
-    var ck = 'tmdb:' + path + '?' + JSON.stringify(params || {});
+    var ck = 'tmdb:' + tmdbLang() + ':' + path + '?' + JSON.stringify(params || {});
     Cache.get(ck, ttl, function (hit) {
       if (hit) return cb(hit);
       Net.get(tmdbUrl(path, params), function (json) {
@@ -425,24 +496,46 @@
     return null;
   }
 
+  // Одна шкала возраста для российских и американских рейтингов. PG-13 = 12+, как обещает плитка «до 12+»
+  var US_AGE = { 'G': 0, 'TV-Y': 0, 'TV-G': 0, 'TV-Y7': 7, 'TV-Y7-FV': 7, 'PG': 8, 'TV-PG': 10,
+    'PG-13': 12, 'TV-14': 14, 'R': 17, 'TV-MA': 17, 'NC-17': 18 };
+  var KIDS_MAX_AGE = 12;
+  var KIDS_UNCONFIRMED_MAX = 8;    // без российского рейтинга и без КП — только до PG
+
+  // Возраст по самому строгому из известных рейтингов; null — рейтинга нет
+  function ageOf(cert) {
+    if (!cert) return null;
+    var a = null;
+    var n = parseInt(cert.ru || '', 10);
+    if (!isNaN(n)) a = n;
+    if (cert.us && US_AGE[cert.us] !== undefined) a = Math.max(a === null ? 0 : a, US_AGE[cert.us]);
+    return a;
+  }
+
   function kidsOk(cert) {
-    if (!cert) return false;
-    if (cert.c === 'RU') {
-      var n = parseInt(cert.v, 10);
-      return !isNaN(n) && n <= 12;
-    }
-    return ['G', 'PG', 'TV-Y', 'TV-Y7', 'TV-G', 'TV-PG'].indexOf(cert.v) > -1;
+    var a = ageOf(cert);
+    return a !== null && a <= KIDS_MAX_AGE;
   }
 
   // Контент для детей: сериальный жанр «Детское» или возрастной рейтинг ниже 7 лет
-  function kidsTargeted(c) {
-    if ((c.genres || []).indexOf(10762) > -1) return true;
+  // Детское: жанр «Детское», детский ТВ-рейтинг, либо низкий возраст (RU ≤ 6 / US G) у анимации или семейного.
+  // Один низкий возраст без такого жанра — не признак: 0+/G стоит и у старой классики.
+  // Анимация не считается детской, если пользователь сам заметно её смотрит
+  function kidsTargeted(c, profile) {
+    var g = c.genres || [];
+    if (g.indexOf(10762) > -1) return true;
     var ct = c.cert;
     if (!ct) return false;
     if (ct.us && ['TV-Y', 'TV-Y7', 'TV-Y7-FV'].indexOf(ct.us) > -1) return true;
     var n = parseInt(ct.ru || '', 10);
-    return !isNaN(n) && n <= 6;
+    var young = (!isNaN(n) && n <= 6) || ct.us === 'G';
+    if (!young) return false;
+    var anim = g.indexOf(16) > -1, family = g.indexOf(10751) > -1;
+    if (!anim && !family) return false;
+    if (anim && profile && typeof profile.animShare === 'number' && profile.animShare >= KIDS_ANIM_LOVER) return false;
+    return true;
   }
+  var KIDS_ANIM_LOVER = 0.3;
 
   // 18+: жёсткий контент. Американский рейтинг надёжнее: российский 18+ в TMDB часто стоит у безобидных фильмов
   var HARD_GENRES = [28, 53, 80, 27, 10752];
@@ -500,7 +593,7 @@
   // Отдельная маленькая очередь: CUB не должен занимать слоты TMDB и Кинопоиска
   var CubNet = {
     queue: [], active: 0, max: 2,
-    get: function (url, ok, fail) { this.queue.push({ url: url, ok: ok, fail: fail }); this.pump(); },
+    get: function (url, ok, fail, ctx) { this.queue.push({ url: url, ok: ok, fail: fail, ctx: ctx }); this.pump(); },
     pump: function () {
       var self = this;
       while (self.active < self.max && self.queue.length) {
@@ -520,10 +613,14 @@
         })(self.queue.shift());
       }
     },
-    drop: function () { this.queue = []; }
+    // Убрать задания одного подбора; без контекста — все
+    drop: function (ctx) {
+      if (!ctx) { this.queue = []; return; }
+      this.queue = this.queue.filter(function (j) { return j.ctx !== ctx; });
+    }
   };
 
-  function cubMeta(id, cb) {
+  function cubMeta(id, cb, ctx) {
     var ck = 'cub:' + id;
     Cache.get(ck, 30 * DAY, function (hit) {
       if (hit && (hit.s || now() - (hit.at || 0) < CUB_EMPTY_TTL)) return cb(hit.s || null, true);
@@ -533,28 +630,35 @@
           Cache.set(ck, { s: sc, at: now() });
           cb(sc, false);
         } else cb(null, false);
-      }, function () { cb(null, false); });
+      }, function () { cb(null, false); }, ctx);
     });
   }
 
   // Подтягивает шкалы для лучших фильмов списка; не ждёт дольше CUB_META_DEADLINE
+  // Счётчики свои у каждого подбора: поздние ответы отменённого подбора не сбивают статистику нового
   function attachCubMeta(list, cb) {
-    var fired = false;
-    var finish = function () { if (fired) return; fired = true; cb(); };
-    if (cubMetaOff()) { MoodsApi.state = false; return finish(); }
+    var fired = false, ctx = {};
+    var st = { got: 0, asked: 0 };
+    var finish = function () {
+      if (fired) return;
+      fired = true;
+      MoodsApi.state = st.got > 0; MoodsApi.got = st.got; MoodsApi.asked = st.asked;
+      cb(st);
+    };
+    if (cubMetaOff()) { MoodsApi.state = false; fired = true; return cb(st); }
     var todo = list.filter(function (it) { return it.c && it.c.type === 'movie' && !it.c.moods; })
       .sort(function (a, b) { return b.score - a.score; }).slice(0, CUB_META_N);
-    MoodsApi.asked = todo.length; MoodsApi.got = 0;
-    for (var k = 0; k < list.length; k++) if (list[k].c && list[k].c.moods) MoodsApi.got++;
-    if (!todo.length) { MoodsApi.state = MoodsApi.got > 0; return finish(); }
+    st.asked = todo.length;
+    for (var k = 0; k < list.length; k++) if (list[k].c && list[k].c.moods) st.got++;
+    if (!todo.length) return finish();
     var left = todo.length;
-    setTimeout(function () { if (!fired) { log('cub meta deadline, left', left); CubNet.drop(); } finish(); }, CUB_META_DEADLINE);
+    setTimeout(function () { if (!fired) { log('cub meta deadline, left', left); CubNet.drop(ctx); } finish(); }, CUB_META_DEADLINE);
     for (var i = 0; i < todo.length; i++) {
       (function (it) {
         cubMeta(it.id, function (sc) {
-          if (sc && !fired) { it.c.moods = sc; MoodsApi.got++; }
-          if (--left === 0) { MoodsApi.state = MoodsApi.got > 0; finish(); }
-        });
+          if (sc && !fired) { it.c.moods = sc; st.got++; }
+          if (--left === 0) finish();
+        }, ctx);
       })(todo[i]);
     }
   }
@@ -651,12 +755,20 @@
     };
   }
 
+  // В кеш кладём уже сжатую карточку (~1–2 КБ), а не сырой ответ с полными credits и рейтингами всех стран
+  // (десятки–сотни КБ): на ТВ это лишняя память и растущая IndexedDB
   function details(type, id, cb) {
-    var append = type === 'movie'
-      ? 'keywords,credits,release_dates,external_ids'
-      : 'keywords,credits,content_ratings,external_ids';
-    tmdb(type + '/' + id, { append_to_response: append }, 30 * DAY, function (d) {
-      cb(d && d.id ? compact(type, d) : null);
+    var ck = 'det2:' + tmdbLang() + ':' + type + ':' + id;
+    Cache.get(ck, 30 * DAY, function (hit) {
+      if (hit) return cb(hit);
+      var append = type === 'movie'
+        ? 'keywords,credits,release_dates,external_ids'
+        : 'keywords,credits,content_ratings,external_ids';
+      Net.get(tmdbUrl(type + '/' + id, { append_to_response: append }), function (d) {
+        var c = d && typeof d === 'object' && d.id ? compact(type, d) : null;
+        if (c) Cache.set(ck, c);
+        cb(c);
+      }, function () { cb(null); });
     });
   }
 
@@ -913,6 +1025,16 @@
     var t = now();
     var dirty = false;
 
+    // Момент первичного импорта истории. В этот момент все карточки получают одну дату,
+    // и это не «пачка» с экрана «Настроить вкус». Для старых установок — самая ранняя дата в seen
+    var initT = store('seen_init', 0);
+    if (!initT) {
+      var minT = 0;
+      each(seen, function (v) { if (v && (!minT || v < minT)) minT = v; });
+      initT = minT || t;
+      save('seen_init', initT);
+    }
+
     function put(card, s, from) {
       if (!card || !card.id) return;
       var type = typeOf(card);
@@ -976,7 +1098,7 @@
     var byDay = {};
     for (var bi = 0; bi < events.length; bi++) {
       var be = events[bi];
-      if (!be.flags.like) continue;
+      if (!be.flags.like || be.date === initT) continue;   // первичный импорт — не пачка
       var dk = Math.floor(be.date / DAY);
       (byDay[dk] = byDay[dk] || []).push(be);
     }
@@ -1135,17 +1257,37 @@
     }
 
     // Явные причины отказов: «не мой жанр» и «слишком старое» — только при повторе
+    // «Не мой жанр» засчитывается одному жанру фильма — самому нетипичному для пользователя
+    // (драме — только если других жанров нет: она стоит у половины фильмов). Привязка «фильм → жанр»
+    // хранится отдельно и не исчезает вместе с 90-дневными отказами — выученное не забывается
     var rej = feedback().rejected, gRej = {}, oldYears = [];
-    each(rej, function (rec) {
+    var gMap = store('genre_rej', {}), gDirty = false;
+    var baseG = profile.f.genre || {};
+    each(rej, function (rec, k) {
       if (!rec || !rec.card || !rec.r) return;
       if (rec.r === 'genre') {
-        var gs = normGenres(rec.card.genre_ids || []);
-        for (var gi = 0; gi < gs.length; gi++) gRej[gs[gi]] = (gRej[gs[gi]] || 0) + 1;
+        if (gMap[k] === undefined) {
+          var gs = normGenres(rec.card.genre_ids || []);
+          var cand = gs.length > 1 ? gs.filter(function (g) { return g !== 18; }) : gs;
+          var pick = null;
+          for (var gi = 0; gi < cand.length; gi++) {
+            var wv = typeof baseG[cand[gi]] === 'number' ? baseG[cand[gi]] : 0;
+            if (pick === null || wv < pick.w) pick = { g: cand[gi], w: wv };
+          }
+          gMap[k] = pick ? pick.g : null;
+          gDirty = true;
+        }
       } else if (rec.r === 'old') {
         var oy = parseInt(String(rec.card.release_date || rec.card.first_air_date || '').slice(0, 4), 10);
         if (!isNaN(oy)) oldYears.push(oy);
       }
     });
+    if (gDirty) {
+      var gk = Object.keys(gMap);
+      if (gk.length > 300) for (var gx = 0; gx < gk.length - 300; gx++) delete gMap[gk[gx]];
+      save('genre_rej', gMap);
+    }
+    each(gMap, function (g) { if (g !== null && g !== undefined) gRej[g] = (gRej[g] || 0) + 1; });
     profile.rejGenres = {};
     profile.f.genre = profile.f.genre || {};
     each(gRej, function (cntG, g) {
@@ -1218,6 +1360,9 @@
 
     var hasMood = false;
     if (mood) each(mood.w, function () { hasMood = true; });
+
+    // С детьми — сначала семейное и мультфильмы, потом остальное
+    if (ans.company === 'kids') { push([10751], 'kids', 1); push([16, 10751], 'kids', 1); push([12, 10751], 'kids', 1); }
 
     if (hasMood) {
       var mg = moodPlus(mood, 3);
@@ -1402,13 +1547,14 @@
     // 5. Закладки «Позже»
     for (var e = 0; e < events.length; e++) {
       var ev = events[e];
-      var intent = false;
-      for (var it = 0; it < INTENT_TYPES.length; it++) if (ev.flags[INTENT_TYPES[it]]) intent = true;
+      var intent = null;
+      for (var it = 0; it < INTENT_TYPES.length && !intent; it++) if (ev.flags[INTENT_TYPES[it]]) intent = INTENT_TYPES[it];
       if (!intent || types.indexOf(ev.type) < 0) continue;
       if (!pool[ev.k]) {
         pool[ev.k] = { k: ev.k, id: ev.id, type: ev.type, r: ev.card, seedHits: 0, seeds: [], wath: true, src: 'wath' };
         srcCount.wath = (srcCount.wath || 0) + 1;
       } else pool[ev.k].wath = true;
+      pool[ev.k].list = intent;
     }
 
     if (--pending === 0) finish();
@@ -1434,6 +1580,7 @@
       var f = events[i].flags || {};
       for (var j = 0; j < WATCHED_TYPES.length; j++) if (f[WATCHED_TYPES[j]]) ex[events[i].k] = 'watched';
       if (f.started || f.viewed) ex[events[i].k] = 'watched';
+      else if (f.look) ex[events[i].k] = 'watching';      // «Смотрю» — в процессе
       // Уже открывали в Lampa: прогресс мог не распознаться, повторно не предлагаем
       else if (!ex[events[i].k] && (f.history || f.continued)) ex[events[i].k] = 'history';
     }
@@ -1443,33 +1590,38 @@
     return ex;
   }
 
+  // Проверки до загрузки деталей — общие для пула и для подставленных частей франшиз.
+  // Пустая строка — подходит, иначе причина отсева
+  function preReason(it, ex, ans) {
+    if (ex[it.k]) return ex[it.k];
+    var r = it.r || {};
+    // Начатое (в том числе онлайн, мимо истории Lampa) не предлагаем никогда
+    if (startedAny(r, it.type)) return 'started';
+    if (!it.wath) {
+      var date = r.release_date || r.first_air_date || '';
+      if (date && date > new Date().toISOString().slice(0, 10)) return 'future';
+      var minVotes = it.type === 'tv' ? 100 : (ans.time === '40' ? 150 : 200);
+      if ((r.vote_count || 0) < minVotes) return 'votes';
+    }
+    return '';
+  }
+
   function prefilter(pool, events, ans, stats) {
     var ex = excludedKeys(events);
-    var today = new Date().toISOString().slice(0, 10);
-    var short = ans.time === '40';
     var out = [];
     stats = stats || {};
-    var bump = function (k) { stats[k] = (stats[k] || 0) + 1; };
 
     each(pool, function (it, k) {
       if (k === '__src') return;
-      if (ex[k]) return bump(ex[k]);
-      var r = it.r || {};
-      // Начатое (в том числе онлайн, мимо истории Lampa) не предлагаем никогда
-      if (startedAny(r, it.type)) return bump('started');
-      var date = r.release_date || r.first_air_date || '';
-      if (!it.wath) {
-        if (date && date > today) return bump('future');
-        var minVotes = it.type === 'tv' ? 100 : (short ? 150 : 200);
-        if ((r.vote_count || 0) < minVotes) return bump('votes');
-      }
-      out.push(it);
+      var why = preReason(it, ex, ans);
+      if (why) stats[why] = (stats[why] || 0) + 1;
+      else out.push(it);
     });
     return out;
   }
 
   // Пустая строка — подходит, иначе причина отсева
-  function postReason(it, ans, profile) {
+  function postReason(it, ans, profile, final) {
     var c = it.c;
     if (!c) return 'no_details';
 
@@ -1488,7 +1640,7 @@
 
     if (c.type === 'movie' && c.runtime && c.runtime <= 45 && (c.vc || 0) < 150) return 'votes';
 
-    if (ans.company !== 'kids' && kidsTargeted(c)) return 'kids_content';
+    if (ans.company !== 'kids' && kidsTargeted(c, profile)) return 'kids_content';
 
     // Смотрят не одни, а анимация пользователю почти не интересна — второму зрителю тем более
     if ((ans.company === 'couple' || ans.company === 'group') && isAnimated(c) && profile && profile.n >= 5 &&
@@ -1496,7 +1648,16 @@
 
     if (ans.company === 'kids') {
       if (c.moods && ((mv(c, 'fear') || 0) > 6 || (mv(c, 'violence') || 0) > 5 || (mv(c, 'profanity') || 0) > 3 || (mv(c, 'sex') || 0) > 2)) return 'kids_moods';
-      if (!kidsOk(c.cert)) return 'kids_cert';
+      // Возраст — самый строгий из TMDB (RU/US) и Кинопоиска
+      var age = ageOf(c.cert);
+      var kpKnown = typeof c.kpAge === 'number';
+      if (kpKnown && c.kpAge >= 0) age = Math.max(age === null ? 0 : age, c.kpAge);
+      if (age === null || age > KIDS_MAX_AGE) return kpKnown && c.kpAge > KIDS_MAX_AGE ? 'kids_kp_age' : 'kids_cert';
+      // Подтверждения нет (КП не ответил, российского рейтинга нет) — по одному американскому рейтингу
+      // пускаем только G/PG: PG-13 у TMDB бывает и у того, что на КП 18+
+      var ruKnown = c.cert && !isNaN(parseInt(c.cert.ru || '', 10));
+      // Решаем только на финальной проверке — до неё КП ещё не спрашивали
+      if (final && !kpKnown && !ruKnown && age > KIDS_UNCONFIRMED_MAX) return 'kids_unconfirmed';
       if (c.genres.indexOf(27) > -1 || c.genres.indexOf(10752) > -1) return 'kids_genre';
     }
 
@@ -1619,7 +1780,7 @@
       for (var i = 0; i < c.genres.length; i++) {
         var gw = mood.w[c.genres[i]];
         if (gw === undefined) continue;
-        if (gw > 0) gw *= moodTaste(profile, c.genres[i]);
+        if (gw > 0 && ans.company !== 'kids') gw *= moodTaste(profile, c.genres[i]);   // вкус взрослого детям не мерило
         if (gw > maxPos) maxPos = gw;
         if (gw < 0) neg += gw;
       }
@@ -1635,6 +1796,14 @@
     }
 
     if (ans.company !== 'kids' && isAnimated(c) && c.genres.indexOf(10751) > -1) m -= 0.4;
+    if (ans.company === 'kids') {
+      var kp = 0, kn = 0;
+      for (var kg = 0; kg < c.genres.length; kg++) {
+        if (KIDS_PLUS.indexOf(c.genres[kg]) > -1) kp = 0.3;
+        if (KIDS_MINUS.indexOf(c.genres[kg]) > -1) kn += 0.3;
+      }
+      m += kp - Math.min(kn, 0.6);
+    }
     if ((ans.mood === 'relax' || ans.mood === 'laugh') && harshAdult(c)) m -= 0.25;
     if (ans.company === 'couple' && harshAdult(c) && ans.mood !== 'nerves' && ans.mood !== 'think') m -= 0.1;
 
@@ -1671,6 +1840,7 @@
   }
 
   function pickWeights(ans, profile) {
+    if (ans.company === 'kids') return { key: 'kids', w: WEIGHTS.kids };
     if (profile.n < 5) return { key: 'cold', w: WEIGHTS.cold };
     if (ans.company === 'group') return { key: 'group', w: WEIGHTS.group };
     if (ans.mood === 'think') return { key: 'think', w: WEIGHTS.think };
@@ -1706,7 +1876,7 @@
 
   function reasonOf(it, parts, w, profile, ans) {
     var c = it.c;
-    if (it.wath) return 'Из вашего списка «Позже»';
+    if (it.wath) return INTENT_REASON[it.list] || INTENT_REASON.wath;
     if (it.src === 'franchise') return 'Первая непросмотренная часть серии';
     // Найден по любимому режиссёру или актёру — называем его
     if (it.src === 'ppl' && !(it.seedHits >= 1)) {
@@ -1812,6 +1982,7 @@
       pt.an = spread > 0.04 ? 0.5 * pt.a + 0.5 * (pt.a - minA) / spread : pt.a;
       var anim = isAnimated(x.c);
       pt.f = clamp((anim ? share : 1 - share) * 2, 0.25, 1);
+      if (ans.company === 'kids') pt.f = 1;          // смотрит ли взрослый мультфильмы — детям неважно
       // Смотрят не одни: доля анимации у пользователя ничего не говорит о вкусе второго зрителя
       if (anim && (ans.company === 'couple' || ans.company === 'group')) pt.f *= 0.6;
       // Настроение — множитель: «Позже» или высокий рейтинг не вытащат фильм, который не подходит под запрос
@@ -1820,7 +1991,7 @@
       var moodGate = w.m > 0 ? 0.15 + 0.85 * pt.m : 1;
       // Нелюбимый жанр (заметный минус в профиле) — отдельный множитель; «Позже» — явный выбор, не трогаем
       pt.d = 1;
-      if (!x.wath) {
+      if (!x.wath && ans.company !== 'kids') {
         var gs = x.c.genres || [];
         for (var dg = 0; dg < gs.length; dg++) if ((profile.f.genre || {})[gs[dg]] <= DISLIKE_AT) { pt.d = DISLIKE_MULT; break; }
       }
@@ -1901,11 +2072,25 @@
     var done = function () {
       if (--left > 0) return;
       var kept = list.filter(function (it) { return !drop[it.k]; });
+      // Подставленная часть проходит те же проверки, что и пул: не начата, не исключена, достаточно голосов
+      additions = additions.filter(function (ad) {
+        var why = preReason(ad, ex, ans);
+        if (!why) return true;
+        stats[why] = (stats[why] || 0) + 1;
+        if (ad.fallback) kept.push(ad.fallback);           // начало серии не подошло — остаётся лучшая часть
+        return false;
+      });
       if (!additions.length) return cb(kept);
       detailsMany(additions, function () {
+        var kids = ans.company === 'kids';
         for (var a = 0; a < additions.length; a++) {
-          var r = postReason(additions[a], ans, profileRef);
-          if (r) stats[r] = (stats[r] || 0) + 1;
+          // С детьми у добавленной части нет шкал CUB и возраста КП — проверяем по строгому правилу
+          var r = postReason(additions[a], ans, profileRef, kids);
+          if (r) {
+            stats[r] = (stats[r] || 0) + 1;
+            // Начало серии не подошло — оставляем лучшую часть, что прошла все проверки пула
+            if (additions[a].fallback) kept.push(additions[a].fallback);
+          }
           else kept.push(additions[a]);
         }
         cb(kept);
@@ -1930,6 +2115,9 @@
         var best = items[0];
         for (var b = 1; b < items.length; b++) if ((items[b].score || 0) > (best.score || 0)) best = items[b];
 
+        var inList = false;
+        if (next) for (var q = 0; q < items.length; q++) if (items[q].id === next.id) inList = true;
+
         for (var j = 0; j < items.length; j++) {
           var it = items[j];
           var keep = !blocked && (next ? it.id === next.id : (parts.length === 0 && it === best));
@@ -1938,13 +2126,12 @@
 
         // Нужная часть не в списке — подставляем её вместо лучшего представителя франшизы
         if (!blocked && next) {
-          var inList = false;
-          for (var q = 0; q < items.length; q++) if (items[q].id === next.id) inList = true;
           if (!inList) {
             additions.push({
               k: keyOf('movie', next.id), id: next.id, type: 'movie', r: next,
               // «Похож на …» относилось к другой части — не переносим
-              seedHits: 0, seeds: [], wath: false, src: 'franchise'
+              seedHits: 0, seeds: [], wath: false, src: 'franchise',
+              fallback: best                                  // если начало серии не пройдёт проверки
             });
           }
         }
@@ -1962,6 +2149,8 @@
   function cancelRun() { runToken++; }
 
   // h: { stage(text), done(state) }
+  var RUN_WATCHDOG = 45000;
+
   function run(ans, h) {
     h = h || {};
     var token = ++runToken;
@@ -1970,6 +2159,21 @@
     var started = now();
     var tm = {};                                     // время этапов, мс — для журнала
     var mark = function (k) { tm[k] = now() - started; };
+    var net0 = { ok: Net.oks, fail: Net.netFails };
+
+    // Сторож: подбор не может висеть бесконечно
+    var finished = false;
+    var fail = function (kind) {
+      if (finished || !alive()) return;
+      finished = true;
+      cancelRun();
+      log('run failed', kind);
+      if (h.error) h.error(kind);
+    };
+    setTimeout(function () {
+      // Запросы только падали и ни один не прошёл — это связь, а не «долго»
+      fail(Net.netFails > net0.fail && Net.oks === net0.ok ? 'net' : 'timeout');
+    }, RUN_WATCHDOG);
 
     save('last_answers', ans);
     stage('Изучаю вашу историю');
@@ -2021,7 +2225,9 @@
         };
 
         var kpBefore = 0;
+        var cubStat = { got: 0, asked: 0 };
         var afterDetails = function () {
+          if (!alive()) return;                       // отменённый подбор не тратит квоту КП и слоты CUB
           mark('details');
           scoreAll(passed, profile, ans);
           stage('Уточняю настроение и рейтинги');
@@ -2029,22 +2235,25 @@
           kpBefore = kpQuota().n;
           var pending = 2;
           var both = function () { if (--pending === 0) afterExtras(); };
-          attachCubMeta(passed, both);
+          attachCubMeta(passed, function (x) { if (x) cubStat = x; both(); });
           attachRatings(passed, both);
         };
 
         var afterExtras = function () {
             if (!alive()) return;
             mark('extras');
-            // Шкалы пришли после фильтров — для детей проверяем ещё раз
-            if (ans.company === 'kids') {
+            if (ans.company !== 'kids') return finishPick();
+            // Шкалы CUB пришли после фильтров, плюс возраст с Кинопоиска — для детей проверяем ещё раз
+            scoreAll(passed, profile, ans);
+            attachKidsAge(passed, function () {
+              if (!alive()) return;
               passed = passed.filter(function (it) {
-                var r = postReason(it, ans, profile);
+                var r = postReason(it, ans, profile, true);
                 if (r) { stats[r] = (stats[r] || 0) + 1; return false; }
                 return true;
               });
-            }
-            finishPick();
+              finishPick();
+            });
         };
 
         var finishPick = function () {
@@ -2059,12 +2268,18 @@
           log('events', events.length, 'profile.n', profile.n, 'pool', Object.keys(pool).length - 1,
             'prefiltered', list.length, 'final', finalList.length, 'ms', now() - started);
 
+          // Пусто, а запросы к TMDB в основном падали — это не «ничего не нашлось», а нет связи
+          var dOk = Net.oks - net0.ok, dFail = Net.netFails - net0.fail;
+          if (!finalList.length && dFail > 0 && dFail >= dOk) return fail('net');
+          if (finished) return;
+          finished = true;
+
           var st = {
             ans: ans, rest: finalList, shown: [], page: [],
             profile: profile, wkey: wkey, cold: profile.n < 5
           };
           st.journal = Journal.begin(ans, {
-            wkey: wkey, ms: now() - started, tm: tm, moods: MoodsApi.state, cub: [MoodsApi.got, MoodsApi.asked],
+            wkey: wkey, ms: now() - started, tm: tm, moods: cubStat.got > 0, cub: [cubStat.got, cubStat.asked],
             kp: { req: kpReq, off: kpOffline(), rated: finalList.filter(function (x) { return x.rt; }).length },
             counts: { events: events.length, profile: profile.n, pool: Object.keys(pool).length - 1, prefiltered: list.length, detailed: top.length, final: finalList.length },
             sources: pool.__src,
@@ -2111,7 +2326,8 @@
       src: it.src || null,
       coll: c.coll || null,
       anim: isAnimated(c),
-      cert: c.cert ? [c.cert.ru ? 'RU:' + c.cert.ru : '', c.cert.us ? 'US:' + c.cert.us : ''].filter(Boolean).join(' ') : null,
+      cert: (c.cert || typeof c.kpAge === 'number') ? [c.cert && c.cert.ru ? 'RU:' + c.cert.ru : '', c.cert && c.cert.us ? 'US:' + c.cert.us : '',
+        typeof c.kpAge === 'number' ? 'KP:' + (c.kpAge < 0 ? '—' : c.kpAge + '+') : ''].filter(Boolean).join(' ') : null,
       moods: c.moods || null,
       wath: !!it.wath,
       seeds: (it.seeds || []).slice(0, 3),
@@ -2429,10 +2645,19 @@
     return Math.max(0, FEEDBACK_DAILY - q.n);
   }
 
+  var FEEDBACK_TIMEOUT = 30000;
+
   function postText(url, body) {
     if (window.fetch) {
-      return fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: body, redirect: 'follow' })
-        .then(function (r) { return r.text(); });
+      // У fetch нет таймаута: при зависшей сети пользователь иначе видит «Отправляю…» без итога
+      return new Promise(function (resolve, reject) {
+        var done = false;
+        var t = setTimeout(function () { if (!done) { done = true; reject(new Error('timeout')); } }, FEEDBACK_TIMEOUT);
+        fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: body, redirect: 'follow' })
+          .then(function (r) { return r.text(); })
+          .then(function (txt) { if (!done) { done = true; clearTimeout(t); resolve(txt); } },
+            function (e) { if (!done) { done = true; clearTimeout(t); reject(e); } });
+      });
     }
     return new Promise(function (resolve, reject) {
       var x = new XMLHttpRequest();
@@ -2476,7 +2701,7 @@
   // =========================================================================
 
   var KP_API = 'https://kinopoiskapiunofficial.tech/';
-  var KP_DAILY_LIMIT = 200;         // личный ключ: предохранитель поверх лимита тарифа
+  var KP_DAILY_LIMIT = 500;         // личный ключ: суточный лимит бесплатного тарифа kinopoiskapiunofficial
   var KP_BUILTIN_DAILY_LIMIT = 40;  // встроенный ключ общий для всех — на устройство даём немного
 
   var KP_B = [91,87,2,85,72,104,63,110,118,53,22,13,0,23,59,43,41,108,35,212,142,203,158,254,247,252,190,174,151,215,192,212,176,237,178,225];
@@ -2513,11 +2738,22 @@
   // Отдельная очередь КП: не мешает TMDB, короткий таймаут, без повторов.
   // Два сетевых сбоя подряд (источник недоступен) — час только кеш.
   var KP_TIMEOUT = 4500, KP_OFF_FOR = 3600 * 1000;
-  var kpRunCap = 0;           // потолок квоты на время текущего подбора (0 — нет)
+  // Контекст подбора для КП: свой потолок квоты и флаг «закончен». Задания очереди помечены контекстом,
+  // поэтому дедлайн одного подбора не трогает задания другого, а поздние шаги закончившегося не уходят в сеть
+  function kpContext() {
+    return { cap: kpQuota().n + (kpUsingBuiltin() ? KP_RUN_BUDGET_BUILTIN : KP_RUN_BUDGET_PERSONAL), done: false };
+  }
   var kpNetFails = 0;
   var KpNet = {
     queue: [], active: 0, max: 3,
-    get: function (url, ok, fail, opts) { this.queue.push({ url: url, ok: ok, fail: fail, opts: opts }); this.pump(); },
+    get: function (url, ok, fail, opts, ctx) { this.queue.push({ url: url, ok: ok, fail: fail, opts: opts, ctx: ctx }); this.pump(); },
+    // Убрать из очереди задания одного подбора (их колбэки получают отказ)
+    dropCtx: function (ctx) {
+      var keep = [], gone = [];
+      for (var i = 0; i < this.queue.length; i++) (this.queue[i].ctx === ctx ? gone : keep).push(this.queue[i]);
+      this.queue = keep;
+      for (var j = 0; j < gone.length; j++) { try { gone[j].fail && gone[j].fail(-1); } catch (e) {} }
+    },
     pump: function () {
       var self = this;
       while (self.active < self.max && self.queue.length) {
@@ -2536,7 +2772,7 @@
             end(job.fail, status);
           };
           // Списываем квоту в момент отправки: отменённые из очереди запросы не считаются
-          if (!kpSpend()) return end(job.fail, -1);
+          if (!kpSpend(job.ctx)) return end(job.fail, -1);
           var req = new Lampa.Reguest();
           req.timeout(KP_TIMEOUT);
           req.silent(job.url, function (j) { kpNetFails = 0; end(job.ok, j); }, function (a) { onFail((a && a.status) || 0); }, false, job.opts);
@@ -2548,17 +2784,21 @@
 
   function kpOffline() { return store('kp_off', 0) > now(); }
 
+  var KP_PAUSE_429 = 60000;
+  var kpPauseUntil = 0;           // в памяти: пауза короткая, переживать перезапуск ей незачем
+  function kpPause() { kpPauseUntil = now() + KP_PAUSE_429; log('kp 429, pause', KP_PAUSE_429); }
+
   // Можно ли ещё запрашивать (без списания)
-  function kpCan() {
-    if (!kpKey() || kpOffline()) return false;
+  function kpCan(ctx) {
+    if (!kpKey() || kpOffline() || kpPauseUntil > now()) return false;
+    if (ctx && ctx.done) return false;
     var q = kpQuota();
-    return !q.blocked && q.n < kpLimit() && !(kpRunCap && q.n >= kpRunCap);
+    return !q.blocked && q.n < kpLimit() && !(ctx && q.n >= ctx.cap);
   }
 
-  function kpSpend() {
-    if (!kpKey() || kpOffline()) return false;
+  function kpSpend(ctx) {
+    if (!kpCan(ctx)) return false;
     var q = kpQuota();
-    if (q.blocked || q.n >= kpLimit() || (kpRunCap && q.n >= kpRunCap)) return false;
     q.n++;
     save('kp_quota', q);
     return true;
@@ -2577,7 +2817,9 @@
 
   function kpFail(cb) {
     return function (status) {
-      if (status === 401 || status === 402 || status === 403 || status === 429) kpBlock(status);
+      // 429 — лимит запросов в секунду, а не суточная квота: короткая пауза, а не блок до конца дня
+      if (status === 429) kpPause();
+      else if (status === 401 || status === 402 || status === 403) kpBlock(status);
       cb(null);
     };
   }
@@ -2600,7 +2842,7 @@
 
   function kpHeaders() { return { headers: { 'X-API-KEY': kpKey() } }; }
 
-  function fetchRatings(it, cb) {
+  function fetchRatings(it, cb, ctx) {
     var c = it.c;
     var cached = kpCache()[c.id];
     if (cached && (parseFloat(cached.kp) > 0 || parseFloat(cached.imdb) > 0)) {
@@ -2612,11 +2854,14 @@
     if (m && now() - m.t < 14 * DAY) return cb(m.kp || m.imdb ? { kp: m.kp, imdb: m.imdb, src: 'cache' } : null);
 
 
-    var finish = function (kp, imdb, kpId) {
+    var finish = function (kp, imdb, kpId, age) {
       kp = parseFloat(kp) || 0;
       imdb = parseFloat(imdb) || 0;
       var mp = Durable.get('kpmap', {});
+      var prev = mp[it.k];
       mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now(), va: c.va || 0 };
+      if (typeof age === 'number') mp[it.k].age = age;
+      else if (prev && typeof prev.age === 'number' && prev.id === mp[it.k].id) mp[it.k].age = prev.age;
       var keys = Object.keys(mp);
       if (keys.length > 1500) {
         keys.sort(function (a, b) { return mp[a].t - mp[b].t; });
@@ -2630,14 +2875,14 @@
     };
 
     var byId = function (kpId) {
-      if (!kpCan()) return cb(null);
+      if (!kpCan(ctx)) return cb(null);
       KpNet.get(KP_API + 'api/v2.2/films/' + kpId, function (j) {
-        finish(j && j.ratingKinopoisk, j && j.ratingImdb, kpId);
-      }, kpFail(cb), kpHeaders());
+        finish(j && j.ratingKinopoisk, j && j.ratingImdb, kpId, kpAgeOf(j));
+      }, kpFail(cb), kpHeaders(), ctx);
     };
 
     var byTitle = function () {
-      if (!c.title || !kpCan()) return cb(null);
+      if (!c.title || !kpCan(ctx)) return cb(null);
       KpNet.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(c.original || c.title), function (j) {
         var films = (j && j.films) || [];
         var y = parseInt(c.year, 10);
@@ -2646,11 +2891,11 @@
           if (!y || (!isNaN(fy) && Math.abs(fy - y) <= 1)) return byId(films[i].filmId);
         }
         finish(0, 0, null);
-      }, kpFail(cb), kpHeaders());
+      }, kpFail(cb), kpHeaders(), ctx);
     };
 
     if (c.imdb) {
-      if (!kpCan()) return cb(null);
+      if (!kpCan(ctx)) return cb(null);
       KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
         var x = j && j.items && j.items[0];
         if (x) finish(x.ratingKinopoisk, x.ratingImdb, x.kinopoiskId);
@@ -2658,8 +2903,77 @@
       }, function (status) {
         if (status === 401 || status === 402 || status === 403 || status === 429 || status <= 0) return kpFail(cb)(status);
         byTitle();
-      }, kpHeaders());
+      }, kpHeaders(), ctx);
     } else byTitle();
+  }
+
+  // Возрастное ограничение Кинопоиска: «age18» → 18; −1 — у КП ограничения нет; null — ответа нет
+  function kpAgeOf(j) {
+    if (!j || typeof j !== 'object') return null;
+    var m = String(j.ratingAgeLimits || '').match(/(\d+)/);
+    return m ? parseInt(m[1], 10) : -1;
+  }
+
+  // Возраст по КП для одного фильма: из kpmap, иначе запрос карточки КП (id берём из kpmap или ищем по imdb)
+  function kpAge(it, cb, ctx) {
+    var mp = Durable.get('kpmap', {});
+    var m = mp[it.k];
+    if (m && typeof m.age === 'number') return cb(m.age);
+    var save = function (id, age) {
+      var mm = Durable.get('kpmap', {});
+      var rec = mm[it.k] || { kp: 0, imdb: 0, t: now(), va: (it.c && it.c.va) || 0 };
+      rec.id = id; rec.age = age;
+      mm[it.k] = rec;
+      Durable.set('kpmap', mm);
+      cb(age);
+    };
+    var byId = function (id) {
+      if (!kpCan(ctx)) return cb(null);
+      KpNet.get(KP_API + 'api/v2.2/films/' + id, function (j) {
+        var age = kpAgeOf(j);
+        if (age === null) return cb(null);
+        save(id, age);
+      }, function () { cb(null); }, kpHeaders(), ctx);
+    };
+    if (m && m.id) return byId(m.id);
+    var c = it.c || {};
+    if (!c.imdb || !kpCan(ctx)) return cb(null);          // поиск по названию ради возраста не тратим
+    KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
+      var x = j && j.items && j.items[0];
+      if (x && x.kinopoiskId) byId(x.kinopoiskId);
+      else cb(null);
+    }, function () { cb(null); }, kpHeaders(), ctx);
+  }
+
+  // «С детьми»: возраст КП для лучших кандидатов. У TMDB часто есть только американский рейтинг,
+  // а КП знает российское ограничение (пример: «10 причин моей ненависти» — PG-13 в TMDB, 18+ на КП)
+  var KIDS_AGE_N = 20, KIDS_AGE_DEADLINE = 5000;
+
+  function attachKidsAge(list, cb) {
+    var fired = false;
+    // Тот же бюджет на подбор, что и у оценок: встроенный ключ общий
+    var ctx = kpContext();
+    var finish = function () { if (!fired) { fired = true; ctx.done = true; KpNet.dropCtx(ctx); cb(); } };
+    var todo = list.filter(function (it) { return it.c && it.c.type === 'movie' && it.c.kpAge === undefined; })
+      .sort(function (a, b) { return b.score - a.score; }).slice(0, KIDS_AGE_N);
+    if (!todo.length || !kpCan(ctx)) return finish();
+    setTimeout(finish, KIDS_AGE_DEADLINE);
+    var idx = 0, running = 0;
+    var next = function () {
+      if (fired) return;
+      if (idx >= todo.length && !running) return finish();
+      while (running < 3 && idx < todo.length) {
+        (function (it) {
+          running++;
+          kpAge(it, function (age) {
+            if (typeof age === 'number') it.c.kpAge = age;
+            running--;
+            next();
+          }, ctx);
+        })(todo[idx++]);
+      }
+    };
+    next();
   }
 
   // Оценки для финалистов перед окончательным порядком: кеш, затем запросы. Подбор ждёт не дольше дедлайна.
@@ -2669,26 +2983,24 @@
 
   function attachRatings(list, cb) {
     var fired = false;
+    var ctx = kpContext();
     var finish = function () {
       if (fired) return;
       fired = true;
-      kpRunCap = 0;
-      KpNet.queue = [];          // не дождались — не тратим квоту на хвост
+      ctx.done = true;
+      KpNet.dropCtx(ctx);        // не дождались — не тратим квоту на хвост; чужие задания не трогаем
       cb();
     };
     var todo = list.slice().sort(function (a, b) { return b.score - a.score; })
       .slice(0, KP_FINALISTS).filter(function (it) { return it.c && !it.rt && !it.kpTried; });
-    if (!todo.length || !kpCan()) return finish();
-    var q0 = kpQuota().n;
-    var budget = kpUsingBuiltin() ? KP_RUN_BUDGET_BUILTIN : KP_RUN_BUDGET_PERSONAL;
-    kpRunCap = q0 + budget;
+    if (!todo.length || !kpCan(ctx)) return finish();
     setTimeout(finish, KP_DEADLINE);
     // По очереди от лучшего к худшему, по 3 фильма одновременно: бюджет уходит на верх списка целиком
     var idx = 0, running = 0;
     var next = function () {
       if (fired) return;
-      if ((idx >= todo.length || !kpCan()) && !running) return finish();
-      while (running < 3 && idx < todo.length && kpCan()) {
+      if ((idx >= todo.length || !kpCan(ctx)) && !running) return finish();
+      while (running < 3 && idx < todo.length && kpCan(ctx)) {
         (function (it) {
           running++;
           it.kpTried = true;
@@ -2700,7 +3012,7 @@
             }
             running--;
             next();
-          });
+          }, ctx);
         })(todo[idx++]);
       }
     };
@@ -3455,8 +3767,26 @@
           state.page = nextPage(state, 5);
           current = state.page[0];
           renderResults(0);
-        }
+        },
+        error: function (kind) { renderError(kind); }
       });
+    }
+
+    // Подбор не удался: нет связи с TMDB или что-то зависло
+    function renderError(kind) {
+      view = 'error';
+      var net = kind === 'net';
+      var wrap = $('<div class="pkr-empty">' + svg('search') +
+        '<div class="pkr-empty__title">' + (net ? 'Нет связи с TMDB' : 'Не получилось подобрать') + '</div>' +
+        '<div class="pkr-empty__text">' + (net
+          ? 'Подборщик берёт фильмы из TMDB, а он сейчас не отвечает. Проверьте интернет и прокси TMDB в настройках Lampa.'
+          : 'Подбор занял слишком много времени — скорее всего, медленно отвечает сеть. Попробуйте ещё раз.') + '</div></div>');
+      var actions = $('<div class="pkr-actions"></div>');
+      actions.append(button('refresh', 'Повторить', 'pkr-btn--primary', function () { startRun(); }));
+      actions.append(button('sliders', 'Изменить ответы', '', function () { renderWizard(0); }));
+      wrap.append(actions);
+      setBody(wrap);
+      refresh(actions.find('.selector').eq(0));
     }
 
     // ---- результаты
@@ -3637,6 +3967,14 @@
       content.append(actions);
 
       if (state.cold) content.append('<div class="pkr-note">Истории просмотров пока мало — подбор в основном по рейтингу и настроению</div>');
+      // Встроенный ключ КП общий и маленький — когда он на сегодня кончился, подсказываем про личный (раз в день)
+      try {
+        var kq = kpQuota();
+        if (kpUsingBuiltin() && (kq.blocked || kq.n >= kpLimit()) && store('kp_hint_day', 0) !== todaySeed()) {
+          save('kp_hint_day', todaySeed());
+          content.append('<div class="pkr-note">Рейтинги Кинопоиска на сегодня закончились. Свой бесплатный ключ снимает ограничение: Настройки → ' + esc(TITLE) + ' → Ключ Кинопоиска</div>');
+        }
+      } catch (e) {}
 
       var row = $('<div class="pkr-row"></div>');
       cardEls = [];
@@ -3841,7 +4179,10 @@
     }
 
     // Комментарий через клавиатуру Lampa. Пустой ввод — отправка без комментария, «Назад» — отмена.
+    var feedbackSending = false;
+
     function askFeedback() {
+      if (feedbackSending) return noty('Журнал уже отправляется');
       if (!feedbackLeft()) return noty('На сегодня лимит отправок исчерпан');
       var restore = function () {
         if (view === 'journal') {
@@ -3850,10 +4191,14 @@
       };
       var go = function (comment) {
         setTimeout(restore, 0);
+        if (feedbackSending) return;
+        feedbackSending = true;
         noty('Отправляю…');
         sendFeedback(comment).then(function () {
+          feedbackSending = false;
           noty('Отправлено, спасибо!');
         }, function (e) {
+          feedbackSending = false;
           log('feedback error', e);
           noty('Не получилось отправить — попробуйте позже');
         });
@@ -3916,7 +4261,7 @@
 
     this.back = function () {
       if (view === 'journal') return leaveJournal();
-      if (view === 'taste') return renderWizard(0);
+      if (view === 'taste' || view === 'error') return renderWizard(0);
       if (view === 'wizard' && step > 0) return renderWizard(step - 1);
       if (view === 'loading') { cancelRun(); return renderWizard(STEPS.length - 1); }
       Lampa.Activity.backward();
@@ -3959,7 +4304,7 @@
   function openPicker(answers) {
     Lampa.Activity.push({
       url: '',
-      title: 'Что посмотреть',
+      title: TITLE,
       component: 'lampa_picker',
       answers: answers || null,
       page: 1
@@ -3979,7 +4324,7 @@
       if ($('.menu [data-action="picker"]').length) return;
       var item = $('<li class="menu__item selector" data-action="picker">' +
         '<div class="menu__ico">' + ICON + '</div>' +
-        '<div class="menu__text">Что посмотреть</div></li>');
+        '<div class="menu__text">' + TITLE + '</div></li>');
       item.on('hover:enter', function () { openPicker(); });
       $('.menu .menu__list').eq(0).append(item);
     } catch (e) { log('menu error', e); }
@@ -3988,7 +4333,7 @@
   function addSettings() {
     try {
       if (!Lampa.SettingsApi || !Lampa.SettingsApi.addComponent) return;
-      Lampa.SettingsApi.addComponent({ component: 'lampa_picker', name: 'Что посмотреть', icon: ICON });
+      Lampa.SettingsApi.addComponent({ component: 'lampa_picker', name: TITLE, icon: ICON });
       Lampa.SettingsApi.addParam({
         component: 'lampa_picker',
         param: { name: NS + 'about', type: 'static' },
@@ -4020,6 +4365,7 @@
       if (!Cache.db) return;                                // без IndexedDB прогрев бесполезен — кеш не переживёт перезапуск
       if (store('warmup_day', 0) === todaySeed()) return;   // не чаще раза в сутки
       save('warmup_day', todaySeed());
+      Cache.sweep();
       var events = collect();
       enrichEvents(events, function () {
         var profile = buildProfile(events);
@@ -4081,7 +4427,8 @@
     journalPacked: function () { return Journal.exportPacked(); },
     journalFit: function () { return Journal.exportFit(); },
     setKpKey: function (k) { save('kp_key', String(k || '')); var q = kpQuota(); q.blocked = false; save('kp_quota', q); return kpPersonal() ? 'личный ключ сохранён' : 'личный ключ удалён, используется встроенный'; },
-    reset: function () { save('feedback', {}); save('seen', {}); save('last_answers', null); return 'reset'; }
+    // Даты первого знакомства (seen) не трогаем: это служебные данные, без них вся история снова «свежая»
+    reset: function () { save('feedback', {}); save('last_answers', null); return 'reset'; }
   };
 
   function init() {
