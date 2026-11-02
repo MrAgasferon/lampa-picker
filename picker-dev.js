@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.11.0-dev';
+  var VERSION = '0.11.1-dev';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -360,6 +360,8 @@
     loaded: {},
     waiting: {},
     timers: {},
+    loading: {},    // чтение из IndexedDB в полёте
+    touched: {},    // во время чтения записали: 'merge' — дописать к прочитанному, 'replace' — прочитанное не нужно
 
     // Однократный перенос старых данных из localStorage
     takeLegacy: function (key) {
@@ -376,20 +378,27 @@
       if (self.loaded[key]) { if (cb) cb(self.vals[key]); return; }
       (self.waiting[key] = self.waiting[key] || []).push(cb);
       if (self.waiting[key].length > 1) return;
+      self.loading[key] = true;
 
       Cache.get('durable:' + key, Infinity, function (v) {
         var legacy = self.takeLegacy(key);
         if ((v === null || v === undefined) && legacy !== null) v = legacy;
+        var touched = self.touched[key], local = self.vals[key];
+        self.loading[key] = false;
+        self.touched[key] = null;
         // Пока грузились, могли что-то записать — не теряем
-        if (self.loaded[key] && Object.prototype.toString.call(self.vals[key]) === '[object Array]' &&
-          Object.prototype.toString.call(v) === '[object Array]') {
-          v = v.concat(self.vals[key]);
-        } else if (self.loaded[key] && self.vals[key] && typeof self.vals[key] === 'object' && v && typeof v === 'object') {
-          v = extend(v, self.vals[key]);
+        if (touched === 'replace') {
+          v = local;                                   // «Очистить» и т. п.: прочитанное устарело
+        } else if (touched) {
+          var isArr = function (x) { return Object.prototype.toString.call(x) === '[object Array]'; };
+          if (v === null || v === undefined) v = local;
+          else if (isArr(v) && isArr(local)) v = v.concat(local);
+          else if (v && typeof v === 'object' && local && typeof local === 'object') v = extend(v, local);
+          else v = local;
         }
         self.vals[key] = (v === null || v === undefined) ? def : v;
         self.loaded[key] = true;
-        if (legacy !== null) self.flush(key);
+        if (legacy !== null || touched) self.flush(key);
         var w = self.waiting[key] || [];
         self.waiting[key] = [];
         for (var i = 0; i < w.length; i++) if (w[i]) w[i](self.vals[key]);
@@ -401,16 +410,19 @@
       return v === undefined || v === null ? def : v;
     },
 
-    set: function (key, val) {
+    // replace = true: значение заменяет всё (очистка), а не дополняет то, что ещё читается с диска
+    set: function (key, val, replace) {
       var self = this;
       self.vals[key] = val;
-      if (!self.loaded[key]) self.loaded[key] = true;
+      if (self.loading[key]) self.touched[key] = replace ? 'replace' : (self.touched[key] || 'merge');
+      else if (!self.loaded[key]) self.loaded[key] = true;
       if (self.timers[key]) return;
       self.timers[key] = setTimeout(function () { self.flush(key); }, 2000);
     },
 
     flush: function (key) {
       if (this.timers[key]) { clearTimeout(this.timers[key]); this.timers[key] = null; }
+      if (this.loading[key] && this.touched[key] !== 'replace') return;  // запишем после чтения, уже слитое
       Cache.set('durable:' + key, this.vals[key]);
     },
 
@@ -562,7 +574,7 @@
 
   // Шкалы содержания из CUB: тот же источник, что показывает сама Lampa в карточке фильма
   // (блок «Метаданные» и теги настроения). Есть только для фильмов.
-  var MoodsApi = { state: null, asked: 0, got: 0 };
+  var MoodsApi = { state: null, asked: 0, got: 0, statuses: {} };   // statuses — какие ответы CUB встречались (для отладки)
   var CUB_META_N = 20;              // запрашиваем только для финалистов
   var CUB_META_DEADLINE = 5000;     // подбор не ждёт CUB дольше
   var CUB_EMPTY_TTL = 7 * DAY;      // «данных нет» перепроверяем раз в неделю
@@ -626,8 +638,11 @@
       if (hit && (hit.s || now() - (hit.at || 0) < CUB_EMPTY_TTL)) return cb(hit.s || null, true);
       CubNet.get(cubMetaUrl(id), function (j) {
         if (j && typeof j === 'object' && j.status) {
+          MoodsApi.statuses[j.status] = (MoodsApi.statuses[j.status] || 0) + 1;
           var sc = parseCubMeta(j);
-          Cache.set(ck, { s: sc, at: now() });
+          // Кешируем только понятные ответы. Прочие статусы (например, «ещё считается») — спросим в следующий раз
+          if (j.status === 'completed' || j.status === 'empty') Cache.set(ck, { s: sc, at: now() });
+          else log('CUB: статус', j.status, 'для', id);
           cb(sc, false);
         } else cb(null, false);
       }, function () { cb(null, false); }, ctx);
@@ -680,9 +695,14 @@
       a = mv(c, 'action'), t = mv(c, 'tension'), r = mv(c, 'romance'), pr = mv(c, 'profanity');
     var z = function (x) { return x === null ? 0 : x; };
     var m = null;
+    // Без главных для настроения шкал оценка по шкалам ненадёжна (нет шкалы ≠ ноль) — пусть решают жанры
+    if (ans.mood === 'relax' && (f === null || v === null)) return null;
+    if (ans.mood === 'laugh' && h === null) return null;
+    if (ans.mood === 'nerves' && f === null && t === null && v === null) return null;
+    if (ans.mood === 'think' && (a === null || h === null)) return null;
 
     if (ans.mood === 'relax') m = 1 - 0.09 * z(f) - 0.07 * z(v) - 0.05 * z(t) - 0.04 * z(sd) + 0.04 * z(h) + 0.03 * z(r);
-    else if (ans.mood === 'laugh') m = (h === null ? 0.5 : h / 10 * 1.2) - 0.04 * z(f) - 0.03 * z(sd);
+    else if (ans.mood === 'laugh') m = h / 10 * 1.2 - 0.04 * z(f) - 0.03 * z(sd);
     // Напряжение есть не у всех фильмов, а страх у триллеров без хоррора низкий: берём максимум из страха,
     // напряжения и насилия плюс половину темпа
     else if (ans.mood === 'nerves') m = clamp((Math.max(z(f), z(t), z(v)) + 0.5 * z(mv(c, 'pace'))) / 8, 0, 1) * 0.85 + z(a) / 10 * 0.25;
@@ -870,6 +890,7 @@
 
   // ---- «Настроить вкус»: известные фильмы и сериалы для быстрой отметки «Нравится»
   var TASTE_PAGE = 24;
+  var TASTE_MAX_PAGES = 5;   // страниц каждого источника (top_rated / popular) — дальше уже нишевое
 
   function tasteSources(page) {
     return [
@@ -964,11 +985,11 @@
       try { h = Lampa.Utils.hash(names[i]); } catch (e) { continue; }
       try {
         var v = Lampa.Timeline.view(h);
-        if (v && v.duration > 0) return v;
+        if (v && v.duration > 0) return v;   // updated — если сборка его пишет
       } catch (e) {}
       var raw = fv[h];
       if (raw && raw.duration > 0) {
-        return { time: raw.time || 0, duration: raw.duration, percent: raw.percent || Math.round((raw.time || 0) / raw.duration * 100) };
+        return { time: raw.time || 0, duration: raw.duration, percent: raw.percent || Math.round((raw.time || 0) / raw.duration * 100), updated: raw.updated || 0 };
       }
     }
     return null;
@@ -1011,6 +1032,10 @@
   function finished(v) {
     return v.percent >= 85 || (v.duration - v.time) <= 600;
   }
+
+  var STARTED_FRESH = 14 * DAY;  // начатое на 1–20 % свежее этого — ещё не «брошено»
+  var SEEN_STALE_MAX = 200;      // столько «лишних» дат в picker_seen терпим без чистки
+  var SEEN_MIN_LISTED = 20;      // ...и чистим, только если списки Lampa явно загрузились
 
   var CLASSIC_RATING = 8.0;     // такие старые фильмы не опускают границу по годам
   var LIKE_BATCH_WEIGHT = 0.6;  // вес отметки из пачки вместо 1,0
@@ -1059,7 +1084,13 @@
             flags[fk] = flags[fk] || {};
             if (finished(p)) { s = 0.8; flags[fk].viewed = true; }
             else if (p.percent > 20) { s = 0.3; flags[fk].started = true; }
-            else if (p.percent > 0) s = -0.5;
+            else if (p.percent > 0) {
+              // Чуть начато: «брошено» только если давно. Дата — из таймлайна, иначе — дата знакомства
+              // (кроме первичного импорта: там дата ничего не говорит о времени просмотра)
+              var pt = p.updated > 0 ? p.updated : (seen[fk] || t);
+              var fresh = (p.updated > 0 || pt !== initT) && t - pt < STARTED_FRESH;
+              s = fresh ? 0 : -0.5;
+            }
           }
         }
         put(card, s, ft);
@@ -1082,6 +1113,15 @@
       put(rec.card, typeof rs === 'number' ? rs : -0.2, 'rejected');
     });
     each(fb.seen, function (rec) { if (rec && rec.card) put(rec.card, 0, 'seen'); });
+
+    // Даты карточек, которых больше нет ни в списках Lampa, ни в обратной связи, не нужны.
+    // Чистим, только когда лишнего много и списки явно загружены (иначе потеряем даты из-за пустой синхронизации)
+    var stale = [], mapN = Object.keys(map).length;
+    each(seen, function (v, k) { if (!map[k]) stale.push(k); });
+    if (stale.length > SEEN_STALE_MAX && mapN >= SEEN_MIN_LISTED) {
+      for (var si = 0; si < stale.length; si++) delete seen[stale[si]];
+      dirty = true;
+    }
 
     if (dirty) save('seen', seen);
 
@@ -1169,11 +1209,12 @@
     var acc = {}, cnt = {}, names = {};
     each(AFFINITY_COEF, function (v, t) { acc[t] = {}; cnt[t] = {}; });
 
-    var n = 0;
+    var n = 0, pos = 0;
     for (var i = 0; i < events.length; i++) {
       var e = events[i];
       if (!e.s || !e.c) continue;
       n++;
+      if (e.s > 0) pos++;
       var w = e.s * decay(e.date);
       var f = featuresOf(e.c);
       each(f, function (vals, t) {
@@ -1186,7 +1227,8 @@
       each(e.c.names || {}, function (nm, pid) { names[pid] = nm; });
     }
 
-    var profile = { n: n, f: {}, names: names };
+    // pos — положительные события: по ним решаем, «знаем ли мы вкус» (одни отказы вкус не описывают)
+    var profile = { n: n, pos: pos, f: {}, names: names };
     for (var lb = 0; lb < events.length; lb++) if (events[lb].batch) profile.likeBatch = (profile.likeBatch || 0) + 1;
 
     each(acc, function (vals, t) {
@@ -1425,9 +1467,12 @@
         if (types.indexOf(t) < 0) continue;
         var k = keyOf(t, r.id);
         if (!pool[k]) {
-          pool[k] = { k: k, id: r.id, type: t, r: r, seedHits: 0, seeds: [], wath: false, src: src };
+          pool[k] = { k: k, id: r.id, type: t, r: r, seedHits: 0, seeds: [], wath: false, src: src, srcs: {} };
           srcCount[src] = (srcCount[src] || 0) + 1;
         }
+        // Все источники, где встретился фильм; основной — по приоритету, а не по тому, кто ответил первым
+        pool[k].srcs[src] = true;
+        if (srcRank(src) < srcRank(pool[k].src)) pool[k].src = src;
         if (seed) { pool[k].seedHits++; pool[k].seeds.push(seed); }
       }
     }
@@ -1643,7 +1688,7 @@
     if (ans.company !== 'kids' && kidsTargeted(c, profile)) return 'kids_content';
 
     // Смотрят не одни, а анимация пользователю почти не интересна — второму зрителю тем более
-    if ((ans.company === 'couple' || ans.company === 'group') && isAnimated(c) && profile && profile.n >= 5 &&
+    if ((ans.company === 'couple' || ans.company === 'group') && isAnimated(c) && profile && profile.pos >= 5 &&
       typeof profile.animShare === 'number' && profile.animShare < 0.2) return 'anim_format';
 
     if (ans.company === 'kids') {
@@ -1685,7 +1730,8 @@
 
   // Оценки из кеша: rating.js (kp_rating) и свой kpmap. Без сети.
   function cachedRatings(c, k) {
-    var rec = kpCache()[c.id];
+    // Кеш rating.js хранит по id TMDB без типа: у фильма и сериала id могут совпасть — для сериалов не берём
+    var rec = c.type === 'tv' ? null : kpCache()[c.id];
     if (rec && (parseFloat(rec.kp) > 0 || parseFloat(rec.imdb) > 0)) return { kp: parseFloat(rec.kp) || 0, imdb: parseFloat(rec.imdb) || 0 };
     var m = Durable.get('kpmap', {})[k];
     if (m && now() - m.t < 14 * DAY && (m.kp || m.imdb)) return { kp: m.kp || 0, imdb: m.imdb || 0 };
@@ -1700,10 +1746,12 @@
       if (kp > 0) { acc.kp[0] += kp - va; acc.kp[1]++; }
       if (im > 0) { acc.imdb[0] += im - va; acc.imdb[1]++; }
     };
-    each(Durable.get('kpmap', {}), function (m) { if (m) add(m.va, m.kp, m.imdb); });
+    var mp = Durable.get('kpmap', {});
+    each(mp, function (m) { if (m) add(m.va, m.kp, m.imdb); });
+    // Кандидаты из кеша — только те, что ещё не учтены через kpmap (кеш rating.js), иначе одно наблюдение считается дважды
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
-      if (it.rt && it.c && it.rt.src === 'cache') add(it.c.va, it.rt.kp, it.rt.imdb);
+      if (it.rt && it.c && it.rt.src === 'cache' && !mp[it.k]) add(it.c.va, it.rt.kp, it.rt.imdb);
     }
     var off = {};
     each(acc, function (a, k) { off[k] = (a[0] + RATE_DEF_OFF[k] * RATE_OFF_PRIOR) / (a[1] + RATE_OFF_PRIOR); });
@@ -1762,7 +1810,7 @@
   var MOOD_TASTE_LOW = 0, MOOD_TASTE_HIGH = 0.2, MOOD_TASTE_MIN = 0.5;
   function moodTaste(profile, g) {
     var pg = profile && profile.f && profile.f.genre;
-    if (!pg || !(profile.n >= 10) || typeof pg[g] !== 'number') return 1;
+    if (!pg || !(profile.pos >= 10) || typeof pg[g] !== 'number') return 1;
     var v = pg[g];
     if (v >= MOOD_TASTE_HIGH) return 1;
     if (v <= MOOD_TASTE_LOW) return MOOD_TASTE_MIN;
@@ -1841,7 +1889,7 @@
 
   function pickWeights(ans, profile) {
     if (ans.company === 'kids') return { key: 'kids', w: WEIGHTS.kids };
-    if (profile.n < 5) return { key: 'cold', w: WEIGHTS.cold };
+    if (!(profile.pos >= 5)) return { key: 'cold', w: WEIGHTS.cold };
     if (ans.company === 'group') return { key: 'group', w: WEIGHTS.group };
     if (ans.mood === 'think') return { key: 'think', w: WEIGHTS.think };
     if (ans.mood === 'surprise') return { key: 'surprise', w: WEIGHTS.surprise };
@@ -1874,12 +1922,17 @@
     return what + ' — ' + MOOD_REASON[ans.mood] + (COMPANY_REASON[ans.company] || '');
   }
 
+  // Приоритет источников для причины и журнала: чем конкретнее объяснение, тем выше
+  var SRC_PRIORITY = ['wath', 'franchise', 'rec', 'ppl', 'kw', 'disc', 'explore'];
+  function srcRank(src) { var i = SRC_PRIORITY.indexOf(src); return i < 0 ? SRC_PRIORITY.length : i; }
+  function hasSrc(it, src) { return it.src === src || !!(it.srcs && it.srcs[src]); }
+
   function reasonOf(it, parts, w, profile, ans) {
     var c = it.c;
     if (it.wath) return INTENT_REASON[it.list] || INTENT_REASON.wath;
     if (it.src === 'franchise') return 'Первая непросмотренная часть серии';
     // Найден по любимому режиссёру или актёру — называем его
-    if (it.src === 'ppl' && !(it.seedHits >= 1)) {
+    if (hasSrc(it, 'ppl') && !(it.seedHits >= 1)) {
       var pd = (c.dir || []).filter(function (id) { return (profile.f.director || {})[id] > 0; });
       if (pd.length) { var pdn = profile.names['p' + pd[0]] || c.names['p' + pd[0]]; if (pdn) return (c.type === 'tv' ? 'Автор ' : 'Режиссёр ') + pdn; }
       var pc = (c.cast || []).filter(function (id) { return (profile.f.cast || {})[id] > 0; });
@@ -1890,7 +1943,7 @@
       return 'Похож на «' + it.seeds[0] + '»';
     }
     // Найден по ключевым словам любимых фильмов (если сильнее нет режиссёра или актёра)
-    if (it.src === 'kw' && !(parts.best && (parts.best.type === 'director' || parts.best.type === 'cast'))) return 'Темы, как в ваших любимых фильмах';
+    if (hasSrc(it, 'kw') && !(parts.best && (parts.best.type === 'director' || parts.best.type === 'cast'))) return 'Темы, как в ваших любимых фильмах';
     // КП заметно поднял фильм
     if (parts.rb >= 0.15 && it.kp >= 7.5) return 'Высоко на Кинопоиске: ' + it.kp.toFixed(1).replace('.', ',');
 
@@ -2276,7 +2329,7 @@
 
           var st = {
             ans: ans, rest: finalList, shown: [], page: [],
-            profile: profile, wkey: wkey, cold: profile.n < 5
+            profile: profile, wkey: wkey, cold: !(profile.pos >= 5)
           };
           st.journal = Journal.begin(ans, {
             wkey: wkey, ms: now() - started, tm: tm, moods: cubStat.got > 0, cub: [cubStat.got, cubStat.asked],
@@ -2348,6 +2401,7 @@
   function profileSummary(profile) {
     return {
       events: profile.n,
+      positive: profile.pos,
       animShare: round3(profile.animShare),
       yearFloor: profile.yearFloor,
       yearFloorBy: profile.yearFloorBy || null,
@@ -2424,7 +2478,7 @@
       this.saveEntry(entry);
     },
 
-    clear: function () { Durable.set('journal', []); Durable.flush('journal'); },
+    clear: function () { Durable.set('journal', [], true); Durable.flush('journal'); },
 
     // Последний подбор в компактном виде — помещается в одно сообщение мессенджера
     exportLast: function () {
@@ -2577,7 +2631,7 @@
         sessions: a.length,
         ua: (navigator.userAgent || '').slice(0, 120),
         kpQuotaToday: kpQuota().n,
-        cubMeta: { off: cubMetaOff(), got: MoodsApi.got, asked: MoodsApi.asked }
+        cubMeta: { off: cubMetaOff(), got: MoodsApi.got, asked: MoodsApi.asked, statuses: MoodsApi.statuses }
       };
       var lines = [JSON.stringify(head)];
       for (var i = 0; i < a.length; i++) lines.push(JSON.stringify(a[i]));
@@ -2844,7 +2898,7 @@
 
   function fetchRatings(it, cb, ctx) {
     var c = it.c;
-    var cached = kpCache()[c.id];
+    var cached = c.type === 'tv' ? null : kpCache()[c.id];   // см. cachedRatings: ключ без типа
     if (cached && (parseFloat(cached.kp) > 0 || parseFloat(cached.imdb) > 0)) {
       return cb({ kp: parseFloat(cached.kp) || 0, imdb: parseFloat(cached.imdb) || 0, src: 'cache' });
     }
@@ -2869,7 +2923,7 @@
       }
       Durable.set('kpmap', mp);
       if (kp || imdb) {
-        writeKpCache(c.id, { kp: kp, imdb: imdb, timestamp: now() });
+        if (c.type !== 'tv') writeKpCache(c.id, { kp: kp, imdb: imdb, timestamp: now() });
         cb({ kp: kp, imdb: imdb, src: 'net' });
       } else cb(null);
     };
@@ -2886,10 +2940,23 @@
       KpNet.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(c.original || c.title), function (j) {
         var films = (j && j.films) || [];
         var y = parseInt(c.year, 10);
-        for (var i = 0; i < films.length; i++) {
-          var fy = parseInt(films[i].year, 10);
-          if (!y || (!isNaN(fy) && Math.abs(fy - y) <= 1)) return byId(films[i].filmId);
-        }
+        // Тип должен совпасть (фильм ≠ сериал), год — сначала точный, потом ±1
+        var typeOk = function (f) {
+          var ft = String(f.type || '');
+          if (!ft) return true;
+          var isTv = /SERIES|TV_SHOW/.test(ft);
+          return c.type === 'tv' ? isTv : !isTv;
+        };
+        var pick = function (tol) {
+          for (var i = 0; i < films.length; i++) {
+            if (!typeOk(films[i])) continue;
+            var fy = parseInt(films[i].year, 10);
+            if (!y || (!isNaN(fy) && Math.abs(fy - y) <= tol)) return films[i];
+          }
+          return null;
+        };
+        var hit = pick(0) || pick(1);
+        if (hit) return byId(hit.filmId);
         finish(0, 0, null);
       }, kpFail(cb), kpHeaders(), ctx);
     };
@@ -3654,7 +3721,7 @@
     function renderTaste() {
       view = 'taste';
       save('taste_offered', true);
-      var seen = {}, page = 1, picked = 0, items = [];
+      var seen = {}, nextP = 1, picked = 0, items = [];
       var wrap = $('<div class="pkr-taste"></div>');
       wrap.append('<div class="pkr-step">Что посмотреть</div>');
       wrap.append('<div class="pkr-q">Что вам понравилось?</div>');
@@ -3679,7 +3746,8 @@
       var count2 = $('<span class="pkr-taste__count"></span>');
       var foot2 = $('<div class="pkr-actions pkr-actions--footer"></div>');
       foot2.append(button('check', 'Готово', 'pkr-btn--primary', function () { finishTaste(); }));
-      foot2.append(button('refresh', 'Ещё фильмы', '', function () { load(); }));
+      var moreBtn2 = button('refresh', 'Ещё фильмы', '', function () { load(); });
+      foot2.append(moreBtn2);
       foot2.append(count2);
       wrap.append(foot2);
 
@@ -3708,24 +3776,41 @@
         return el;
       };
 
-      var loading = false;
+      // Страницы источников идут по порядку: 1, 2, 3… Следующую подгружаем заранее, пока человек отмечает
+      var loading = false, prefetching = false, wantShow = false;
+      var fetchMore = function (cb) {
+        if (nextP > TASTE_MAX_PAGES) return cb(false);
+        var p = nextP++;
+        tasteBatch(p, seen, function (list) { items = items.concat(list); cb(true); });
+      };
+      var exhausted = function () { return nextP > TASTE_MAX_PAGES && !prefetching && !items.length; };
+      var show = function () {
+        var chunk = items.splice(0, TASTE_PAGE);
+        var first = null;
+        for (var i = 0; i < chunk.length; i++) { var e = tcard(chunk[i]); if (!first) first = e; grid.append(e); }
+        loading = false;
+        if (items.length < TASTE_PAGE && nextP <= TASTE_MAX_PAGES && !prefetching) {
+          prefetching = true;
+          fetchMore(function () { prefetching = false; if (wantShow) { wantShow = false; load(); } });
+        }
+        if (!first && !grid.children().length) {
+          grid.append('<div class="pkr-j__row">Не удалось загрузить список — проверьте связь с TMDB</div>');
+        } else if (exhausted()) {
+          // Всё показано — кнопку «Ещё фильмы» убираем, чтобы не жать впустую
+          moreBtn.remove(); moreBtn2.remove();
+          if (!first) noty('Больше нет — это все популярные фильмы и сериалы');
+        }
+        try { Lampa.Controller.collectionSet(focusable()); } catch (e2) {}
+        if (first) refresh(first);
+        else if (!grid.children('.pkr-tcard').length || exhausted()) refresh(foot.find('.selector').eq(0));
+      };
       var load = function () {
         if (loading) return;
+        if (items.length >= TASTE_PAGE || (nextP > TASTE_MAX_PAGES && !prefetching)) { loading = true; return show(); }
+        if (prefetching) { wantShow = true; return; }   // следующая страница уже в пути
         loading = true;
-        var add = function (list) {
-          items = items.concat(list);
-          var chunk = items.splice(0, TASTE_PAGE);
-          var first = null;
-          for (var i = 0; i < chunk.length; i++) { var e = tcard(chunk[i]); if (!first) first = e; grid.append(e); }
-          try { Lampa.Controller.collectionSet(focusable()); } catch (e2) {}
-          loading = false;
-          // Мало осталось — следующая страница источников
-          if (items.length < TASTE_PAGE && page < 5) { page++; tasteBatch(page, seen, function (more) { items = items.concat(more); }); }
-          if (first) refresh(first);
-          else if (!grid.children().length) grid.append('<div class="pkr-j__row">Не удалось загрузить список — проверьте связь с TMDB</div>');
-        };
-        if (items.length >= TASTE_PAGE) return add([]);
-        tasteBatch(page, seen, function (list) { page++; add(list); });
+        var step = function () { fetchMore(function (ok) { if (ok && items.length < TASTE_PAGE) return step(); show(); }); };
+        step();
       };
 
       setBody(wrap);

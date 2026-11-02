@@ -428,6 +428,59 @@ const CHECKS = [
     const s = env.storage.picker_seen;
     return { ok: !!(s && s['movie:1']), got: JSON.stringify(s) };
   } },
+  { id: 'F15b', title: 'Начатое на 10 % месяц назад — всё ещё «брошено» (−0,5)', fn: async () => {
+    const env = makeEnv({ fav: { history: [card(55)] } });
+    const t = env.clock.now;
+    env.storage.picker_seen_init = t - 60 * 86400000;
+    env.storage.picker_seen = { 'movie:55': t - 30 * 86400000 };
+    env.timeline[hash('Film 55')] = { percent: 10, time: 600, duration: 6000 };
+    const ev = env.pk.collect();
+    return { ok: ev[0].s === -0.5, got: 'сигнал ' + ev[0].s };
+  } },
+  { id: 'F17c', title: 'Durable: запись в журнал во время загрузки дописывается к прочитанному', fn: async () => {
+    const env = makeEnv({ idb: 'fake', idbDelay: 50, idbData: { 'durable:journal': { t: 1, v: [{ id: 'old1' }] } } });
+    await env.cb(cb => env.pk.Cache.init(cb));
+    env.pk.Durable.load('journal', []);
+    env.pk.Durable.set('journal', [{ id: 'new1' }]);
+    await env.clock.advance(3000);
+    const v = env.pk.Durable.get('journal', []);
+    return { ok: v.length === 2 && v[0].id === 'old1' && v[1].id === 'new1', got: JSON.stringify(v) };
+  } },
+  { id: 'F19b', title: '«Настроить вкус»: страницы кончились — «Ещё фильмы» пропадает', fn: async () => {
+    const env = await tasteEnv();
+    const btn = () => env.$('.pkr-btn').filter(function () { return env.$(this).text().indexOf('Ещё фильмы') > -1; }).length;
+    let clicks = 0;
+    while (btn() && clicks < 40) { await env.more(); clicks++; }
+    const p = env.pages();
+    return { ok: !btn() && Math.max.apply(null, p) === 5, got: 'нажатий ' + clicks + ', кнопок ' + btn() + ', страницы ' + p.join(',') };
+  } },
+  { id: 'F21b', title: 'CUB: без шкал страха и насилия «Расслабиться» решают жанры, а не нули', fn: async () => {
+    const { pk } = makeEnv();
+    const m = pk.moodFromScales({ moods: { humor: 7 } }, { mood: 'relax', company: 'solo' });
+    return { ok: m === null, got: 'оценка по шкалам ' + m };
+  } },
+  { id: 'F23b', title: 'picker_seen: даты пропавших из списков карточек вычищаются', fn: async () => {
+    const likes = []; for (let i = 0; i < 30; i++) likes.push(card(100 + i));
+    const seen = {}; for (let i = 0; i < 300; i++) seen['movie:' + (5000 + i)] = 1700000000000;
+    const env = makeEnv({ fav: { like: likes }, storage: { picker_seen: seen, picker_seen_init: 1700000000000 } });
+    env.pk.collect();
+    const n = Object.keys(env.storage.picker_seen).length;
+    return { ok: n === 30, got: 'дат в picker_seen: ' + n };
+  } },
+  { id: 'F23c', title: 'picker_seen: пустые списки (не загрузились) даты не стирают', fn: async () => {
+    const seen = {}; for (let i = 0; i < 300; i++) seen['movie:' + (5000 + i)] = 1700000000000;
+    const env = makeEnv({ storage: { picker_seen: seen, picker_seen_init: 1700000000000 } });
+    env.pk.collect();
+    const n = Object.keys(env.storage.picker_seen).length;
+    return { ok: n === 300, got: 'дат в picker_seen: ' + n };
+  } },
+  { id: 'F26', title: 'Причина не зависит от того, какой источник ответил первым', fn: async () => {
+    const { pk } = makeEnv();
+    const it = { k: 'movie:1', c: { type: 'movie', dir: [], cast: [5], names: { p5: 'Энн Хэтэуэй' } }, src: 'disc', srcs: { disc: true, ppl: true }, seedHits: 0, seeds: [] };
+    const profile = { f: { cast: { 5: 1 }, director: {}, genre: {} }, names: {} };
+    const r = pk.reasonOf(it, { best: null, rb: 0, s: 0, a: 0.5, q: 0.5, n: 0 }, { q: 0.3, a: 0.35, m: 0.2, n: 0.05, s: 0.1 }, profile, { mood: 'any', company: 'solo' });
+    return { ok: r === 'С Энн Хэтэуэй', got: r };
+  } },
   { id: 'F24', title: 'Кеш kp_rating (ключ без типа) не применяется к сериалам', fn: async () => {
     const env = makeEnv({ storage: { kp_rating: { 5: { kp: 8.1, imdb: 7.9 } } } });
     const r = env.pk.cachedRatings({ id: 5, type: 'tv' }, 'tv:5');
