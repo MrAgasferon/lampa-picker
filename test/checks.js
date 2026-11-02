@@ -497,6 +497,52 @@ const CHECKS = [
     const kp = res && res[0] && res[0].kp;
     return { ok: kp === 7.7, got: 'КП ' + kp + (kp === 5.5 ? ' (взят сериал)' : '') };
   } },
+  // ------------------------------------------------------------------ модель выдачи (P2, блок 2)
+  { id: 'M25', title: 'Разброс оценки привязан к фильму, а не к месту в списке', fn: async () => {
+    const { pk } = makeEnv();
+    const mk = (k, score) => ({ k, score });
+    const a = [mk('movie:1', 0.9), mk('movie:2', 0.8), mk('movie:3', 0.7)];
+    const b = [mk('movie:9', 0.95), mk('movie:3', 0.85), mk('movie:1', 0.5)];
+    pk.jitter(a); pk.jitter(b);
+    const ja = a.find(x => x.k === 'movie:3').jmul, jb = b.find(x => x.k === 'movie:3').jmul;
+    return { ok: ja === jb && ja >= 0.92 && ja <= 1.08, got: 'movie:3: ' + ja + ' и ' + jb };
+  } },
+  { id: 'M27a', title: 'Показанное сегодня при новом подборе идёт с ×0,85', fn: async () => {
+    const env = makeEnv(baseWorld());
+    const r1 = await env.run(ANY);
+    const comp = r1.st;
+    const page1 = env.pk.nextPage({ rest: comp.rest.slice(), shown: [] }, 5).map(x => x.k);
+    env.storage.picker_shown_day = { d: env.pk.todaySeed(), k: Object.fromEntries(page1.map(k => [k, 1])) };
+    const r2 = await env.run(ANY);
+    const pen = r2.st.rest.filter(x => page1.indexOf(x.k) > -1).map(x => x.rp);
+    const other = r2.st.rest.filter(x => page1.indexOf(x.k) < 0).every(x => x.rp === 1);
+    return { ok: pen.length > 0 && pen.every(v => v === 0.85) && other, got: 'штрафов ' + pen.join(',') + ', остальные без штрафа: ' + other };
+  } },
+  { id: 'M27b', title: 'Вчерашние показы не штрафуются', fn: async () => {
+    const env = makeEnv(baseWorld());
+    env.storage.picker_shown_day = { d: 19990101, k: { 'movie:300': 1, 'movie:302': 1 } };
+    const r = await env.run(ANY);
+    const bad = r.st.rest.filter(x => x.rp !== 1).length;
+    return { ok: bad === 0, got: 'со штрафом ' + bad };
+  } },
+  { id: 'M28', title: 'Нелюбимый жанр: штраф плавный (−0,3 → ×1, −0,59 → ×0,87…0,9, −0,9 → ×0,6)', fn: async () => {
+    const { pk } = makeEnv();
+    const d = g => pk.dislikeMult([27], { f: { genre: { 27: g } } });
+    const raw = [d(-0.3), d(-0.59), d(-0.61), d(-0.9), d(-1)], v = raw.map(r2);
+    const ok = v[0] === 1 && raw[1] > 0.85 && raw[1] < 0.9 && Math.abs(raw[1] - raw[2]) < 0.03 && v[3] === 0.6 && v[4] === 0.6;
+    return { ok, got: v.join(' · ') };
+  } },
+  { id: 'M29', title: 'Теневая формула пишет свою пятёрку в журнал, выдача не меняется', fn: async () => {
+    const env = makeEnv(baseWorld());
+    const r = await env.run({ time: 'any', mood: 'any', company: 'solo' });
+    const sh = r.st.journal && r.st.journal.shadow;
+    const page = env.pk.nextPage({ rest: r.st.rest.slice(), shown: [] }, 5).map(x => x.k);
+    const env2 = makeEnv(baseWorld());
+    const r2 = await env2.run({ time: 'any', mood: 'any', company: 'solo' });
+    const page2 = env2.pk.nextPage({ rest: r2.st.rest.slice(), shown: [] }, 5).map(x => x.k);
+    const ok = !!(sh && sh.top.length === 5 && sh.same >= 0 && sh.same <= 5) && page.join() === page2.join();
+    return { ok, got: sh ? 'тень: ' + sh.top.map(x => x.k).join(',') + ', совпало ' + sh.same : 'тени нет' };
+  } },
   { id: 'F27', title: 'poster_path с кавычками не ломает разметку', fn: async () => {
     const env = await tasteEnv('/x.jpg\')" onmouseover="alert(1)" data-x="');
     const n = env.$('[onmouseover]').length;

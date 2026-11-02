@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.11.1-dev';
+  var VERSION = '0.11.2-dev';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -1984,7 +1984,18 @@
     return '';
   }
 
-  var DISLIKE_AT = -0.6, DISLIKE_MULT = 0.6;
+  // Нелюбимый жанр: штраф плавно от DISLIKE_FROM (×1) до DISLIKE_FULL (×DISLIKE_MULT), без ступеньки
+  var DISLIKE_FROM = -0.45, DISLIKE_FULL = -0.9, DISLIKE_MULT = 0.6;
+
+  function dislikeMult(genres, profile) {
+    var gw = (profile.f && profile.f.genre) || {}, worst = 0;
+    for (var i = 0; i < (genres || []).length; i++) {
+      var v = gw[genres[i]];
+      if (typeof v === 'number' && v < worst) worst = v;
+    }
+    var t = clamp((DISLIKE_FROM - worst) / (DISLIKE_FROM - DISLIKE_FULL), 0, 1);
+    return 1 - (1 - DISLIKE_MULT) * t;
+  }
 
   function scoreAll(items, profile, ans) {
     var pw = pickWeights(ans, profile);
@@ -2043,11 +2054,7 @@
       var base = (w.q * pt.q + w.a * pt.an + w.n * pt.n + w.s * pt.s) / (rest > 0 ? rest : 1);
       var moodGate = w.m > 0 ? 0.15 + 0.85 * pt.m : 1;
       // Нелюбимый жанр (заметный минус в профиле) — отдельный множитель; «Позже» — явный выбор, не трогаем
-      pt.d = 1;
-      if (!x.wath && ans.company !== 'kids') {
-        var gs = x.c.genres || [];
-        for (var dg = 0; dg < gs.length; dg++) if ((profile.f.genre || {})[gs[dg]] <= DISLIKE_AT) { pt.d = DISLIKE_MULT; break; }
-      }
+      pt.d = !x.wath && ans.company !== 'kids' ? dislikeMult(x.c.genres, profile) : 1;
       pt.y = x.wath ? 1 : yearFactor(x.c, profile, ans); // «Позже» — явный выбор, годы не штрафуем
       x.score = base * moodGate * (0.3 + 0.7 * pt.f) * pt.y * pt.d;
       x.reason = reasonOf(x, pt, w, profile, ans);
@@ -2072,13 +2079,73 @@
     return union ? inter / union : 0;
   }
 
-  function jitter(items) {
-    items.sort(function (a, b) { return b.score - a.score; });
-    var rand = rng(todaySeed());
-    for (var i = 0; i < Math.min(15, items.length); i++) {
-      items[i].jscore = items[i].score * (0.92 + 0.16 * rand());
+  // Числовой отпечаток строки — сид разброса для конкретного фильма
+  function strSeed(str) {
+    var h = 2166136261;
+    str = String(str || '');
+    for (var i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul ? Math.imul(h, 16777619) : (h * 16777619) >>> 0;
     }
-    for (var j = 15; j < items.length; j++) items[j].jscore = items[j].score;
+    return h >>> 0;
+  }
+
+  // Показанное сегодня. Новый день — новый список
+  var REPEAT_MULT = 0.85;   // показанное сегодня без действий при новом подборе — чуть ниже
+  function shownToday() {
+    var sd = store('shown_day', null);
+    return sd && sd.d === todaySeed() && sd.k ? sd.k : {};
+  }
+  function markShownToday(items) {
+    var map = shownToday(), n = 0;
+    for (var i = 0; i < items.length; i++) if (items[i] && items[i].k && !map[items[i].k]) { map[items[i].k] = 1; n++; }
+    if (n) save('shown_day', { d: todaySeed(), k: map });
+  }
+
+  // Разброс ×0,92…1,08 привязан к фильму и дню: в течение дня у фильма тот же множитель, где бы он ни стоял.
+  // Показанное сегодня (без «Открыть», «Не то», «Уже видел» — те и так скрыты) — ×REPEAT_MULT
+  function jitter(items) {
+    var day = todaySeed(), seenToday = shownToday();
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      it.jmul = 0.92 + 0.16 * rng(day ^ strSeed(it.k))();
+      it.rp = seenToday[it.k] ? REPEAT_MULT : 1;
+      it.jscore = it.score * it.jmul * it.rp;
+    }
+    items.sort(function (a, b) { return b.jscore - a.jscore; });
+  }
+
+  // ---- Теневая формула (п. 29): только в журнал, выдача не меняется.
+  // Вкус весомее (a +0,10 за счёт q), совпадение растягивается по процентилям, а не от минимума до максимума
+  var SHADOW_SHIFT = 0.10;
+  function shadowPick(items, ans, wkey) {
+    if (wkey === 'cold' || wkey === 'kids' || items.length < 6) return null;
+    var w = WEIGHTS[wkey];
+    if (!w || w.q < SHADOW_SHIFT) return null;
+    var w2 = extend({}, w);
+    w2.a = w.a + SHADOW_SHIFT; w2.q = w.q - SHADOW_SHIFT;
+    var order = items.slice().sort(function (a, b) { return a.parts.a - b.parts.a; });
+    var pct = {};
+    for (var r = 0; r < order.length; r++) pct[order[r].k] = order.length > 1 ? r / (order.length - 1) : 0.5;
+    var rest = 1 - w2.m;
+    var copies = items.map(function (x) {
+      var pt = x.parts;
+      var an2 = 0.5 * pt.a + 0.5 * pct[x.k];
+      var base = (w2.q * pt.q + w2.a * an2 + w2.n * pt.n + w2.s * pt.s) / (rest > 0 ? rest : 1);
+      var gate = w2.m > 0 ? 0.15 + 0.85 * pt.m : 1;
+      var sc = base * gate * (0.3 + 0.7 * pt.f) * pt.y * pt.d;
+      return extend(extend({}, x), { score: sc, jscore: sc * (x.jmul || 1) * (x.rp || 1) });
+    });
+    copies.sort(function (a, b) { return b.jscore - a.jscore; });
+    var shadowTop = nextPage({ rest: copies, shown: [] }, 5);
+    var mainTop = nextPage({ rest: items.slice(), shown: [] }, 5);
+    var mainKeys = mainTop.map(function (x) { return x.k; });
+    var same = 0;
+    for (var i = 0; i < shadowTop.length; i++) if (mainKeys.indexOf(shadowTop[i].k) > -1) same++;
+    return {
+      same: same,
+      top: shadowTop.map(function (x) { return { k: x.k, title: x.c.title, score: round3(x.score), an: round3(0.5 * x.parts.a + 0.5 * pct[x.k]) }; })
+    };
   }
 
   function nextPage(state, n) {
@@ -2316,6 +2383,8 @@
           var top = list.slice(0, offset);
           var wkey = scoreAll(finalList, profile, ans);
           jitter(finalList);
+          var shadow = null;
+          try { shadow = shadowPick(finalList, ans, wkey); } catch (eS) { log('shadow error', eS); }
           var kpReq = Math.max(0, kpQuota().n - kpBefore);
 
           log('events', events.length, 'profile.n', profile.n, 'pool', Object.keys(pool).length - 1,
@@ -2338,7 +2407,9 @@
             sources: pool.__src,
             dropped: stats,
             profile: profileSummary(profile),
-            top: finalList.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).map(journalItem)
+            top: finalList.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).map(journalItem),
+            shadow: shadow,
+            repeats: finalList.filter(function (x) { return x.rp < 1; }).length
           });
           if (h.done) h.done(st);
           });
@@ -2374,6 +2445,7 @@
       imdb: it.imdbR || null,
       rsrc: it.rt ? it.rt.src : null,
       rc: round3(p.rc), rb: round3(p.rb), d: p.d === 1 || p.d === undefined ? undefined : round3(p.d),
+      rp: it.rp && it.rp < 1 ? it.rp : undefined,
       score: round3(it.score),
       q: round3(p.q), a: round3(p.a), an: round3(p.an), m: round3(p.m), n: round3(p.n), s: round3(p.s), f: round3(p.f), y: round3(p.y),
       src: it.src || null,
@@ -2492,6 +2564,8 @@
         if (it.anim) f += 'A';
         if (it.wath) f += 'W';
         if (it.coll) f += 'C';
+        if (it.rp) f += 'R';
+        if (it.d) f += 'D' + Math.round(it.d * 100);
         return f;
       };
       var c = e.counts || {};
@@ -2521,6 +2595,7 @@
             it.tmdb, it.votes, it.kp ? r2(it.kp) : 0, it.imdb ? r2(it.imdb) : 0,
             it.cert || '', it.page + '/' + it.pos, short(it.reason, 34)];
         }),
+        shd: e.shadow ? [e.shadow.same, e.shadow.top.map(function (x) { return short(x.title, 22); })] : undefined,
         act: (e.actions || []).map(function (x) {
           var row = [x.sec, x.act];
           if (x.title) row.push(short(x.title, 22));
@@ -2566,13 +2641,15 @@
         // название, год, тип+источник, флаги, score, q, an, m, n, s, f, y (×100), tmdb/kp/imdb (×10), голоса, cert, стр/поз[, причина]
         sh: (e.shown || []).map(function (it) {
           var row = [short(it.title, 24), it.year, (it.k || '').charAt(0) + String(it.src || '').charAt(0),
-            (it.anim ? 'A' : '') + (it.wath ? 'W' : '') + (it.coll ? 'C' : ''),
+            (it.anim ? 'A' : '') + (it.wath ? 'W' : '') + (it.coll ? 'C' : '') + (it.rp ? 'R' : '') + (it.d ? 'D' + Math.round(it.d * 100) : ''),
             i100(it.score), i100(it.q), i100(it.an), i100(it.m), i100(it.n), i100(it.s), i100(it.f), i100(it.y),
             i100((it.tmdb || 0) / 10), i100((it.kp || 0) / 10), i100((it.imdb || 0) / 10), it.votes || 0,
             it.cert || '', it.page + '/' + it.pos];
           if (withReasons) row.push(short(it.reason, 30));
           return row;
         }),
+        // тень: сколько из её пятёрки совпало с показанной первой страницей, и сама пятёрка
+        shd: e.shadow ? [e.shadow.same, e.shadow.top.map(function (x) { return short(x.title, 16); })] : undefined,
         act: (e.actions || []).map(function (x) {
           var row = [x.sec, x.act];
           if (x.title) row.push(short(x.title, 18));
@@ -4080,6 +4157,7 @@
 
       if (!state.logged) {
         Journal.shown(state.journal, state.page, state.pageNo || 1);
+        markShownToday(state.page);
         state.logged = true;
       }
       loadRatings();
@@ -4158,7 +4236,7 @@
       setTimeout(function () {
         replaceInPage(state, it);
         var fresh = state.page[idx];
-        if (fresh && fresh !== it) Journal.shown(state.journal, [fresh], (state.pageNo || 1) + '-repl');
+        if (fresh && fresh !== it) { Journal.shown(state.journal, [fresh], (state.pageNo || 1) + '-repl'); markShownToday([fresh]); }
         current = state.page[Math.min(idx, state.page.length - 1)];
         renderResults(idx);
       }, 220);
