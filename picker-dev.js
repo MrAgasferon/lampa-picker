@@ -494,6 +494,7 @@
   var US_AGE = { 'G': 0, 'TV-Y': 0, 'TV-G': 0, 'TV-Y7': 7, 'TV-Y7-FV': 7, 'PG': 8, 'TV-PG': 10,
     'PG-13': 12, 'TV-14': 14, 'R': 17, 'TV-MA': 17, 'NC-17': 18 };
   var KIDS_MAX_AGE = 12;
+  var KIDS_UNCONFIRMED_MAX = 8;    // без российского рейтинга и без КП — только до PG
 
   // Возраст по самому строгому из известных рейтингов; null — рейтинга нет
   function ageOf(cert) {
@@ -1566,7 +1567,7 @@
   }
 
   // Пустая строка — подходит, иначе причина отсева
-  function postReason(it, ans, profile) {
+  function postReason(it, ans, profile, final) {
     var c = it.c;
     if (!c) return 'no_details';
 
@@ -1595,8 +1596,14 @@
       if (c.moods && ((mv(c, 'fear') || 0) > 6 || (mv(c, 'violence') || 0) > 5 || (mv(c, 'profanity') || 0) > 3 || (mv(c, 'sex') || 0) > 2)) return 'kids_moods';
       // Возраст — самый строгий из TMDB (RU/US) и Кинопоиска
       var age = ageOf(c.cert);
-      if (typeof c.kpAge === 'number' && c.kpAge >= 0) age = Math.max(age === null ? 0 : age, c.kpAge);
-      if (age === null || age > KIDS_MAX_AGE) return typeof c.kpAge === 'number' && c.kpAge > KIDS_MAX_AGE ? 'kids_kp_age' : 'kids_cert';
+      var kpKnown = typeof c.kpAge === 'number';
+      if (kpKnown && c.kpAge >= 0) age = Math.max(age === null ? 0 : age, c.kpAge);
+      if (age === null || age > KIDS_MAX_AGE) return kpKnown && c.kpAge > KIDS_MAX_AGE ? 'kids_kp_age' : 'kids_cert';
+      // Подтверждения нет (КП не ответил, российского рейтинга нет) — по одному американскому рейтингу
+      // пускаем только G/PG: PG-13 у TMDB бывает и у того, что на КП 18+
+      var ruKnown = c.cert && !isNaN(parseInt(c.cert.ru || '', 10));
+      // Решаем только на финальной проверке — до неё КП ещё не спрашивали
+      if (final && !kpKnown && !ruKnown && age > KIDS_UNCONFIRMED_MAX) return 'kids_unconfirmed';
       if (c.genres.indexOf(27) > -1 || c.genres.indexOf(10752) > -1) return 'kids_genre';
     }
 
@@ -2172,7 +2179,7 @@
             attachKidsAge(passed, function () {
               if (!alive()) return;
               passed = passed.filter(function (it) {
-                var r = postReason(it, ans, profile);
+                var r = postReason(it, ans, profile, true);
                 if (r) { stats[r] = (stats[r] || 0) + 1; return false; }
                 return true;
               });
