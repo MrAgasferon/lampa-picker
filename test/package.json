@@ -1,0 +1,14 @@
+{
+  "name": "lampa-picker-test",
+  "private": true,
+  "description": "Стенд для проверки picker.js: jsdom + мок Lampa + виртуальное время",
+  "scripts": {
+    "test": "node run.js",
+    "test:strict": "node run.js --strict"
+  },
+  "devDependencies": {
+    "acorn": "^8.12.0",
+    "jquery": "^3.7.1",
+    "jsdom": "^24.1.0"
+  }
+}

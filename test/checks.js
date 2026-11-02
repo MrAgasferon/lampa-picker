@@ -1,0 +1,472 @@
+// Проверки. Каждая утверждает, как ДОЛЖНО быть, и возвращает { ok, got }.
+// S* — базовое поведение (сейчас проходит, защищает от регрессий).
+// F* — находки аудита (ID как в AUDIT_lampa-picker_0.10.3.md); пока не исправлены — падают
+//      и перечислены в known-failures.json.
+'use strict';
+const fs = require('fs');
+const { makeEnv, movie, card, hash, RAW } = require('./env');
+
+const ANY = { time: 'any', mood: 'any', company: 'solo' };
+const ids = list => list.map(it => it.id);
+const r2 = x => Math.round(x * 100) / 100;
+
+// Обычный мир: 8 «Нравится», 3 в истории, 40 фильмов в discover, 20 в рекомендациях
+function baseWorld(extra) {
+  const likes = []; for (let i = 0; i < 8; i++) likes.push(card(100 + i));
+  const hist = []; for (let i = 0; i < 3; i++) hist.push(card(150 + i));
+  const world = { movies: {}, discover: [], recs: [], collections: {} };
+  for (let i = 0; i < 40; i++) world.discover.push(300 + i);
+  for (let i = 0; i < 20; i++) world.recs.push(340 + i);
+  [100, 101, 150].forEach(id => world.discover.push(id));           // уже виденное попадёт в пул
+  // уже виденное и отклонённое — с высоким рейтингом, чтобы без фильтров оно точно дошло до финала
+  [100, 101, 150, 300, 301].forEach(id => { world.movies[id] = movie(id, { vote_average: 9.0, vote_count: 20000 }); });
+  return Object.assign({ fav: { like: likes, history: hist }, world }, extra || {});
+}
+
+// Возрастной рейтинг для синтетики
+const cert = (us, ru) => {
+  const out = [];
+  if (us) out.push({ iso_3166_1: 'US', release_dates: [{ certification: us }] });
+  if (ru) out.push({ iso_3166_1: 'RU', release_dates: [{ certification: ru }] });
+  return out;
+};
+const certObj = (pk, us, ru) => pk.certOf('movie', { release_dates: { results: cert(us, ru) } });
+const certTv = (pk, us, ru) => {
+  const r = [];
+  if (us) r.push({ iso_3166_1: 'US', rating: us });
+  if (ru) r.push({ iso_3166_1: 'RU', rating: ru });
+  return pk.certOf('tv', { content_ratings: { results: r } });
+};
+const item = (c) => ({ c: Object.assign({ type: 'movie', runtime: 100, vc: 5000, va: 7, genres: [18], kw: [], cast: [], dir: [], names: {}, moods: null }, c) });
+const why = (pk, it, ans, profile) => pk.postReason(it, Object.assign({}, ANY, ans), profile || { n: 10, animShare: 0.2, f: {} }, true) || 'проходит';
+
+// Мир с франшизой: часть 1 начата (не в истории), часть с 40 голосами, «Смотрю»
+function franchiseEnv() {
+  const likes = []; for (let i = 0; i < 6; i++) likes.push(card(100 + i));
+  const world = { movies: {}, discover: [201, 202, 203], recs: [], collections: { 900: [201, 202, 203], 950: [777, 778] } };
+  [201, 202, 203].forEach((id, i) => { world.movies[id] = movie(id, { coll: 900, release_date: (2001 + 2 * i) + '-01-01', vote_average: 8.2 }); });
+  world.movies[777] = movie(777, { vote_count: 40, coll: 950, release_date: '1999-01-01' });
+  world.movies[778] = movie(778, { coll: 950, release_date: '2004-01-01', vote_average: 8.2 });
+  world.discover.push(778);
+  for (let i = 0; i < 20; i++) { world.discover.push(301 + i); world.recs.push(331 + i); }
+  const env = makeEnv({ fav: { like: likes, look: [card(401, { title: 'Watching now', original_title: 'Watching now', vote_average: 8.2 })] }, world });
+  env.timeline[hash('Film 201')] = { percent: 30, time: 1800, duration: 6000 };
+  return env;
+}
+
+// Экран «Настроить вкус» (открывается сам, когда истории нет)
+async function tasteEnv(posterPath) {
+  const router = function (url) {
+    const m = url.match(/3\/(movie|tv)\/(top_rated|popular)\?page=(\d+)/);
+    if (m) {
+      const base = ({ 'movie/top_rated': 1, 'tv/top_rated': 2, 'movie/popular': 3, 'tv/popular': 4 })[m[1] + '/' + m[2]] * 100000 + (+m[3]) * 1000;
+      return { body: { results: Array.from({ length: 20 }, (_, i) => ({ id: base + i, title: 'T' + (base + i), name: 'T' + (base + i),
+        poster_path: posterPath || '/x.jpg', vote_count: 3000, release_date: '2010-01-01' })) } };
+    }
+    return { body: { results: [] } };
+  };
+  const env = makeEnv({ router });
+  const comp = new env.pk.PickerComponent({});
+  env.w.document.body.appendChild(comp.create()[0]);
+  await env.clock.advance(200);
+  env.pages = () => Array.from(new Set(env.log.urls.map(u => +(u.match(/page=(\d+)/) || [])[1]).filter(Boolean))).sort((a, b) => a - b);
+  env.more = async () => {
+    env.$('.pkr-btn').filter(function () { return env.$(this).text().indexOf('Ещё фильмы') > -1; }).eq(0).trigger('hover:enter');
+    await env.clock.advance(200);
+  };
+  return env;
+}
+
+const CHECKS = [
+  // ------------------------------------------------------------------ базовое поведение
+  { id: 'S1', title: 'Синтаксис — чистый ES5 (acorn)', fn: async () => {
+    try { require('acorn').parse(RAW, { ecmaVersion: 5 }); return { ok: true, got: 'ES5' }; }
+    catch (e) { return { ok: false, got: e.message }; }
+  } },
+  { id: 'S2', title: 'Полный подбор: есть финалисты, первая страница из 5, без «Нравится» и истории', fn: async () => {
+    const env = makeEnv(baseWorld());
+    const r = await env.run(ANY);
+    if (!r.st) return { ok: false, got: r.timedOut ? 'подбор не завершился' : 'ошибка: ' + r.error };
+    const fin = ids(r.st.rest);
+    const page = env.pk.nextPage(r.st, 5);
+    const leaked = fin.filter(id => [100, 101, 150].indexOf(id) > -1);
+    return { ok: fin.length >= 5 && page.length === 5 && !leaked.length, got: 'финал ' + fin.length + ', страница ' + page.length + ', виденное в финале: ' + (leaked.join(',') || 'нет') };
+  } },
+  { id: 'S3', title: '«Не то» и «Уже видел» не возвращаются в выдачу', fn: async () => {
+    const env = makeEnv(baseWorld());
+    const t = env.clock.now;
+    env.storage.picker_feedback = { rejected: { 'movie:300': { t, r: 'meh', card: { id: 300, genre_ids: [28], method: 'movie' } } },
+      seen: { 'movie:301': { t, card: { id: 301, method: 'movie' } } }, opened: {} };
+    const r = await env.run(ANY);
+    const fin = ids(r.st ? r.st.rest : []);
+    return { ok: !!r.st && fin.indexOf(300) < 0 && fin.indexOf(301) < 0, got: '300 в финале: ' + (fin.indexOf(300) > -1) + ', 301: ' + (fin.indexOf(301) > -1) };
+  } },
+  { id: 'S4', title: '«С детьми»: нет ужасов и 18+', fn: async () => {
+    const o = baseWorld();
+    for (let i = 0; i < 6; i++) { o.world.discover.push(360 + i); o.world.movies[360 + i] = movie(360 + i, { genre_ids: [27, 28, 878], vote_average: 9.0, vote_count: 20000, cert: cert('R', '18+') }); }
+    // 18+ без «ужасов» и во вкусе пользователя (дойдут до деталей): отсечь должен именно возрастной фильтр
+    for (let i = 0; i < 6; i++) { o.world.discover.push(370 + i); o.world.movies[370 + i] = movie(370 + i, { genre_ids: [28, 878], vote_average: 9.0, vote_count: 20000, cert: cert('R', '18+') }); }
+    const env = makeEnv(o);
+    const r = await env.run({ time: 'any', mood: 'any', company: 'kids' });
+    const fin = r.st ? r.st.rest : [];
+    const bad = fin.filter(it => it.c.genres.indexOf(27) > -1 || env.pk.adultRated(it.c));
+    const d = (r.st && r.st.journal && r.st.journal.dropped) || {};
+    const cut = (d.kids_cert || 0) + (d.kids_genre || 0);
+    return { ok: !!r.st && fin.length > 0 && !bad.length && cut > 0, got: 'финал ' + fin.length + ', неподходящих: ' + bad.length + ', отсеяно по возрасту/жанру: ' + cut };
+  } },
+  { id: 'S5', title: '«До 1,5 часа»: только фильмы не длиннее 100 мин', fn: async () => {
+    const o = baseWorld();
+    for (let i = 0; i < 6; i++) o.world.movies[320 + i] = movie(320 + i, { runtime: 150, vote_average: 9.0, vote_count: 20000 });
+    const env = makeEnv(o);
+    const r = await env.run({ time: '90', mood: 'any', company: 'solo' });
+    const bad = (r.st ? r.st.rest : []).filter(it => it.c.type !== 'movie' || !(it.c.runtime <= 100));
+    const cut = ((r.st && r.st.journal && r.st.journal.dropped) || {}).too_long || 0;
+    return { ok: !!r.st && r.st.rest.length > 0 && !bad.length && cut > 0, got: 'финал ' + (r.st ? r.st.rest.length : 0) + ', не по времени: ' + bad.length + ', отсеяно too_long: ' + cut };
+  } },
+  { id: 'S6', title: 'Одна франшиза — одна карточка', fn: async () => {
+    const o = baseWorld();
+    o.world.collections[950] = [380, 381, 382];
+    [380, 381, 382].forEach((id, i) => { o.world.movies[id] = movie(id, { coll: 950, release_date: (2001 + i) + '-01-01', vote_average: 8.6 }); o.world.discover.push(id); });
+    const env = makeEnv(o);
+    const r = await env.run(ANY);
+    const n = (r.st ? r.st.rest : []).filter(it => it.c.coll === 950).length;
+    return { ok: !!r.st && n <= 1, got: 'карточек из коллекции: ' + n };
+  } },
+  { id: 'S7', title: 'Журнал: сессия записана, «Последний подбор» — JSON до 3900 символов', fn: async () => {
+    const env = makeEnv(baseWorld());
+    await env.run(ANY);
+    const J = env.pk.Journal;
+    if (!J) return { ok: false, got: 'Journal не найден' };
+    const txt = J.exportLast();
+    let parsed = false; try { JSON.parse(txt); parsed = true; } catch (e) {}
+    return { ok: J.list().length >= 1 && parsed && txt.length <= 3900, got: 'сессий ' + J.list().length + ', длина ' + txt.length + ', JSON ' + parsed };
+  } },
+  { id: 'S8', title: 'Холодный старт без истории: подбор работает, флаг cold', fn: async () => {
+    const o = baseWorld(); o.fav = {};
+    const env = makeEnv(o);
+    const r = await env.run(ANY);
+    return { ok: !!r.st && r.st.cold === true && r.st.rest.length > 0, got: r.st ? 'cold ' + r.st.cold + ', финал ' + r.st.rest.length : 'нет результата' };
+  } },
+
+  // ------------------------------------------------------------------ находки аудита
+  { id: 'F1', title: 'Первый запуск: старые «Нравится» не считаются «пачкой»', fn: async () => {
+    const likes = []; for (let i = 0; i < 12; i++) likes.push(card(100 + i));
+    const hist = []; for (let i = 0; i < 40; i++) hist.push(card(500 + i, { genre_ids: [18] }));
+    const env = makeEnv({ fav: { like: likes, history: hist } });
+    const { events } = await env.profile();
+    const l = events.filter(e => e.flags.like);
+    const batch = l.filter(e => e.batch).length;
+    return { ok: batch === 0 && l.every(e => e.s === 1), got: 'пачкой помечено ' + batch + ' из ' + l.length + ', вес лайка ' + l[0].s };
+  } },
+  { id: 'F2', title: 'Кеш деталей одного фильма меньше 10 КБ', fn: async () => {
+    const cast = Array.from({ length: 60 }, (_, i) => ({ adult: false, gender: 2, id: 10000 + i, known_for_department: 'Acting', name: 'Actor Name ' + i, original_name: 'Actor Name ' + i, popularity: 12.3, profile_path: '/abcdefghijklmnopqrstuvwx' + i + '.jpg', cast_id: i, character: 'Character ' + i, credit_id: '52fe4250c3a36847f80149f' + i, order: i }));
+    const crew = Array.from({ length: 300 }, (_, i) => ({ adult: false, gender: 1, id: 20000 + i, known_for_department: 'Production', name: 'Crew Person ' + i, original_name: 'Crew Person ' + i, popularity: 1.2, profile_path: null, credit_id: '52fe4250c3a36847f8014a' + i, department: 'Production', job: i === 0 ? 'Director' : 'Producer' }));
+    const env = makeEnv({ world: { movies: { 42: movie(42, { credits: { cast, crew } }) } } });
+    await env.cb(cb => env.pk.details('movie', 42, cb));
+    let bytes = 0;
+    Object.keys(env.pk.Cache.mem).forEach(k => { bytes += JSON.stringify(env.pk.Cache.mem[k]).length; });
+    return { ok: bytes < 10000, got: 'в кеше ' + bytes + ' байт' };
+  } },
+  { id: 'F3a', title: 'indexedDB.open без ответа: подбор всё равно завершается', fn: async () => {
+    const o = baseWorld(); o.idb = { open() { return {}; } };
+    const env = makeEnv(o);
+    const r = await env.run(ANY, 120000);
+    return { ok: !r.timedOut, got: r.timedOut ? 'висит на «' + r.stages.slice(-1)[0] + '», запросов ' + env.log.urls.length : (r.error ? 'ошибка показана' : 'финал ' + r.st.rest.length) };
+  } },
+  { id: 'F3b', title: 'Зависшие запросы TMDB не блокируют очередь навсегда', fn: async () => {
+    const env = makeEnv({ router: (url, p, def) => (url.indexOf('/hang') > -1 ? { hang: true } : def(url)) });
+    for (let i = 0; i < 4; i++) env.pk.tmdb('movie/hang' + i, {}, 1000, () => {});
+    const res = await env.cb(cb => env.pk.tmdb('movie/5', {}, 1000, cb), 120000);
+    return { ok: !!res, got: res ? 'пятый запрос выполнен' : 'пятый запрос не выполнен за 120 с (занято слотов ' + env.pk.Net.active + ')' };
+  } },
+  { id: 'F4a', title: '«С детьми»: RU 12+ / US R отсекается', fn: async () => {
+    const { pk } = makeEnv();
+    const got = why(pk, item({ cert: certObj(pk, 'R', '12+') }), { company: 'kids' });
+    return { ok: got !== 'проходит', got };
+  } },
+  { id: 'F4b', title: '«С детьми»: US PG-13 без RU — проходит с подтверждением КП ≤ 12, без него — нет', fn: async () => {
+    const { pk } = makeEnv();
+    const confirmed = why(pk, item({ cert: certObj(pk, 'PG-13', null), kpAge: 12 }), { company: 'kids' });
+    const unconfirmed = why(pk, item({ cert: certObj(pk, 'PG-13', null) }), { company: 'kids' });
+    const pg = why(pk, item({ cert: certObj(pk, 'PG', null) }), { company: 'kids' });
+    return { ok: confirmed === 'проходит' && unconfirmed !== 'проходит' && pg === 'проходит',
+      got: 'КП 12+: ' + confirmed + '; без КП: ' + unconfirmed + '; PG без КП: ' + pg };
+  } },
+  { id: 'F4c', title: '«С детьми»: сериал TV-Y7-FV допускается', fn: async () => {
+    const { pk } = makeEnv();
+    const got = why(pk, item({ type: 'tv', runtime: 22, genres: [16], cert: certTv(pk, 'TV-Y7-FV', null) }), { company: 'kids' });
+    return { ok: got === 'проходит', got };
+  } },
+  { id: 'F4d', title: '«С детьми»: семейное выше триллера 12+ даже у любителя триллеров', fn: async () => {
+    const likes = []; const movies = {};
+    for (let i = 0; i < 10; i++) { likes.push(card(100 + i, { genre_ids: [53, 80, 9648] })); movies[100 + i] = movie(100 + i, { genre_ids: [53, 80, 9648] }); }
+    const env = makeEnv({ fav: { like: likes }, world: { movies } });
+    const { profile } = await env.profile();
+    const mk = (id, genres, c) => ({ k: 'movie:' + id, id, type: 'movie', seedHits: 0, seeds: [], wath: false, src: 'disc',
+      c: { id, type: 'movie', title: 'X' + id, year: '2016', genres, kw: [], cast: [], dir: [], names: {}, lang: 'en', va: 7.5, vc: 8000, runtime: 100, cert: c, moods: null, coll: null, card: {} } });
+    const ans = { time: 'any', mood: 'any', company: 'kids' };
+    const items = [mk(1, [53, 9648, 80], certObj(env.pk, 'PG-13', '12+')), mk(2, [16, 10751, 12], certObj(env.pk, 'PG', '6+')), mk(3, [10751, 35, 12], certObj(env.pk, 'G', '0+'))];
+    env.pk.scoreAll(items, profile, ans);
+    const thr = items[0].score, fam = Math.max(items[1].score, items[2].score);
+    return { ok: fam > thr, got: 'триллер ' + r2(thr) + ', лучшее семейное ' + r2(fam) };
+  } },
+  { id: 'F4e', title: '«С детьми»: PG-13 в TMDB, но 18+ на Кинопоиске — отсекается', fn: async () => {
+    const o = baseWorld();
+    o.world.movies[300] = movie(300, { genre_ids: [35, 10749], vote_average: 9.5, vote_count: 30000, cert: cert('PG-13', null) });
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        const im = url.match(/imdbId=tt(\d+)/);
+        if (im) return { body: { items: [{ kinopoiskId: 5000000 + +im[1], ratingKinopoisk: 7.5, ratingImdb: 7.2 }] } };
+        const byId = url.match(/films\/(\d+)$/);
+        if (byId) return { body: { kinopoiskId: +byId[1], ratingKinopoisk: 7.5, ratingImdb: 7.2, ratingAgeLimits: +byId[1] === 5000300 ? 'age18' : 'age6' } };
+      }
+      return def(url);
+    };
+    const env = makeEnv(Object.assign(o, { kp: true, router }));
+    const r = await env.run({ time: 'any', mood: 'any', company: 'kids' });
+    const fin = r.st ? r.st.rest : [];
+    const x = fin.find(it => it.id === 300);
+    const d = (r.st && r.st.journal && r.st.journal.dropped) || {};
+    return { ok: !!r.st && fin.length > 0 && !x, got: x ? 'в финале (KP возраст ' + x.c.kpAge + ')' : 'отсеян, kids_kp_age ' + (d.kids_kp_age || 0) + ', финал ' + fin.length };
+  } },
+  { id: 'F4f', title: '«С детьми»: PG-13 без RU — с КП 12+ остаётся, без КП отсекается', fn: async () => {
+    const mk = (kp, ageStr) => {
+      const o = baseWorld();
+      o.world.movies[300] = movie(300, { genre_ids: [35, 10749], vote_average: 9.5, vote_count: 30000, cert: cert('PG-13', null) });
+      const router = (url, p, def) => {
+        if (url.indexOf('kinopoiskapiunofficial') > -1) {
+          const im = url.match(/imdbId=tt(\d+)/);
+          if (im) return { body: { items: [{ kinopoiskId: 5000000 + +im[1], ratingKinopoisk: 7.5, ratingImdb: 7.2 }] } };
+          const byId = url.match(/films\/(\d+)$/);
+          if (byId) return { body: { kinopoiskId: +byId[1], ratingKinopoisk: 7.5, ratingImdb: 7.2, ratingAgeLimits: ageStr } };
+        }
+        return def(url);
+      };
+      return makeEnv(Object.assign(o, { kp, router }));
+    };
+    const ans = { time: 'any', mood: 'any', company: 'kids' };
+    const r1 = await mk(true, 'age12').run(ans);
+    const r2 = await mk(false, 'age12').run(ans);
+    const in1 = !!(r1.st && r1.st.rest.find(it => it.id === 300));
+    const in2 = !!(r2.st && r2.st.rest.find(it => it.id === 300));
+    return { ok: in1 && !in2, got: 'КП 12+: ' + (in1 ? 'в финале' : 'нет') + '; КП недоступен: ' + (in2 ? 'в финале' : 'нет') };
+  } },
+  { id: 'F4g', title: '«С детьми»: франшиза начинается с первой части, если она подходит детям; иначе — лучшая проверенная', fn: async () => {
+    const mk = (firstCert) => {
+      const o = baseWorld();
+      o.world.collections[960] = [390, 391, 392];
+      o.world.movies[390] = movie(390, { coll: 960, release_date: '1995-01-01', genre_ids: [16, 10751, 35], vote_average: 8.3, vote_count: 20000, cert: firstCert });
+      o.world.movies[391] = movie(391, { coll: 960, release_date: '2010-01-01', genre_ids: [16, 10751, 35], vote_average: 7.9, vote_count: 20000, cert: cert('G', '0+') });
+      o.world.movies[392] = movie(392, { coll: 960, release_date: '2019-01-01', genre_ids: [16, 10751, 35], vote_average: 9.5, vote_count: 20000, cert: cert('G', '6+') });
+      o.world.discover.push(392);
+      return makeEnv(o);
+    };
+    const ans = { time: 'any', mood: 'any', company: 'kids' };
+    const pick = r => ((r.st ? r.st.rest : []).filter(it => it.c.coll === 960).map(it => it.id)).join(',') || 'нет';
+    const ok1 = pick(await mk(cert('G', '0+')).run(ans));
+    const ok2 = pick(await mk(cert('PG-13', null)).run(ans));   // первая часть без подтверждения — не детям
+    return { ok: ok1 === '390' && ok2 === '392', got: 'первая подходит: ' + ok1 + '; первая не подтверждена: ' + ok2 };
+  } },
+  { id: 'F5', title: '«Смотрю» не предлагается (тем более как «Позже»)', fn: async () => {
+    const env = franchiseEnv();
+    const r = await env.run(ANY);
+    const x = (r.st ? r.st.rest : []).find(it => it.id === 401);
+    return { ok: !!r.st && !x, got: x ? 'в финале, причина «' + x.reason + '»' : 'не предлагается' };
+  } },
+  { id: 'F6a', title: 'Франшиза не возвращает начатую часть', fn: async () => {
+    const env = franchiseEnv();
+    const r = await env.run(ANY);
+    const x = (r.st ? r.st.rest : []).find(it => it.id === 201);
+    return { ok: !!r.st && !x, got: x ? 'начатая часть в финале (src ' + x.src + ')' : 'нет' };
+  } },
+  { id: 'F6b', title: 'Франшиза не добавляет фильм ниже порога голосов', fn: async () => {
+    const env = franchiseEnv();
+    const r = await env.run(ANY);
+    const x = (r.st ? r.st.rest : []).find(it => it.id === 777);
+    return { ok: !!r.st && !x, got: x ? 'фильм с 40 голосами в финале (src ' + x.src + ')' : 'нет' };
+  } },
+  { id: 'F7a', title: '«Один»: семейный мультфильм 6+ не отсекается у любителя анимации', fn: async () => {
+    const { pk } = makeEnv();
+    const got = why(pk, item({ genres: [16, 10751], cert: certObj(pk, 'PG', '6+') }), { company: 'solo' }, { n: 20, animShare: 0.6, f: {} });
+    return { ok: got === 'проходит', got };
+  } },
+  { id: 'F7b', title: '«Один»: комедия RU 0+ (не детская) не отсекается', fn: async () => {
+    const { pk } = makeEnv();
+    const got = why(pk, item({ genres: [35], cert: certObj(pk, null, '0+') }), { company: 'solo' });
+    return { ok: got === 'проходит', got };
+  } },
+  { id: 'F8', title: 'Три «Не мой жанр» по фильмам с драмой не делают драму «нелюбимой»', fn: async () => {
+    const likes = []; for (let i = 0; i < 12; i++) likes.push(card(100 + i));
+    const env = makeEnv({ fav: { like: likes } });
+    const t = env.clock.now, rej = {};
+    [[18, 27], [18, 10752], [18, 53]].forEach((g, i) => { rej['movie:' + (900 + i)] = { t, r: 'genre', card: { id: 900 + i, genre_ids: g, method: 'movie' } }; });
+    env.storage.picker_feedback = { rejected: rej, seen: {}, opened: {} };
+    const { profile } = await env.profile();
+    const d = (profile.f.genre || {})[18] || 0;
+    return { ok: d > -0.6, got: 'вес драмы ' + r2(d) };
+  } },
+  { id: 'F9', title: 'Дедлайн старого подбора не выбрасывает задания КП нового', fn: async () => {
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        const id = +((url.match(/imdbId=tt(\d+)/) || [])[1] || 0);
+        return { delay: id < 2000 ? 4000 : 300, body: { items: [{ ratingKinopoisk: 7.5, ratingImdb: 7.2, kinopoiskId: id }] } };
+      }
+      return def(url);
+    };
+    const env = makeEnv({ kp: true, router });
+    const mk = (base, n) => Array.from({ length: n }, (_, i) => ({ k: 'movie:' + (base + i), id: base + i, type: 'movie', score: 1 - i / 100,
+      c: { id: base + i, va: 7, vc: 5000, imdb: 'tt' + (base + i), title: 'F' } }));
+    const A = mk(1000, 6), B = mk(3000, 20);
+    const qB = () => (env.pk.KpNet.queue || []).filter(j => /imdbId=tt3\d{3}/.test(j.url || '')).length;
+    env.pk.attachRatings(A, () => {});
+    await env.clock.advance(1000);
+    env.pk.attachRatings(B, () => {});
+    await env.clock.advance(3950);                       // t = 4,95 с
+    const before = qB();
+    await env.clock.advance(150);                        // t = 5,1 с — сработал дедлайн A
+    const after = qB();
+    return { ok: before > 0 && after === before, got: 'заданий B в очереди: до дедлайна A ' + before + ', после ' + after };
+  } },
+  { id: 'F10', title: '429 от КП не блокирует ключ до конца суток', fn: async () => {
+    const env = makeEnv({ kp: true, router: (url, p, def) => (url.indexOf('kinopoisk') > -1 ? { status: 429 } : def(url)) });
+    await env.cb(cb => env.pk.fetchRatings({ k: 'movie:1', c: { id: 1, imdb: 'tt1', title: 'X', va: 7 } }, cb));
+    const b = env.pk.kpQuota().blocked;
+    return { ok: !b, got: 'blocked = ' + b };
+  } },
+  { id: 'F11', title: 'TMDB недоступен: подбор сообщает о сети, а не «ничего не нашлось»', fn: async () => {
+    const env = makeEnv({ fav: { wath: [card(5)], like: [card(1)] }, router: () => ({ status: 0 }) });
+    const r = await env.run({ time: '90', mood: 'relax', company: 'solo' });
+    const flagged = !!(r.error || (r.st && (r.st.netError || r.st.netFail || r.st.offline)));
+    return { ok: flagged, got: r.error ? 'error: ' + r.error : (r.st ? 'done, финал ' + r.st.rest.length + ', отсев ' + JSON.stringify(r.st.journal && r.st.journal.dropped) : 'нет результата') };
+  } },
+  { id: 'F12a', title: 'Язык данных TMDB берётся из tmdb_lang', fn: async () => {
+    const { pk } = makeEnv({ storage: { language: 'ru', tmdb_lang: 'uk' } });
+    const lang = (pk.tmdbUrl('movie/1', {}).match(/language=([^&]+)/) || [])[1];
+    return { ok: lang === 'uk', got: 'language=' + lang };
+  } },
+  { id: 'F12b', title: 'Смена языка TMDB не отдаёт кеш на старом языке', fn: async () => {
+    const env = makeEnv({ storage: { language: 'ru', tmdb_lang: 'ru' } });
+    await env.cb(cb => env.pk.tmdb('movie/7', {}, 86400000, cb));
+    env.storage.tmdb_lang = 'uk'; env.storage.language = 'uk';
+    await env.cb(cb => env.pk.tmdb('movie/7', {}, 86400000, cb));
+    const n = env.log.urls.filter(u => u.indexOf('/3/movie/7?') > -1).length;
+    return { ok: n === 2, got: 'сетевых запросов ' + n + ' (второй ответ ' + (n === 2 ? 'из сети' : 'из кеша') + ')' };
+  } },
+  { id: 'F15', title: 'Начатое вчера (10 %) не даёт минус к вкусу', fn: async () => {
+    const env = makeEnv({ fav: { history: [card(55)] } });
+    env.timeline[hash('Film 55')] = { percent: 10, time: 600, duration: 6000, updated: env.clock.now - 86400000 };
+    const ev = env.pk.collect();
+    return { ok: ev[0].s >= 0, got: 'сигнал ' + ev[0].s };
+  } },
+  { id: 'F16', title: 'Пять отказов у нового пользователя — всё ещё холодный старт', fn: async () => {
+    const env = makeEnv();
+    const t = env.clock.now, rej = {};
+    for (let i = 0; i < 5; i++) rej['movie:' + (70 + i)] = { t, r: 'meh', card: { id: 70 + i, genre_ids: [35], method: 'movie' } };
+    env.storage.picker_feedback = { rejected: rej, seen: {}, opened: {} };
+    const { profile } = await env.profile();
+    const key = env.pk.pickWeights({ mood: 'relax', company: 'solo' }, profile).key;
+    return { ok: key === 'cold', got: 'веса ' + key + ', profile.n ' + profile.n };
+  } },
+  { id: 'F17a', title: 'Durable: запись во время загрузки не теряется', fn: async () => {
+    const env = makeEnv({ idb: 'fake', idbDelay: 50 });
+    env.pk.Durable.load('kpmap', {});
+    env.pk.Durable.set('kpmap', { 'movie:1': { kp: 8 } });
+    await env.clock.advance(3000);
+    const v = env.pk.Durable.get('kpmap', {});
+    return { ok: !!v['movie:1'], got: JSON.stringify(v) };
+  } },
+  { id: 'F17b', title: 'Durable: «Очистить», пока журнал читается из IndexedDB, не откатывается', fn: async () => {
+    const env = makeEnv({ idb: 'fake', idbDelay: 50, idbData: { 'durable:journal': { t: 1, v: [{ id: 'old1' }, { id: 'old2' }] } } });
+    await env.cb(cb => env.pk.Cache.init(cb));           // база уже открыта, как после старта Lampa
+    env.pk.Durable.load('journal', []);                  // чтение журнала из IndexedDB в полёте…
+    env.pk.Journal.clear();                              // …и в этот момент «Очистить»
+    await env.clock.advance(3000);
+    const v = env.pk.Durable.get('journal', null);
+    return { ok: Array.isArray(v) && v.length === 0, got: JSON.stringify(v) };
+  } },
+  { id: 'F18', title: 'ratingOffsets: одно наблюдение считается один раз', fn: async () => {
+    const env = makeEnv();
+    env.pk.Durable.vals.kpmap = { 'movie:1': { kp: 8, imdb: 7.5, va: 7, t: env.clock.now } };
+    const off = env.pk.ratingOffsets([{ k: 'movie:1', c: { va: 7 }, rt: { kp: 8, imdb: 7.5, src: 'cache' } }]);
+    return { ok: off.n === 1, got: 'наблюдений ' + off.n };
+  } },
+  { id: 'F19', title: '«Настроить вкус» запрашивает вторую страницу', fn: async () => {
+    const env = await tasteEnv();
+    for (let i = 0; i < 4; i++) await env.more();
+    const p = env.pages();
+    return { ok: p.indexOf(2) > -1, got: 'страницы ' + p.join(', ') };
+  } },
+  { id: 'F21', title: 'CUB: статус кроме completed/empty не кешируется на неделю', fn: async () => {
+    let calls = 0;
+    const env = makeEnv({ cub: true, router: (url, p, def) => {
+      if (url.indexOf('cub.test') > -1) { calls++; return { body: calls === 1 ? { status: 'processing' } : { status: 'completed', review: [{ name: 'humor', avg: 7 }] } }; }
+      return def(url);
+    } });
+    await env.cb(cb => env.pk.cubMeta(603, cb));
+    await env.clock.advance(3600e3);
+    const res = await env.cb(cb => env.pk.cubMeta(603, cb));
+    return { ok: calls === 2, got: 'запросов к CUB ' + calls + ', шкалы ' + JSON.stringify(res && res[0]) };
+  } },
+  { id: 'F22', title: 'Сериал: длительность серии — медиана, а не минимум', fn: async () => {
+    const { pk } = makeEnv();
+    const c = pk.compact('tv', { id: 1, name: 'S', original_name: 'S', episode_run_time: [25, 40, 55], first_air_date: '2015-01-01', genres: [] });
+    return { ok: c.runtime === 40, got: 'runtime ' + c.runtime };
+  } },
+  { id: 'F23', title: 'reset() не стирает даты первого знакомства (picker_seen)', fn: async () => {
+    const env = makeEnv({ storage: { picker_seen: { 'movie:1': 1700000000000 } } });
+    env.w.LampaPicker.reset();
+    const s = env.storage.picker_seen;
+    return { ok: !!(s && s['movie:1']), got: JSON.stringify(s) };
+  } },
+  { id: 'F24', title: 'Кеш kp_rating (ключ без типа) не применяется к сериалам', fn: async () => {
+    const env = makeEnv({ storage: { kp_rating: { 5: { kp: 8.1, imdb: 7.9 } } } });
+    const r = env.pk.cachedRatings({ id: 5, type: 'tv' }, 'tv:5');
+    return { ok: !r, got: r ? 'взят рейтинг ' + JSON.stringify(r) : 'не взят' };
+  } },
+  { id: 'F25', title: 'Поиск КП по названию учитывает тип (фильм ≠ сериал)', fn: async () => {
+    const env = makeEnv({ kp: true, router: (url, p, def) => {
+      if (url.indexOf('search-by-keyword') > -1) return { body: { films: [{ filmId: 1, year: '2015', type: 'TV_SERIES' }, { filmId: 2, year: '2015', type: 'FILM' }] } };
+      const m = url.match(/api\/v2\.2\/films\/(\d+)$/);
+      if (m) return { body: { ratingKinopoisk: m[1] === '2' ? 7.7 : 5.5, ratingImdb: 7.0 } };
+      return def(url);
+    } });
+    const res = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:77', c: { id: 77, title: 'Same', original: 'Same', year: '2015', va: 7, imdb: null, type: 'movie' } }, cb));
+    const kp = res && res[0] && res[0].kp;
+    return { ok: kp === 7.7, got: 'КП ' + kp + (kp === 5.5 ? ' (взят сериал)' : '') };
+  } },
+  { id: 'F27', title: 'poster_path с кавычками не ломает разметку', fn: async () => {
+    const env = await tasteEnv('/x.jpg\')" onmouseover="alert(1)" data-x="');
+    const n = env.$('[onmouseover]').length;
+    return { ok: n === 0, got: 'элементов с onmouseover: ' + n };
+  } },
+  { id: 'F28', title: 'Экран журнала не пишет весь журнал в консоль', fn: async () => {
+    const likes = []; for (let i = 0; i < 6; i++) likes.push(card(100 + i));
+    const env = makeEnv({ fav: { like: likes } });
+    env.pk.Durable.vals.journal = [{ id: env.clock.now, answers: 'a', counts: {}, shown: [], actions: [] }];
+    const comp = new env.pk.PickerComponent({});
+    env.w.document.body.appendChild(comp.create()[0]);
+    env.$('.pkr-btn').filter(function () { return env.$(this).text().indexOf('Журнал') > -1; }).eq(0).trigger('hover:enter');
+    await env.clock.advance(100);
+    const n = env.log.console.filter(s => s.indexOf('[Picker] journal') === 0).length;
+    return { ok: n === 0, got: 'выводов журнала в консоль: ' + n };
+  } },
+  { id: 'F29', title: 'diag() не показывает api_key', fn: async () => {
+    const env = makeEnv();
+    const rep = env.w.LampaPicker.diag();
+    const s = JSON.stringify(rep);
+    const leak = s.indexOf('PUBLICKEY') > -1;               // ключ из мока Lampa.TMDB.key()
+    return { ok: !leak, got: leak ? 'в отчёте виден ключ TMDB' : 'ключ замаскирован' };
+  } },
+  { id: 'F30', title: 'Начатость видна по привязке к карточке, если сменилось название', fn: async () => {
+    const env = makeEnv({ timelineFn: (h, meta) => (meta && meta.card === 'movie_201' ? { percent: 40, time: 2400, duration: 6000 } : null) });
+    const started = env.pk.startedAny({ id: 201, title: 'Новое название', original_title: 'New Title' }, 'movie');
+    return { ok: !!started, got: started ? 'видно' : 'не видно (view вызывается без привязки)' };
+  } },
+  { id: 'F31', title: 'Без Lampa.TMDB.api запросы не уходят на bylampa.online', fn: async () => {
+    const { pk } = makeEnv({ noTmdbApi: true });
+    const u = pk.tmdbUrl('movie/1', {});
+    return { ok: u.indexOf('bylampa') < 0, got: u.replace(/api_key=[^&]+/, 'api_key=…') };
+  } }
+];
+
+module.exports = CHECKS;
