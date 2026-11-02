@@ -1593,7 +1593,10 @@
 
     if (ans.company === 'kids') {
       if (c.moods && ((mv(c, 'fear') || 0) > 6 || (mv(c, 'violence') || 0) > 5 || (mv(c, 'profanity') || 0) > 3 || (mv(c, 'sex') || 0) > 2)) return 'kids_moods';
-      if (!kidsOk(c.cert)) return 'kids_cert';
+      // Возраст — самый строгий из TMDB (RU/US) и Кинопоиска
+      var age = ageOf(c.cert);
+      if (typeof c.kpAge === 'number' && c.kpAge >= 0) age = Math.max(age === null ? 0 : age, c.kpAge);
+      if (age === null || age > KIDS_MAX_AGE) return typeof c.kpAge === 'number' && c.kpAge > KIDS_MAX_AGE ? 'kids_kp_age' : 'kids_cert';
       if (c.genres.indexOf(27) > -1 || c.genres.indexOf(10752) > -1) return 'kids_genre';
     }
 
@@ -2163,15 +2166,18 @@
         var afterExtras = function () {
             if (!alive()) return;
             mark('extras');
-            // Шкалы пришли после фильтров — для детей проверяем ещё раз
-            if (ans.company === 'kids') {
+            if (ans.company !== 'kids') return finishPick();
+            // Шкалы CUB пришли после фильтров, плюс возраст с Кинопоиска — для детей проверяем ещё раз
+            scoreAll(passed, profile, ans);
+            attachKidsAge(passed, function () {
+              if (!alive()) return;
               passed = passed.filter(function (it) {
                 var r = postReason(it, ans, profile);
                 if (r) { stats[r] = (stats[r] || 0) + 1; return false; }
                 return true;
               });
-            }
-            finishPick();
+              finishPick();
+            });
         };
 
         var finishPick = function () {
@@ -2244,7 +2250,8 @@
       src: it.src || null,
       coll: c.coll || null,
       anim: isAnimated(c),
-      cert: c.cert ? [c.cert.ru ? 'RU:' + c.cert.ru : '', c.cert.us ? 'US:' + c.cert.us : ''].filter(Boolean).join(' ') : null,
+      cert: (c.cert || typeof c.kpAge === 'number') ? [c.cert && c.cert.ru ? 'RU:' + c.cert.ru : '', c.cert && c.cert.us ? 'US:' + c.cert.us : '',
+        typeof c.kpAge === 'number' ? 'KP:' + (c.kpAge < 0 ? '—' : c.kpAge + '+') : ''].filter(Boolean).join(' ') : null,
       moods: c.moods || null,
       wath: !!it.wath,
       seeds: (it.seeds || []).slice(0, 3),
@@ -2745,11 +2752,14 @@
     if (m && now() - m.t < 14 * DAY) return cb(m.kp || m.imdb ? { kp: m.kp, imdb: m.imdb, src: 'cache' } : null);
 
 
-    var finish = function (kp, imdb, kpId) {
+    var finish = function (kp, imdb, kpId, age) {
       kp = parseFloat(kp) || 0;
       imdb = parseFloat(imdb) || 0;
       var mp = Durable.get('kpmap', {});
+      var prev = mp[it.k];
       mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now(), va: c.va || 0 };
+      if (typeof age === 'number') mp[it.k].age = age;
+      else if (prev && typeof prev.age === 'number' && prev.id === mp[it.k].id) mp[it.k].age = prev.age;
       var keys = Object.keys(mp);
       if (keys.length > 1500) {
         keys.sort(function (a, b) { return mp[a].t - mp[b].t; });
@@ -2765,7 +2775,7 @@
     var byId = function (kpId) {
       if (!kpCan()) return cb(null);
       KpNet.get(KP_API + 'api/v2.2/films/' + kpId, function (j) {
-        finish(j && j.ratingKinopoisk, j && j.ratingImdb, kpId);
+        finish(j && j.ratingKinopoisk, j && j.ratingImdb, kpId, kpAgeOf(j));
       }, kpFail(cb), kpHeaders());
     };
 
@@ -2793,6 +2803,75 @@
         byTitle();
       }, kpHeaders());
     } else byTitle();
+  }
+
+  // Возрастное ограничение Кинопоиска: «age18» → 18; −1 — у КП ограничения нет; null — ответа нет
+  function kpAgeOf(j) {
+    if (!j || typeof j !== 'object') return null;
+    var m = String(j.ratingAgeLimits || '').match(/(\d+)/);
+    return m ? parseInt(m[1], 10) : -1;
+  }
+
+  // Возраст по КП для одного фильма: из kpmap, иначе запрос карточки КП (id берём из kpmap или ищем по imdb)
+  function kpAge(it, cb) {
+    var mp = Durable.get('kpmap', {});
+    var m = mp[it.k];
+    if (m && typeof m.age === 'number') return cb(m.age);
+    var save = function (id, age) {
+      var mm = Durable.get('kpmap', {});
+      var rec = mm[it.k] || { kp: 0, imdb: 0, t: now(), va: (it.c && it.c.va) || 0 };
+      rec.id = id; rec.age = age;
+      mm[it.k] = rec;
+      Durable.set('kpmap', mm);
+      cb(age);
+    };
+    var byId = function (id) {
+      if (!kpCan()) return cb(null);
+      KpNet.get(KP_API + 'api/v2.2/films/' + id, function (j) {
+        var age = kpAgeOf(j);
+        if (age === null) return cb(null);
+        save(id, age);
+      }, function () { cb(null); }, kpHeaders());
+    };
+    if (m && m.id) return byId(m.id);
+    var c = it.c || {};
+    if (!c.imdb || !kpCan()) return cb(null);          // поиск по названию ради возраста не тратим
+    KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
+      var x = j && j.items && j.items[0];
+      if (x && x.kinopoiskId) byId(x.kinopoiskId);
+      else cb(null);
+    }, function () { cb(null); }, kpHeaders());
+  }
+
+  // «С детьми»: возраст КП для лучших кандидатов. У TMDB часто есть только американский рейтинг,
+  // а КП знает российское ограничение (пример: «10 причин моей ненависти» — PG-13 в TMDB, 18+ на КП)
+  var KIDS_AGE_N = 20, KIDS_AGE_DEADLINE = 5000;
+
+  function attachKidsAge(list, cb) {
+    var fired = false;
+    var finish = function () { if (!fired) { fired = true; kpRunCap = 0; cb(); } };
+    var todo = list.filter(function (it) { return it.c && it.c.type === 'movie' && it.c.kpAge === undefined; })
+      .sort(function (a, b) { return b.score - a.score; }).slice(0, KIDS_AGE_N);
+    if (!todo.length || !kpCan()) return finish();
+    // Тот же бюджет на подбор, что и у оценок: встроенный ключ общий
+    kpRunCap = kpQuota().n + (kpUsingBuiltin() ? KP_RUN_BUDGET_BUILTIN : KP_RUN_BUDGET_PERSONAL);
+    setTimeout(finish, KIDS_AGE_DEADLINE);
+    var idx = 0, running = 0;
+    var next = function () {
+      if (fired) return;
+      if (idx >= todo.length && !running) return finish();
+      while (running < 3 && idx < todo.length) {
+        (function (it) {
+          running++;
+          kpAge(it, function (age) {
+            if (typeof age === 'number') it.c.kpAge = age;
+            running--;
+            next();
+          });
+        })(todo[idx++]);
+      }
+    };
+    next();
   }
 
   // Оценки для финалистов перед окончательным порядком: кеш, затем запросы. Подбор ждёт не дольше дедлайна.
