@@ -543,6 +543,16 @@ const CHECKS = [
     const ok = !!(sh && sh.top.length === 5 && sh.same >= 0 && sh.same <= 5) && page.join() === page2.join();
     return { ok, got: sh ? 'тень: ' + sh.top.map(x => x.k).join(',') + ', совпало ' + sh.same : 'тени нет' };
   } },
+  { id: 'F26b', title: 'Фильм из «Позже», который пришёл и из discover, не роняет подбор', fn: async () => {
+    const w = baseWorld();
+    w.fav.wath = [card(305)];                        // 305 есть и в discover
+    const env = makeEnv(Object.assign(w, { idb: 'fake', idbDelay: 30 }));
+    const errs = [];
+    env.w.addEventListener('error', e => errs.push(e.message || String(e.error)));
+    const r = await env.run(ANY);
+    const it = r.st && r.st.rest.find(x => x.k === 'movie:305');
+    return { ok: !!(r.st && !r.error && !errs.length), got: r.error ? 'ошибка: ' + r.error : (errs.length ? errs[0] : 'ок, 305: ' + (it ? it.src + ' ' + JSON.stringify(it.srcs) : 'нет в финале')) };
+  } },
   { id: 'F27', title: 'poster_path с кавычками не ломает разметку', fn: async () => {
     const env = await tasteEnv('/x.jpg\')" onmouseover="alert(1)" data-x="');
     const n = env.$('[onmouseover]').length;

@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.11.2-dev';
+  var VERSION = '0.11.3-dev';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -1471,7 +1471,7 @@
           srcCount[src] = (srcCount[src] || 0) + 1;
         }
         // Все источники, где встретился фильм; основной — по приоритету, а не по тому, кто ответил первым
-        pool[k].srcs[src] = true;
+        (pool[k].srcs = pool[k].srcs || {})[src] = true;   // у карточек из «Позже» и франшиз srcs может не быть
         if (srcRank(src) < srcRank(pool[k].src)) pool[k].src = src;
         if (seed) { pool[k].seedHits++; pool[k].seeds.push(seed); }
       }
@@ -1480,7 +1480,8 @@
     function req(path, params, type, seed, src) {
       pending++;
       tmdb(path, params, LIST_TTL, function (json) {
-        if (json && json.results) add(json.results, type, seed, src);
+        // Ошибка в разборе одного ответа не должна вешать весь подбор до таймера
+        try { if (json && json.results) add(json.results, type, seed, src); } catch (e) { log('pool add error', e); }
         if (--pending === 0) finish();
       });
     }
@@ -1596,7 +1597,7 @@
       for (var it = 0; it < INTENT_TYPES.length && !intent; it++) if (ev.flags[INTENT_TYPES[it]]) intent = INTENT_TYPES[it];
       if (!intent || types.indexOf(ev.type) < 0) continue;
       if (!pool[ev.k]) {
-        pool[ev.k] = { k: ev.k, id: ev.id, type: ev.type, r: ev.card, seedHits: 0, seeds: [], wath: true, src: 'wath' };
+        pool[ev.k] = { k: ev.k, id: ev.id, type: ev.type, r: ev.card, seedHits: 0, seeds: [], wath: true, src: 'wath', srcs: { wath: true } };
         srcCount.wath = (srcCount.wath || 0) + 1;
       } else pool[ev.k].wath = true;
       pool[ev.k].list = intent;
