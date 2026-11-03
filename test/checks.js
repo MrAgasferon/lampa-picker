@@ -553,6 +553,101 @@ const CHECKS = [
     const it = r.st && r.st.rest.find(x => x.k === 'movie:305');
     return { ok: !!(r.st && !r.error && !errs.length), got: r.error ? 'ошибка: ' + r.error : (errs.length ? errs[0] : 'ок, 305: ' + (it ? it.src + ' ' + JSON.stringify(it.srcs) : 'нет в финале')) };
   } },
+  { id: 'SM', title: 'Все сочетания ответов (5×6×4) с медленным кешем: без ошибок, дублей, NaN, лишней длительности и поздних частей франшиз', fn: async () => {
+    const likes = []; for (let i = 0; i < 12; i++) likes.push(card(100 + i, { genre_ids: [[35], [18], [878, 28], [27, 53], [16, 10751]][i % 5] }));
+    const world = { movies: {}, discover: [], recs: [], collections: { 980: [600, 601, 602] } };
+    for (let i = 0; i < 60; i++) {
+      const g = [[35], [18, 10749], [27, 53], [878, 9648], [16, 10751], [28, 12], [99], [80, 18]][i % 8];
+      world.movies[300 + i] = movie(300 + i, { genre_ids: g, runtime: [30, 85, 100, 125, 150][i % 5], vote_average: 6 + (i % 30) / 10, vote_count: 500 + i * 100 });
+      world.discover.push(300 + i);
+    }
+    for (let i = 0; i < 3; i++) world.movies[600 + i] = movie(600 + i, { coll: 980, release_date: (2001 + i * 3) + '-01-01', runtime: 100 + i * 20 });
+    world.discover.push(602);
+    for (let i = 0; i < 20; i++) world.recs.push(300 + i * 3);
+    const problems = [];
+    let n = 0;
+    for (const time of ['40', '90', '120', 'series', 'any']) for (const mood of ['relax', 'laugh', 'nerves', 'think', 'surprise', 'any']) for (const company of ['solo', 'couple', 'kids', 'group']) {
+      n++;
+      const env = makeEnv({ fav: { like: likes, wath: [card(305), card(601)], history: [card(600)] }, world, idb: 'fake', idbDelay: 30 });
+      const errs = [];
+      env.w.addEventListener('error', e => errs.push(e.message || String(e.error)));
+      const r = await env.run({ time, mood, company });
+      const tag = time + '/' + mood + '/' + company;
+      if (!r.st || r.error || errs.length) { problems.push(tag + ': ' + (r.error || errs[0] || 'нет результата')); continue; }
+      const seenK = new Set();
+      for (const it of r.st.rest) {
+        if (seenK.has(it.k)) problems.push(tag + ': дубль ' + it.k);
+        seenK.add(it.k);
+        if (!(it.score >= 0) || !isFinite(it.jscore)) problems.push(tag + ': NaN у ' + it.k);
+        if ((time === '90' || time === '120') && it.c.runtime > +time + 10) problems.push(tag + ': длинный ' + it.k);
+        if (it.c.coll === 980 && it.id !== 601) problems.push(tag + ': часть франшизы ' + it.id);
+      }
+    }
+    return { ok: !problems.length, got: n + ' подборов' + (problems.length ? ', проблемы: ' + problems.slice(0, 3).join('; ') : ', без проблем') };
+  } },
+  // ------------------------------------------------------------------ франшизы: всегда первая непросмотренная часть
+  { id: 'FR1', title: 'Франшиза: первая часть длиннее выбранного времени — франшиза пропускается, поздней части нет', fn: async () => {
+    const o = baseWorld();
+    o.world.collections[970] = [410, 411, 412];
+    o.world.movies[410] = movie(410, { coll: 970, release_date: '2001-01-01', runtime: 152, vote_average: 8.0 });
+    o.world.movies[411] = movie(411, { coll: 970, release_date: '2005-01-01', runtime: 157, vote_average: 7.9 });
+    o.world.movies[412] = movie(412, { coll: 970, release_date: '2011-01-01', runtime: 125, vote_average: 9.5, vote_count: 20000 });
+    o.world.discover.push(412);
+    const env = makeEnv(o);
+    const r = await env.run({ time: '120', mood: 'any', company: 'solo' });
+    const got = (r.st ? r.st.rest : []).filter(it => it.c.coll === 970).map(it => it.id);
+    const fr = (r.st && r.st.journal.franchises || []).find(f => f.coll === 970);
+    return { ok: !!r.st && !got.length && fr && fr.res === 'skip:too_long', got: 'в финале ' + (got.join(',') || 'ничего') + ', журнал ' + JSON.stringify(fr) };
+  } },
+  { id: 'FR2', title: 'Франшиза: подходящая первая часть подставляется вместо поздней', fn: async () => {
+    const o = baseWorld();
+    o.world.collections[971] = [420, 421, 422];
+    o.world.movies[420] = movie(420, { coll: 971, release_date: '2001-01-01', runtime: 110, vote_average: 7.8 });
+    o.world.movies[421] = movie(421, { coll: 971, release_date: '2005-01-01', runtime: 110, vote_average: 7.6 });
+    o.world.movies[422] = movie(422, { coll: 971, release_date: '2011-01-01', runtime: 110, vote_average: 9.5, vote_count: 20000 });
+    o.world.discover.push(422);
+    const env = makeEnv(o);
+    const r = await env.run({ time: '120', mood: 'any', company: 'solo' });
+    const got = (r.st ? r.st.rest : []).filter(it => it.c.coll === 971).map(it => it.id);
+    return { ok: got.join() === '420', got: 'в финале ' + (got.join(',') || 'ничего') };
+  } },
+  { id: 'FR3', title: 'Франшиза: первая часть в истории — предлагается вторая', fn: async () => {
+    const o = baseWorld();
+    o.world.collections[972] = [430, 431, 432];
+    o.world.movies[430] = movie(430, { coll: 972, release_date: '2001-01-01', runtime: 110 });
+    o.world.movies[431] = movie(431, { coll: 972, release_date: '2005-01-01', runtime: 110, vote_average: 7.6 });
+    o.world.movies[432] = movie(432, { coll: 972, release_date: '2011-01-01', runtime: 110, vote_average: 9.5, vote_count: 20000 });
+    o.world.discover.push(432);
+    o.fav.history = o.fav.history.concat([card(430)]);
+    const env = makeEnv(o);
+    const r = await env.run({ time: '120', mood: 'any', company: 'solo' });
+    const got = (r.st ? r.st.rest : []).filter(it => it.c.coll === 972).map(it => it.id);
+    return { ok: got.join() === '431', got: 'в финале ' + (got.join(',') || 'ничего') };
+  } },
+  { id: 'FR4', title: 'Франшиза: первая часть в «Смотрю» — вторую не предлагаем', fn: async () => {
+    const o = baseWorld();
+    o.world.collections[973] = [440, 441];
+    o.world.movies[440] = movie(440, { coll: 973, release_date: '2001-01-01', runtime: 110 });
+    o.world.movies[441] = movie(441, { coll: 973, release_date: '2011-01-01', runtime: 110, vote_average: 9.5, vote_count: 20000 });
+    o.world.discover.push(441);
+    o.fav.look = [card(440)];
+    const env = makeEnv(o);
+    const r = await env.run({ time: '120', mood: 'any', company: 'solo' });
+    const got = (r.st ? r.st.rest : []).filter(it => it.c.coll === 973).map(it => it.id);
+    const fr = (r.st && r.st.journal.franchises || []).find(f => f.coll === 973);
+    return { ok: !!r.st && !got.length && fr && fr.res === 'blocked:watching', got: 'в финале ' + (got.join(',') || 'ничего') + ', журнал ' + JSON.stringify(fr) };
+  } },
+  { id: 'FR5', title: '«С детьми»: первая часть длиннее времени — запасной части нет (запасная — только по возрасту)', fn: async () => {
+    const o = baseWorld();
+    o.world.collections[974] = [450, 451];
+    o.world.movies[450] = movie(450, { coll: 974, release_date: '1995-01-01', runtime: 150, genre_ids: [16, 10751, 35], vote_average: 8.3, vote_count: 20000, cert: cert('G', '0+') });
+    o.world.movies[451] = movie(451, { coll: 974, release_date: '2019-01-01', runtime: 100, genre_ids: [16, 10751, 35], vote_average: 9.5, vote_count: 20000, cert: cert('G', '0+') });
+    o.world.discover.push(451);
+    const env = makeEnv(o);
+    const r = await env.run({ time: '120', mood: 'any', company: 'kids' });
+    const got = (r.st ? r.st.rest : []).filter(it => it.c.coll === 974).map(it => it.id);
+    return { ok: !!r.st && !got.length, got: 'в финале ' + (got.join(',') || 'ничего') };
+  } },
   { id: 'F27', title: 'poster_path с кавычками не ломает разметку', fn: async () => {
     const env = await tasteEnv('/x.jpg\')" onmouseover="alert(1)" data-x="');
     const n = env.$('[onmouseover]').length;

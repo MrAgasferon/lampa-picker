@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.11.3-dev';
+  var VERSION = '0.11.4-dev';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -1749,10 +1749,13 @@
     };
     var mp = Durable.get('kpmap', {});
     each(mp, function (m) { if (m) add(m.va, m.kp, m.imdb); });
-    // Кандидаты из кеша — только те, что ещё не учтены через kpmap (кеш rating.js), иначе одно наблюдение считается дважды
+    // Кандидаты из кеша — только те, что ещё не учтены через kpmap (например, из кеша rating.js),
+    // иначе одно наблюдение считается дважды. Запись kpmap без оценок или без TMDB не считается учтённой
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
-      if (it.rt && it.c && it.rt.src === 'cache' && !mp[it.k]) add(it.c.va, it.rt.kp, it.rt.imdb);
+      var mm = mp[it.k];
+      var counted = mm && mm.va > 0 && (mm.kp > 0 || mm.imdb > 0);
+      if (it.rt && it.c && it.rt.src === 'cache' && !counted) add(it.c.va, it.rt.kp, it.rt.imdb);
     }
     var off = {};
     each(acc, function (a, k) { off[k] = (a[0] + RATE_DEF_OFF[k] * RATE_OFF_PRIOR) / (a[1] + RATE_OFF_PRIOR); });
@@ -2182,13 +2185,27 @@
       if (c && c.type === 'movie' && c.coll) (byColl[c.coll] = byColl[c.coll] || []).push(list[i]);
     }
     var colls = Object.keys(byColl);
-    if (!colls.length) return cb(list);
+    if (!colls.length) return cb(list, []);
 
     var ex = excludedKeys(events);
     var today = new Date().toISOString().slice(0, 10);
+    var kids = ans.company === 'kids';
     var drop = {};
     var additions = [];
     var left = colls.length;
+    var frLog = [];   // решения по франшизам — для журнала
+    var note = function (collId, items, next, res) {
+      frLog.push({ coll: +collId || collId, found: items.slice(0, 3).map(function (x) { return x.c && x.c.title; }), next: next ? next.title || next.name || next.id : null, res: res });
+    };
+
+    // Начало серии не подошло: взрослым поздняя часть не нужна — франшиза в этом подборе пропускается.
+    // С детьми — остаётся лучшая часть, прошедшая все проверки пула (первая могла не подойти по возрасту)
+    var rejectStart = function (kept, ad, why) {
+      stats[why] = (stats[why] || 0) + 1;
+      // Запасная часть — только когда начало не подошло детям по возрасту или содержанию (kids_*)
+      if (ad.fallback && /^kids_/.test(why)) { kept.push(ad.fallback); ad.log.res = 'fallback:' + why; }
+      else ad.log.res = 'skip:' + why;
+    };
 
     var done = function () {
       if (--left > 0) return;
@@ -2197,24 +2214,18 @@
       additions = additions.filter(function (ad) {
         var why = preReason(ad, ex, ans);
         if (!why) return true;
-        stats[why] = (stats[why] || 0) + 1;
-        if (ad.fallback) kept.push(ad.fallback);           // начало серии не подошло — остаётся лучшая часть
+        rejectStart(kept, ad, why);
         return false;
       });
-      if (!additions.length) return cb(kept);
+      if (!additions.length) return cb(kept, frLog);
       detailsMany(additions, function () {
-        var kids = ans.company === 'kids';
         for (var a = 0; a < additions.length; a++) {
           // С детьми у добавленной части нет шкал CUB и возраста КП — проверяем по строгому правилу
           var r = postReason(additions[a], ans, profileRef, kids);
-          if (r) {
-            stats[r] = (stats[r] || 0) + 1;
-            // Начало серии не подошло — оставляем лучшую часть, что прошла все проверки пула
-            if (additions[a].fallback) kept.push(additions[a].fallback);
-          }
+          if (r) rejectStart(kept, additions[a], r);
           else kept.push(additions[a]);
         }
-        cb(kept);
+        cb(kept, frLog);
       });
     };
 
@@ -2225,12 +2236,15 @@
         });
         parts.sort(function (a, b) { return a.release_date < b.release_date ? -1 : 1; });
 
-        // Следующая часть: первая, которую не смотрели (отклонённая — франшиза пропускается целиком)
-        var next = null, blocked = false;
+        // Следующая часть: первая, которую не смотрели. Просмотренное (досмотрено, история, «Уже видел») пропускаем.
+        // Отклонённая, «Смотрю» или недавно открытая из подборки — франшиза в этом подборе пропускается целиком:
+        // предлагать следующую часть рано, а ту же — не нужно
+        var next = null, blocked = '';
         for (var p = 0; p < parts.length; p++) {
           var k = keyOf('movie', parts[p].id);
-          if (ex[k] === 'rejected') { blocked = true; break; }
-          if (!ex[k]) { next = parts[p]; break; }
+          var exk = ex[k];
+          if (exk === 'rejected' || exk === 'watching' || exk === 'opened') { blocked = exk; break; }
+          if (!exk) { next = parts[p]; break; }
         }
 
         var best = items[0];
@@ -2241,20 +2255,26 @@
 
         for (var j = 0; j < items.length; j++) {
           var it = items[j];
+          // Состав коллекции неизвестен (TMDB не ответил) — остаётся лучшая из найденных частей
           var keep = !blocked && (next ? it.id === next.id : (parts.length === 0 && it === best));
           if (!keep) { drop[it.k] = true; stats.franchise = (stats.franchise || 0) + 1; }
         }
 
-        // Нужная часть не в списке — подставляем её вместо лучшего представителя франшизы
-        if (!blocked && next) {
-          if (!inList) {
-            additions.push({
-              k: keyOf('movie', next.id), id: next.id, type: 'movie', r: next,
-              // «Похож на …» относилось к другой части — не переносим
-              seedHits: 0, seeds: [], wath: false, src: 'franchise',
-              fallback: best                                  // если начало серии не пройдёт проверки
-            });
-          }
+        if (blocked) note(collId, items, null, 'blocked:' + blocked);
+        else if (!parts.length) note(collId, items, null, 'no_parts');
+        else if (!next) note(collId, items, null, 'all_watched');
+        else if (inList) note(collId, items, next, 'next_in_list');
+        else {
+          // Нужная часть не в списке — подставляем её вместо найденных частей франшизы
+          var ad = {
+            k: keyOf('movie', next.id), id: next.id, type: 'movie', r: next,
+            // «Похож на …» относилось к другой части — не переносим
+            seedHits: 0, seeds: [], wath: false, src: 'franchise',
+            fallback: kids ? best : null                     // запасная часть — только с детьми
+          };
+          note(collId, items, next, 'added');
+          ad.log = frLog[frLog.length - 1];
+          additions.push(ad);
         }
         done();
       });
@@ -2379,7 +2399,7 @@
 
         var finishPick = function () {
           scoreAll(passed, profile, ans);
-          franchiseFilter(passed, events, ans, stats, profile, function (finalList) {
+          franchiseFilter(passed, events, ans, stats, profile, function (finalList, frLog) {
           if (!alive()) return;
           var top = list.slice(0, offset);
           var wkey = scoreAll(finalList, profile, ans);
@@ -2410,7 +2430,8 @@
             profile: profileSummary(profile),
             top: finalList.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).map(journalItem),
             shadow: shadow,
-            repeats: finalList.filter(function (x) { return x.rp < 1; }).length
+            repeats: finalList.filter(function (x) { return x.rp < 1; }).length,
+            franchises: frLog && frLog.length ? frLog.slice(0, 12) : undefined
           });
           if (h.done) h.done(st);
           });
@@ -2597,6 +2618,7 @@
             it.cert || '', it.page + '/' + it.pos, short(it.reason, 34)];
         }),
         shd: e.shadow ? [e.shadow.same, e.shadow.top.map(function (x) { return short(x.title, 22); })] : undefined,
+        fr: e.franchises ? e.franchises.map(function (f) { return [short(f.next || (f.found || [])[0], 22), f.res]; }) : undefined,
         act: (e.actions || []).map(function (x) {
           var row = [x.sec, x.act];
           if (x.title) row.push(short(x.title, 22));
@@ -2651,6 +2673,8 @@
         }),
         // тень: сколько из её пятёрки совпало с показанной первой страницей, и сама пятёрка
         shd: e.shadow ? [e.shadow.same, e.shadow.top.map(function (x) { return short(x.title, 16); })] : undefined,
+        // франшизы: [часть, решение]
+        fr: e.franchises ? e.franchises.map(function (f) { return [short(f.next || (f.found || [])[0], 16), f.res]; }) : undefined,
         act: (e.actions || []).map(function (x) {
           var row = [x.sec, x.act];
           if (x.title) row.push(short(x.title, 18));
