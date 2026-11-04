@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.12.0';
+  var VERSION = '0.13.0';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -1033,6 +1033,7 @@
     return v.percent >= 85 || (v.duration - v.time) <= 600;
   }
 
+  var SHORT_MIN = 15;            // фильмы короче, минут, не предлагаем
   var STARTED_FRESH = 14 * DAY;  // начатое на 1–20 % свежее этого — ещё не «брошено»
   var SEEN_STALE_MAX = 200;      // столько «лишних» дат в picker_seen терпим без чистки
   var SEEN_MIN_LISTED = 20;      // ...и чистим, только если списки Lampa явно загрузились
@@ -1345,7 +1346,9 @@
       if (!profile.yearFloor || oldFloor > profile.yearFloor) { profile.yearFloor = oldFloor; profile.yearFloorBy = 'rejects'; }
     }
 
-    var seeds = events.filter(function (e) { return e.s > 0.25; });
+    // Опорные — только то, что вы видели и оценили: «Нравится» и просмотренное (список «Просмотрено» или досмотрено).
+    // Открытое из подборки, закладки и «Позже» влияют на вкус, но «Похож на …» по ним не строим — фильм вы ещё не видели
+    var seeds = events.filter(function (e) { return e.s > 0.25 && e.flags && (e.flags.like || e.flags.viewed); });
     seeds.sort(function (a, b) { return b.s * decay(b.date) - a.s * decay(a.date); });
     // Пачка отметок не занимает все опорные места
     var seedMax = 15, batchMax = Math.round(seedMax * SEED_BATCH_SHARE), nb = 0, picked = [];
@@ -1684,6 +1687,8 @@
       if (c.runtime && c.runtime > 60) return 'too_long';
     }
 
+    // Короткометражки на 3–14 минут — не просмотр на вечер (сериалы не трогаем: у них длительность серии)
+    if (c.type === 'movie' && c.runtime && c.runtime < SHORT_MIN) return 'too_short';
     if (c.type === 'movie' && c.runtime && c.runtime <= 45 && (c.vc || 0) < 150) return 'votes';
 
     if (ans.company !== 'kids' && kidsTargeted(c, profile)) return 'kids_content';
@@ -1905,6 +1910,20 @@
     return String(v);
   }
 
+  // 1 голос, 2 голоса, 5 голосов, 21 голос; «тыс.» — всегда «голосов»
+  function votesText(v) {
+    v = v || 0;
+    if (v >= 1000) return formatVotes(v) + ' голосов';
+    var n10 = v % 10, n100 = v % 100;
+    var word = n10 === 1 && n100 !== 11 ? 'голос' : (n10 >= 2 && n10 <= 4 && (n100 < 12 || n100 > 14) ? 'голоса' : 'голосов');
+    return v + ' ' + word;
+  }
+
+  function rating1(x) { return x.toFixed(1).replace('.', ','); }
+
+  var HIGH_RATING = 7.0;   // ниже «Высокий рейтинг» звучит странно — ищем другое объяснение
+  var HIGH_KP = 7.5;       // «Высоко на Кинопоиске» — как и в основной причине про КП
+
   var MOOD_REASON = {
     relax: 'под «Расслабиться»', laugh: 'чтобы посмеяться', nerves: 'чтобы пощекотать нервы',
     think: 'чтобы подумать', surprise: 'что-то непривычное'
@@ -1982,9 +2001,29 @@
         var mr = moodReason(c, ans);
         if (mr) return mr;
       }
-      if (k === 'q' && parts.r) return 'Высокий рейтинг: ' + parts.r.toFixed(1) + ', ' + formatVotes(c.vc) + ' голосов';
-      if (k === 'n' && c.genres.length) return 'Что-то новое: ' + (GENRE_NAMES[c.genres[0]] || '').toLowerCase();
+      if (k === 'q' && parts.r) {
+        // Рейтинг — объяснение, только если он и правда высокий (на TMDB или на Кинопоиске).
+        // TMDB 8,8 при КП 6,5 — не «высокий»: свежие фильмы TMDB завышает
+        var kpLow = it.kp > 0 && it.kp < HIGH_RATING;
+        if (parts.r >= HIGH_RATING && !kpLow) return 'Высокий рейтинг: ' + rating1(parts.r) + ', ' + votesText(c.vc);
+        if (it.kp >= HIGH_KP) return 'Высоко на Кинопоиске: ' + rating1(it.kp);
+      }
+      if (k === 'n' && parts.n > 0) {
+        // Называем жанр, который и правда новый для вас, — не первый попавшийся
+        var ng = null, recentG = profile.recentGenres || [];
+        for (var ni = 0; ni < c.genres.length && !ng; ni++) if (recentG.indexOf(c.genres[ni]) < 0 && GENRE_NAMES[c.genres[ni]]) ng = c.genres[ni];
+        if (ng) return 'Что-то новое: ' + GENRE_NAMES[ng].toLowerCase();
+      }
     }
+    // Сильного объяснения нет: жанры под настроение, иначе самый близкий вкусу жанр
+    var mr2 = moodReason(c, ans);
+    if (mr2) return mr2;
+    var gw = (profile.f && profile.f.genre) || {}, bestG = null;
+    for (var gi = 0; gi < c.genres.length; gi++) {
+      var gv = gw[c.genres[gi]];
+      if (GENRE_NAMES[c.genres[gi]] && typeof gv === 'number' && gv > 0 && (!bestG || gv > gw[bestG])) bestG = c.genres[gi];
+    }
+    if (bestG) return 'Ваш жанр: ' + GENRE_NAMES[bestG].toLowerCase();
     return '';
   }
 
@@ -2094,26 +2133,37 @@
     return h >>> 0;
   }
 
-  // Показанное сегодня. Новый день — новый список
-  var REPEAT_MULT = 0.85;   // показанное сегодня без действий при новом подборе — чуть ниже
+  // Показанное сегодня: ключ → сколько раз показан. Новый день — новый список
+  var REPEAT_MULT = 0.85;   // за каждый показ сегодня без действий — ещё ×0,85…
+  var REPEAT_MIN = 0.6;     // …но не ниже: сильный фильм может вернуться наверх, а завтра штраф снимается
   function shownToday() {
     var sd = store('shown_day', null);
     return sd && sd.d === todaySeed() && sd.k ? sd.k : {};
   }
+  // Каждый подбор отмечает показанные карточки один раз (страница отмечается при первом показе, см. state.logged)
   function markShownToday(items) {
     var map = shownToday(), n = 0;
-    for (var i = 0; i < items.length; i++) if (items[i] && items[i].k && !map[items[i].k]) { map[items[i].k] = 1; n++; }
+    for (var i = 0; i < items.length; i++) {
+      var k = items[i] && items[i].k;
+      if (!k) continue;
+      map[k] = (typeof map[k] === 'number' ? map[k] : 0) + 1;
+      n++;
+    }
     if (n) save('shown_day', { d: todaySeed(), k: map });
+  }
+  function repeatMult(times) {
+    if (!(times > 0)) return 1;
+    return Math.max(REPEAT_MIN, Math.pow(REPEAT_MULT, times));
   }
 
   // Разброс ×0,92…1,08 привязан к фильму и дню: в течение дня у фильма тот же множитель, где бы он ни стоял.
-  // Показанное сегодня (без «Открыть», «Не то», «Уже видел» — те и так скрыты) — ×REPEAT_MULT
+  // Показанное сегодня (без «Открыть», «Не то», «Уже видел» — те и так скрыты) — ×0,85 за каждый показ, не ниже ×0,6
   function jitter(items) {
     var day = todaySeed(), seenToday = shownToday();
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
       it.jmul = 0.92 + 0.16 * rng(day ^ strSeed(it.k))();
-      it.rp = seenToday[it.k] ? REPEAT_MULT : 1;
+      it.rp = repeatMult(seenToday[it.k]);
       it.jscore = it.score * it.jmul * it.rp;
     }
     items.sort(function (a, b) { return b.jscore - a.jscore; });
@@ -2290,16 +2340,22 @@
   function cancelRun() { runToken++; }
 
   // h: { stage(text), done(state) }
-  var RUN_WATCHDOG = 45000;
+  // Сторож подбора: на медленной сети ждём, пока данные идут, но не вечно
+  var RUN_SILENCE = 20000;     // ни одного ответа TMDB и ни одного нового этапа столько — сдаёмся
+  var RUN_HARD_LIMIT = 90000;  // общий предел подбора
+  var DETAILS_SOFT = 25000;    // после этого детали больше не догружаем, если кандидатов уже хватает…
+  var DETAILS_MIN_OK = 10;     // …столько прошедших фильтры
 
   function run(ans, h) {
     h = h || {};
     var token = ++runToken;
     var alive = function () { return token === runToken; };
-    var stage = function (t) { if (h.stage && alive()) h.stage(t); };
     var started = now();
+    var lastProgress = started, lastOks = Net.oks;
+    var poke = function () { lastProgress = now(); };
+    var stage = function (t) { poke(); if (h.stage && alive()) h.stage(t); };
     var tm = {};                                     // время этапов, мс — для журнала
-    var mark = function (k) { tm[k] = now() - started; };
+    var mark = function (k) { poke(); tm[k] = now() - started; };
     var net0 = { ok: Net.oks, fail: Net.netFails };
 
     // Сторож: подбор не может висеть бесконечно
@@ -2311,10 +2367,17 @@
       log('run failed', kind);
       if (h.error) h.error(kind);
     };
-    setTimeout(function () {
-      // Запросы только падали и ни один не прошёл — это связь, а не «долго»
-      fail(Net.netFails > net0.fail && Net.oks === net0.ok ? 'net' : 'timeout');
-    }, RUN_WATCHDOG);
+    // Каждую секунду: пришёл ли ответ TMDB или начался новый этап. Тишина 20 с или 90 с всего — ошибка
+    var watchdog = setInterval(function () {
+      if (finished || !alive()) { clearInterval(watchdog); return; }
+      if (Net.oks !== lastOks) { lastOks = Net.oks; poke(); }
+      var t = now();
+      if (t - lastProgress > RUN_SILENCE || t - started > RUN_HARD_LIMIT) {
+        clearInterval(watchdog);
+        // Запросы только падали и ни один не прошёл — это связь, а не «долго»
+        fail(Net.netFails > net0.fail && Net.oks === net0.ok ? 'net' : 'timeout');
+      }
+    }, 1000);
 
     save('last_answers', ans);
     stage('Изучаю вашу историю');
@@ -2347,6 +2410,7 @@
         var BATCH = 30, WANT = 30, MAX_DETAILED = strict ? 150 : 90;
         var passed = [];
         var offset = 0;
+        var detailsCut = false;   // медленная сеть: остановились раньше, кандидатов хватало
 
         var nextBatch = function () {
           if (!alive()) return;
@@ -2360,7 +2424,10 @@
               if (r) stats[r] = (stats[r] || 0) + 1;
               else passed.push(batch[b]);
             }
-            if (passed.length < WANT && offset < list.length && offset < MAX_DETAILED) nextBatch();
+            var more = passed.length < WANT && offset < list.length && offset < MAX_DETAILED;
+            // Сеть медленная, а кандидатов уже достаточно — подбираем из того, что есть
+            if (more && now() - started > DETAILS_SOFT && passed.length >= DETAILS_MIN_OK) { more = false; detailsCut = true; }
+            if (more) nextBatch();
             else afterDetails();
           });
         };
@@ -2431,7 +2498,8 @@
             top: finalList.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).map(journalItem),
             shadow: shadow,
             repeats: finalList.filter(function (x) { return x.rp < 1; }).length,
-            franchises: frLog && frLog.length ? frLog.slice(0, 12) : undefined
+            franchises: frLog && frLog.length ? frLog.slice(0, 30) : undefined,
+            detailsCut: detailsCut || undefined
           });
           if (h.done) h.done(st);
           });
@@ -2466,8 +2534,12 @@
       kp: it.kp || null,
       imdb: it.imdbR || null,
       rsrc: it.rt ? it.rt.src : null,
+      kpProbe: it.kp || it.imdbR ? undefined : (it.kpProbe || undefined),
+      // Почему нет оценки КП/IMDb: not_found, no_rating, cached_miss, cached_no_rating, deadline, run_budget, daily_limit, blocked,
+      // paused, offline, no_key, net, http_NNN; not_requested — не среди финалистов, спрашивали только кеш
+      kpMiss: it.kp || it.imdbR ? undefined : (it.kpMiss || 'not_requested'),
       rc: round3(p.rc), rb: round3(p.rb), d: p.d === 1 || p.d === undefined ? undefined : round3(p.d),
-      rp: it.rp && it.rp < 1 ? it.rp : undefined,
+      rp: it.rp && it.rp < 1 ? round3(it.rp) : undefined,
       score: round3(it.score),
       q: round3(p.q), a: round3(p.a), an: round3(p.an), m: round3(p.m), n: round3(p.n), s: round3(p.s), f: round3(p.f), y: round3(p.y),
       src: it.src || null,
@@ -2490,6 +2562,20 @@
       var label = names ? (names(x[0]) || x[0]) : x[0];
       return label + ' ' + (Math.round(x[1] * 100) / 100);
     });
+  }
+
+  // Карточки без оценки КП для сжатых форматов: [название, причина, IMDb (e — пусто), вариантов в поиске, первые два «тип год»]
+  function kpMissRows(shown, short) {
+    var rows = [];
+    (shown || []).forEach(function (it) {
+      if (it.kp || it.imdb || !it.kpMiss || it.kpMiss === 'not_requested') return;
+      var p = it.kpProbe;
+      var im = p ? (p.imdb === 'empty' ? 'e' : p.imdb) : null;
+      if (p && p.found) rows.push([short(it.title, 16), it.kpMiss, im, 'id' + p.found, (p.type || '?') + ' ' + (p.year || '?') + ' ' + short(p.name, 14)]);
+      else rows.push([short(it.title, 16), it.kpMiss].concat(p ? [im, p.total,
+        (p.top || []).slice(0, 2).map(function (x) { return (x[0] || '?').replace('TV_SERIES', 'TVS').replace('MINI_SERIES', 'MS') + ' ' + (x[1] || '?'); }).join('|')] : []));
+    });
+    return rows.length ? rows.slice(0, 8) : undefined;
   }
 
   function profileSummary(profile) {
@@ -2558,7 +2644,11 @@
     rating: function (entry, it) {
       if (!entry) return;
       for (var i = 0; i < entry.shown.length; i++) {
-        if (entry.shown[i].k === it.k) { entry.shown[i].kp = it.kp || null; entry.shown[i].imdb = it.imdbR || null; }
+        if (entry.shown[i].k === it.k) {
+          entry.shown[i].kp = it.kp || null; entry.shown[i].imdb = it.imdbR || null;
+          entry.shown[i].kpMiss = it.kp || it.imdbR ? undefined : (it.kpMiss || entry.shown[i].kpMiss);
+          entry.shown[i].kpProbe = it.kp || it.imdbR ? undefined : (it.kpProbe || entry.shown[i].kpProbe);
+        }
       }
       this.saveEntry(entry);
     },
@@ -2586,7 +2676,7 @@
         if (it.anim) f += 'A';
         if (it.wath) f += 'W';
         if (it.coll) f += 'C';
-        if (it.rp) f += 'R';
+        if (it.rp) f += 'R' + Math.round(it.rp * 100);
         if (it.d) f += 'D' + Math.round(it.d * 100);
         return f;
       };
@@ -2619,6 +2709,7 @@
         }),
         shd: e.shadow ? [e.shadow.same, e.shadow.top.map(function (x) { return short(x.title, 22); })] : undefined,
         fr: e.franchises ? e.franchises.map(function (f) { return [short(f.next || (f.found || [])[0], 22), f.res]; }) : undefined,
+        km: kpMissRows(e.shown, short),
         act: (e.actions || []).map(function (x) {
           var row = [x.sec, x.act];
           if (x.title) row.push(short(x.title, 22));
@@ -2664,7 +2755,7 @@
         // название, год, тип+источник, флаги, score, q, an, m, n, s, f, y (×100), tmdb/kp/imdb (×10), голоса, cert, стр/поз[, причина]
         sh: (e.shown || []).map(function (it) {
           var row = [short(it.title, 24), it.year, (it.k || '').charAt(0) + String(it.src || '').charAt(0),
-            (it.anim ? 'A' : '') + (it.wath ? 'W' : '') + (it.coll ? 'C' : '') + (it.rp ? 'R' : '') + (it.d ? 'D' + Math.round(it.d * 100) : ''),
+            (it.anim ? 'A' : '') + (it.wath ? 'W' : '') + (it.coll ? 'C' : '') + (it.rp ? 'R' + Math.round(it.rp * 100) : '') + (it.d ? 'D' + Math.round(it.d * 100) : ''),
             i100(it.score), i100(it.q), i100(it.an), i100(it.m), i100(it.n), i100(it.s), i100(it.f), i100(it.y),
             i100((it.tmdb || 0) / 10), i100((it.kp || 0) / 10), i100((it.imdb || 0) / 10), it.votes || 0,
             it.cert || '', it.page + '/' + it.pos];
@@ -2675,6 +2766,8 @@
         shd: e.shadow ? [e.shadow.same, e.shadow.top.map(function (x) { return short(x.title, 16); })] : undefined,
         // франшизы: [часть, решение]
         fr: e.franchises ? e.franchises.map(function (f) { return [short(f.next || (f.found || [])[0], 16), f.res]; }) : undefined,
+        // без оценки КП: см. kpMissRows
+        km: kpMissRows(e.shown, short),
         act: (e.actions || []).map(function (x) {
           var row = [x.sec, x.act];
           if (x.title) row.push(short(x.title, 18));
@@ -2952,6 +3045,19 @@
     return !q.blocked && q.n < kpLimit() && !(ctx && q.n >= ctx.cap);
   }
 
+  // Почему сейчас нельзя спросить КП — для журнала (пусто — можно)
+  function kpWhyNot(ctx) {
+    if (!kpKey()) return 'no_key';
+    if (kpOffline()) return 'offline';
+    if (kpPauseUntil > now()) return 'paused';
+    if (ctx && ctx.done) return 'deadline';
+    var q = kpQuota();
+    if (q.blocked) return 'blocked';
+    if (q.n >= kpLimit()) return 'daily_limit';
+    if (ctx && q.n >= ctx.cap) return 'run_budget';
+    return '';
+  }
+
   function kpSpend(ctx) {
     if (!kpCan(ctx)) return false;
     var q = kpQuota();
@@ -2976,7 +3082,7 @@
       // 429 — лимит запросов в секунду, а не суточная квота: короткая пауза, а не блок до конца дня
       if (status === 429) kpPause();
       else if (status === 401 || status === 402 || status === 403) kpBlock(status);
-      cb(null);
+      cb(null, status > 0 ? 'http_' + status : 'net');
     };
   }
 
@@ -2998,6 +3104,14 @@
 
   function kpHeaders() { return { headers: { 'X-API-KEY': kpKey() } }; }
 
+  var KP_YEAR_SLACK = 3;   // ±лет при совпадении названия
+  var KP_MATCH_V = 2;      // версия сопоставления: «не найден» от прежней версии переспрашиваем один раз
+
+  // Название для сравнения: без регистра, знаков и «ё»
+  function normTitle(t) {
+    return String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, '');
+  }
+
   function fetchRatings(it, cb, ctx) {
     var c = it.c;
     var cached = c.type === 'tv' ? null : kpCache()[c.id];   // см. cachedRatings: ключ без типа
@@ -3007,7 +3121,18 @@
 
     var map = Durable.get('kpmap', {});
     var m = map[it.k];
-    if (m && now() - m.t < 14 * DAY) return cb(m.kp || m.imdb ? { kp: m.kp, imdb: m.imdb, src: 'cache' } : null);
+    // Второй аргумент cb — почему оценки нет (для журнала)
+    // «Не найден» из старых версий (без записи, что ответил КП) переспрашиваем один раз — ради диагностики
+    var legacyMiss = m && !m.kp && !m.imdb && !m.id && (!m.probe || (m.probe.total > 0 && m.mv !== KP_MATCH_V));
+    // Фильм на КП найден, но оценку ещё не спрашивали: запись от «С детьми» (возраст) или из старой версии
+    // без отметки r — сразу за оценкой по id
+    // …или «нашёлся без оценки» от прежней версии (оценку брали из списка по IMDb, а не из карточки) — тоже по id, один раз
+    var ageOnly = m && !m.kp && !m.imdb && m.id && (!m.r || m.mv !== KP_MATCH_V);
+    if (m && now() - m.t < 14 * DAY && !legacyMiss && !ageOnly) {
+      if (m.kp || m.imdb) return cb({ kp: m.kp, imdb: m.imdb, src: 'cache' });
+      if (m.probe) it.kpProbe = m.probe;
+      return cb(null, m.id ? 'cached_no_rating' : 'cached_miss');   // нашёлся без оценки / не нашёлся
+    }
 
 
     var finish = function (kp, imdb, kpId, age) {
@@ -3015,9 +3140,10 @@
       imdb = parseFloat(imdb) || 0;
       var mp = Durable.get('kpmap', {});
       var prev = mp[it.k];
-      mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now(), va: c.va || 0 };
+      mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now(), va: c.va || 0, r: 1, mv: KP_MATCH_V };   // r — оценку спрашивали
       if (typeof age === 'number') mp[it.k].age = age;
       else if (prev && typeof prev.age === 'number' && prev.id === mp[it.k].id) mp[it.k].age = prev.age;
+      if (!kp && !imdb && it.kpProbe) mp[it.k].probe = it.kpProbe;   // что ответил КП — до следующей проверки
       var keys = Object.keys(mp);
       if (keys.length > 1500) {
         keys.sort(function (a, b) { return mp[a].t - mp[b].t; });
@@ -3027,18 +3153,26 @@
       if (kp || imdb) {
         if (c.type !== 'tv') writeKpCache(c.id, { kp: kp, imdb: imdb, timestamp: now() });
         cb({ kp: kp, imdb: imdb, src: 'net' });
-      } else cb(null);
+      } else cb(null, kpId ? 'no_rating' : 'not_found');
     };
 
+    var imdbRes = '';   // что ответил поиск по IMDb-номеру — для журнала
+
     var byId = function (kpId) {
-      if (!kpCan(ctx)) return cb(null);
+      if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
       KpNet.get(KP_API + 'api/v2.2/films/' + kpId, function (j) {
+        if (j && !(parseFloat(j.ratingKinopoisk) > 0 || parseFloat(j.ratingImdb) > 0)) {
+          // Для журнала: какой фильм КП сопоставил — вдруг не тот (короткометражка, видео с тем же названием)
+          it.kpProbe = { imdb: imdbRes || (c.imdb ? 'skip' : 'none'), found: kpId, type: String(j.type || ''), year: String(j.year || ''),
+            name: String(j.nameRu || j.nameOriginal || j.nameEn || '').slice(0, 30), votes: j.ratingKinopoiskVoteCount || 0 };
+        }
         finish(j && j.ratingKinopoisk, j && j.ratingImdb, kpId, kpAgeOf(j));
       }, kpFail(cb), kpHeaders(), ctx);
     };
 
     var byTitle = function () {
-      if (!c.title || !kpCan(ctx)) return cb(null);
+      if (!c.title) return cb(null, 'not_found');
+      if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
       KpNet.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(c.original || c.title), function (j) {
         var films = (j && j.films) || [];
         var y = parseInt(c.year, 10);
@@ -3049,28 +3183,43 @@
           var isTv = /SERIES|TV_SHOW/.test(ft);
           return c.type === 'tv' ? isTv : !isTv;
         };
-        var pick = function (tol) {
+        // Год на КП бывает годом производства, а на TMDB — годом проката («Связь»: КП 2012, TMDB 2014).
+        // Поэтому при совпадении названия допускаем разницу до 3 лет
+        var nameOk = function (f) {
+          return (c.original && normTitle(f.nameEn) === normTitle(c.original)) || (c.title && normTitle(f.nameRu) === normTitle(c.title));
+        };
+        var pick = function (tol, needName) {
           for (var i = 0; i < films.length; i++) {
             if (!typeOk(films[i])) continue;
+            if (needName && !nameOk(films[i])) continue;
             var fy = parseInt(films[i].year, 10);
             if (!y || (!isNaN(fy) && Math.abs(fy - y) <= tol)) return films[i];
           }
           return null;
         };
-        var hit = pick(0) || pick(1);
+        var hit = pick(0) || pick(1) || pick(KP_YEAR_SLACK, true);
         if (hit) return byId(hit.filmId);
+        // Для журнала: что вернул поиск (до 5 вариантов: тип, год, название) — чтобы понять, почему не совпало
+        it.kpProbe = {
+          imdb: c.imdb ? imdbRes : 'none', q: String(c.original || c.title).slice(0, 40), year: y || null, total: films.length,
+          top: films.slice(0, 5).map(function (f) { return [String(f.type || ''), String(f.year || ''), String(f.nameRu || f.nameEn || '').slice(0, 30)]; })
+        };
         finish(0, 0, null);
       }, kpFail(cb), kpHeaders(), ctx);
     };
 
+    if (ageOnly) return byId(m.id);   // фильм на КП уже найден — сразу за оценкой
     if (c.imdb) {
-      if (!kpCan(ctx)) return cb(null);
+      if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
       KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
         var x = j && j.items && j.items[0];
-        if (x) finish(x.ratingKinopoisk, x.ratingImdb, x.kinopoiskId);
-        else byTitle();
+        // Список по IMDb-номеру иногда отдаёт фильм без оценок, хотя у карточки КП они есть — переспрашиваем по id
+        if (x && !(parseFloat(x.ratingKinopoisk) > 0 || parseFloat(x.ratingImdb) > 0) && x.kinopoiskId) { imdbRes = 'item_no_rating'; byId(x.kinopoiskId); }
+        else if (x) finish(x.ratingKinopoisk, x.ratingImdb, x.kinopoiskId);
+        else { imdbRes = 'empty'; byTitle(); }
       }, function (status) {
         if (status === 401 || status === 402 || status === 403 || status === 429 || status <= 0) return kpFail(cb)(status);
+        imdbRes = 'http_' + status;
         byTitle();
       }, kpHeaders(), ctx);
     } else byTitle();
@@ -3151,19 +3300,22 @@
   var KP_RUN_BUDGET_BUILTIN = 12, KP_RUN_BUDGET_PERSONAL = 40;
 
   function attachRatings(list, cb) {
-    var fired = false;
+    var fired = false, timedOut = false;
     var ctx = kpContext();
+    var todo = list.slice().sort(function (a, b) { return b.score - a.score; })
+      .slice(0, KP_FINALISTS).filter(function (it) { return it.c && !it.rt && !it.kpTried; });
     var finish = function () {
       if (fired) return;
       fired = true;
+      // Кого не успели или не смогли спросить — причина в журнал
+      var why = timedOut ? 'deadline' : (kpWhyNot(ctx) || 'deadline');
+      for (var t = 0; t < todo.length; t++) if (!todo[t].rt && !todo[t].kpMiss) todo[t].kpMiss = why;
       ctx.done = true;
       KpNet.dropCtx(ctx);        // не дождались — не тратим квоту на хвост; чужие задания не трогаем
       cb();
     };
-    var todo = list.slice().sort(function (a, b) { return b.score - a.score; })
-      .slice(0, KP_FINALISTS).filter(function (it) { return it.c && !it.rt && !it.kpTried; });
     if (!todo.length || !kpCan(ctx)) return finish();
-    setTimeout(finish, KP_DEADLINE);
+    setTimeout(function () { timedOut = true; finish(); }, KP_DEADLINE);
     // По очереди от лучшего к худшему, по 3 фильма одновременно: бюджет уходит на верх списка целиком
     var idx = 0, running = 0;
     var next = function () {
@@ -3173,12 +3325,13 @@
         (function (it) {
           running++;
           it.kpTried = true;
-          fetchRatings(it, function (r) {
+          fetchRatings(it, function (r, why) {
             if (r) {
               it.rt = { kp: r.kp || 0, imdb: r.imdb || 0, src: r.src || 'net' };
               if (r.kp) it.kp = r.kp;
               if (r.imdb) it.imdbR = r.imdb;
-            }
+              it.kpMiss = null;
+            } else if (!fired) it.kpMiss = why || 'not_found';
             running--;
             next();
           }, ctx);
@@ -4208,8 +4361,13 @@
             var cr = x.c ? cachedRatings(x.c, x.k) : null;
             cb(cr ? { kp: cr.kp, imdb: cr.imdb, src: 'cache' } : null);
           } : fetchRatings;
-          getR(it, function (r) {
-            if (!r) return;
+          getR(it, function (r, why) {
+            if (!r) {
+              // «не найден» из кеша — следствие того же поиска: исходную причину подбора не затираем
+              if (why && !it.kp && !it.imdbR && !(why === 'cached_miss' && it.kpMiss)) { it.kpMiss = why; Journal.rating(state.journal, it); }
+              return;
+            }
+            it.kpMiss = null;
             it.kp = r.kp || it.kp || 0;
             it.imdbR = r.imdb || it.imdbR || 0;
             Journal.rating(state.journal, it);
