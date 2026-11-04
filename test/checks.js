@@ -781,6 +781,34 @@ const CHECKS = [
     const a = pk.reasonOf(mk(7.1), parts, w, prof, ans), b = pk.reasonOf(mk(7.8), parts, w, prof, ans);
     return { ok: !/Кинопоиске/.test(a) && b === 'Высоко на Кинопоиске: 7,8', got: 'КП 7,1 → «' + a + '»; КП 7,8 → «' + b + '»' };
   } },
+  { id: 'P7a', title: 'Причина: TMDB 8,8 при КП 6,5 — не «Высокий рейтинг»', fn: async () => {
+    const { pk } = makeEnv();
+    const it = { k: 'movie:1', kp: 6.5, c: { type: 'movie', title: 'X', genres: [80, 28], va: 8.8, vc: 974, dir: [], cast: [], names: {} }, src: 'disc', srcs: { disc: true }, seedHits: 0, seeds: [] };
+    const r = pk.reasonOf(it, { best: null, rb: -0.9, s: 0, a: 0.5, q: 0.9, n: 0, m: 0.8, r: 8.8 }, { q: 0.3, a: 0.35, m: 0.2, n: 0.05, s: 0.1 }, { f: { genre: {} }, names: {} }, { mood: 'nerves', company: 'solo' });
+    return { ok: !/^Высокий рейтинг/.test(r), got: r };
+  } },
+  { id: 'P7b', title: 'Причина «Что-то новое» называет новый для вас жанр, а не первый', fn: async () => {
+    const { pk } = makeEnv();
+    const it = { k: 'movie:1', c: { type: 'movie', title: 'X', genres: [80, 28, 18], va: 6.8, vc: 2000, dir: [], cast: [], names: {} }, src: 'disc', srcs: { disc: true }, seedHits: 0, seeds: [] };
+    const prof = { f: { genre: { 80: 0.45 } }, names: {}, recentGenres: [80, 18] };
+    const r = pk.reasonOf(it, { best: null, rb: 0, s: 0, a: 0.5, q: 0.4, n: 0.15, m: 0.6, r: 6.8 }, { q: 0.3, a: 0.35, m: 0.2, n: 0.05, s: 0.1 }, prof, { mood: 'any', company: 'solo' });
+    return { ok: r === 'Что-то новое: боевик', got: r };
+  } },
+  { id: 'P3f', title: 'LPJ2: у карточки без оценки КП есть причина и ответ КП (km)', fn: async () => {
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        if (url.indexOf('imdbId=') > -1) return { body: { items: [] } };
+        if (url.indexOf('search-by-keyword') > -1) return { body: { films: [{ filmId: 9, type: 'FILM', year: '2012', nameRu: 'Связь' }] } };
+      }
+      return def(url);
+    };
+    const env = makeEnv(Object.assign(baseWorld(), { kp: true, router }));
+    const r = await env.run(ANY);
+    env.pk.Journal.shown(r.st.journal, env.pk.nextPage(r.st, 5), 1);
+    const o = env.pk.Journal.compactEntry(env.pk.Journal.list().slice(-1)[0], true, null).o;
+    const row = (o.km || [])[0];
+    return { ok: !!row && row[1] === 'not_found' && row[2] === 'e' && row[3] === 1 && row[4] === 'FILM 2012', got: JSON.stringify(o.km) };
+  } },
   { id: 'F27', title: 'poster_path с кавычками не ломает разметку', fn: async () => {
     const env = await tasteEnv('/x.jpg\')" onmouseover="alert(1)" data-x="');
     const n = env.$('[onmouseover]').length;

@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.12.2-dev';
+  var VERSION = '0.12.3-dev';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -2000,11 +2000,18 @@
         if (mr) return mr;
       }
       if (k === 'q' && parts.r) {
-        // Рейтинг — объяснение, только если он и правда высокий (на TMDB или на Кинопоиске)
-        if (parts.r >= HIGH_RATING) return 'Высокий рейтинг: ' + rating1(parts.r) + ', ' + votesText(c.vc);
+        // Рейтинг — объяснение, только если он и правда высокий (на TMDB или на Кинопоиске).
+        // TMDB 8,8 при КП 6,5 — не «высокий»: свежие фильмы TMDB завышает
+        var kpLow = it.kp > 0 && it.kp < HIGH_RATING;
+        if (parts.r >= HIGH_RATING && !kpLow) return 'Высокий рейтинг: ' + rating1(parts.r) + ', ' + votesText(c.vc);
         if (it.kp >= HIGH_KP) return 'Высоко на Кинопоиске: ' + rating1(it.kp);
       }
-      if (k === 'n' && parts.n > 0 && c.genres.length) return 'Что-то новое: ' + (GENRE_NAMES[c.genres[0]] || '').toLowerCase();
+      if (k === 'n' && parts.n > 0) {
+        // Называем жанр, который и правда новый для вас, — не первый попавшийся
+        var ng = null, recentG = profile.recentGenres || [];
+        for (var ni = 0; ni < c.genres.length && !ng; ni++) if (recentG.indexOf(c.genres[ni]) < 0 && GENRE_NAMES[c.genres[ni]]) ng = c.genres[ni];
+        if (ng) return 'Что-то новое: ' + GENRE_NAMES[ng].toLowerCase();
+      }
     }
     // Сильного объяснения нет: жанры под настроение, иначе самый близкий вкусу жанр
     var mr2 = moodReason(c, ans);
@@ -2555,6 +2562,18 @@
     });
   }
 
+  // Карточки без оценки КП для сжатых форматов: [название, причина, IMDb (e — пусто), вариантов в поиске, первые два «тип год»]
+  function kpMissRows(shown, short) {
+    var rows = [];
+    (shown || []).forEach(function (it) {
+      if (it.kp || it.imdb || !it.kpMiss || it.kpMiss === 'not_requested') return;
+      var p = it.kpProbe;
+      rows.push([short(it.title, 16), it.kpMiss].concat(p ? [p.imdb === 'empty' ? 'e' : p.imdb, p.total,
+        (p.top || []).slice(0, 2).map(function (x) { return (x[0] || '?').replace('TV_SERIES', 'TVS').replace('MINI_SERIES', 'MS') + ' ' + (x[1] || '?'); }).join('|')] : []));
+    });
+    return rows.length ? rows.slice(0, 8) : undefined;
+  }
+
   function profileSummary(profile) {
     return {
       events: profile.n,
@@ -2685,6 +2704,7 @@
         }),
         shd: e.shadow ? [e.shadow.same, e.shadow.top.map(function (x) { return short(x.title, 22); })] : undefined,
         fr: e.franchises ? e.franchises.map(function (f) { return [short(f.next || (f.found || [])[0], 22), f.res]; }) : undefined,
+        km: kpMissRows(e.shown, short),
         act: (e.actions || []).map(function (x) {
           var row = [x.sec, x.act];
           if (x.title) row.push(short(x.title, 22));
@@ -2741,6 +2761,8 @@
         shd: e.shadow ? [e.shadow.same, e.shadow.top.map(function (x) { return short(x.title, 16); })] : undefined,
         // франшизы: [часть, решение]
         fr: e.franchises ? e.franchises.map(function (f) { return [short(f.next || (f.found || [])[0], 16), f.res]; }) : undefined,
+        // без оценки КП: см. kpMissRows
+        km: kpMissRows(e.shown, short),
         act: (e.actions || []).map(function (x) {
           var row = [x.sec, x.act];
           if (x.title) row.push(short(x.title, 18));
