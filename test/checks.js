@@ -648,6 +648,87 @@ const CHECKS = [
     const got = (r.st ? r.st.rest : []).filter(it => it.c.coll === 974).map(it => it.id);
     return { ok: !!r.st && !got.length, got: 'в финале ' + (got.join(',') || 'ничего') };
   } },
+  // ------------------------------------------------------------------ 0.12.1: остаток P2
+  { id: 'P1', title: 'Повторы: ×0,85 за каждый показ сегодня, не ниже ×0,6; счётчик растёт с каждым подбором', fn: async () => {
+    const env = makeEnv(baseWorld());
+    env.storage.picker_shown_day = { d: env.pk.todaySeed(), k: { 'movie:300': 2, 'movie:302': 5 } };
+    const r = await env.run(ANY);
+    const rp = k => { const x = r.st.rest.find(it => it.k === k); return x ? Math.round(x.rp * 10000) / 10000 : 'нет'; };
+    env.pk.markShownToday([{ k: 'movie:777' }]); env.pk.markShownToday([{ k: 'movie:777' }]);
+    const cnt = env.pk.shownToday()['movie:777'];
+    const ok = rp('movie:300') === 0.7225 && rp('movie:302') === 0.6 && cnt === 2;
+    return { ok, got: '2 показа ×' + rp('movie:300') + ', 5 показов ×' + rp('movie:302') + ', счётчик после двух подборов ' + cnt };
+  } },
+  { id: 'P2a', title: 'Склонение: 1 голос, 2 голоса, 11 голосов, 21 голос, 322 голоса, 5 тыс. голосов', fn: async () => {
+    const { pk } = makeEnv();
+    const got = [1, 2, 11, 21, 322, 5000].map(pk.votesText).join(', ');
+    return { ok: got === '1 голос, 2 голоса, 11 голосов, 21 голос, 322 голоса, 5 тыс. голосов', got };
+  } },
+  { id: 'P2b', title: 'Причина: «Высокий рейтинг» только от 7,0; у среднего фильма — жанр под настроение', fn: async () => {
+    const { pk } = makeEnv();
+    const mk = (va, vc) => ({ k: 'movie:1', c: { type: 'movie', title: 'X', genres: [35], va, vc, dir: [], cast: [], names: {} }, src: 'disc', srcs: { disc: true }, seedHits: 0, seeds: [] });
+    const parts = r => ({ best: null, rb: 0, s: 0, a: 0.5, q: 0.9, n: 0, m: 0.6, r });
+    const w = { q: 0.3, a: 0.35, m: 0.2, n: 0.05, s: 0.1 }, prof = { f: { genre: {} }, names: {} }, ans = { mood: 'laugh', company: 'solo' };
+    const low = pk.reasonOf(mk(6.4, 322), parts(6.4), w, prof, ans);
+    const high = pk.reasonOf(mk(8.0, 5000), parts(8.0), w, prof, ans);
+    return { ok: !/^Высокий рейтинг/.test(low) && high === 'Высокий рейтинг: 8,0, 5 тыс. голосов', got: '6,4 → «' + low + '»; 8,0 → «' + high + '»' };
+  } },
+  { id: 'P3a', title: 'Журнал: КП выключен — у карточек без оценки причина offline', fn: async () => {
+    const env = makeEnv(baseWorld());
+    const r = await env.run(ANY);
+    const miss = (r.st.journal.top || []).map(x => x.kpMiss);
+    const ok = miss.length > 0 && miss.every(m => m === 'offline' || m === 'not_requested') && miss.indexOf('offline') > -1;
+    return { ok, got: Array.from(new Set(miss)).join(', ') };
+  } },
+  { id: 'P3b', title: 'Журнал: КП не нашёл фильм — причина not_found, повторно — cached_miss', fn: async () => {
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        if (url.indexOf('imdbId=') > -1) return { body: { items: [] } };
+        if (url.indexOf('search-by-keyword') > -1) return { body: { films: [] } };
+      }
+      return def(url);
+    };
+    const env = makeEnv(Object.assign(baseWorld(), { kp: true, router }));
+    const r1 = await env.run(ANY);
+    const m1 = Array.from(new Set((r1.st.journal.top || []).map(x => x.kpMiss)));
+    const r2 = await env.run(ANY);
+    const m2 = Array.from(new Set((r2.st.journal.top || []).map(x => x.kpMiss)));
+    return { ok: m1.indexOf('not_found') > -1 && m2.indexOf('cached_miss') > -1, got: 'первый: ' + m1.join(', ') + '; второй: ' + m2.join(', ') };
+  } },
+  { id: 'P4a', title: 'Медленная сеть: детали по 3 с — подбор не падает, а останавливается раньше (detailsCut)', fn: async () => {
+    const router = (url, p, def) => {
+      const r = def(url);
+      if (/\/3\/movie\/\d+\?/.test(url)) return Object.assign({}, r, { delay: 3000 });
+      return r;
+    };
+    // Две трети кандидатов длиннее 1,5 часа — за одну пачку деталей нужных 30 не набрать
+    const w = baseWorld();
+    for (let i = 0; i < 60; i++) if (i % 3) w.world.movies[300 + i] = movie(300 + i, { runtime: 150 });
+    const env = makeEnv(Object.assign(w, { router }));
+    const t0 = env.clock.now;
+    const r = await env.run({ time: '90', mood: 'any', company: 'solo' }, 200000);
+    const sec = Math.round((env.clock.now - t0) / 1000);
+    return { ok: !!r.st && !r.error && r.st.journal.detailsCut === true && r.st.rest.length >= 10, got: (r.error ? 'ошибка ' + r.error : 'готово, финал ' + r.st.rest.length + ', detailsCut ' + r.st.journal.detailsCut) + ', ' + sec + ' с' };
+  } },
+  { id: 'P4b', title: 'Сеть молчит — ошибка за ~20 с тишины, а не через минуты', fn: async () => {
+    const router = (url, p, def) => {
+      const r = def(url);
+      if (/\/3\/(movie|tv)\/\d+/.test(url) || /discover|recommendations/.test(url)) return Object.assign({}, r, { delay: 100000 });
+      return r;
+    };
+    const env = makeEnv(Object.assign(baseWorld(), { router }));
+    const t0 = env.clock.now;
+    const r = await env.run(ANY, 200000);
+    const sec = Math.round((env.clock.now - t0) / 1000);
+    return { ok: !!r.error && sec <= 45, got: (r.error ? 'ошибка ' + r.error : 'без ошибки') + ' через ' + sec + ' с' };
+  } },
+  { id: 'P5', title: 'Короткометражка на 4 минуты не предлагается (сериал с серией 11 мин — можно)', fn: async () => {
+    const { pk } = makeEnv();
+    const a = why(pk, item({ runtime: 4, vc: 600 }), { time: '40' });
+    const b = why(pk, item({ runtime: 4, vc: 600 }), {});
+    const c = why(pk, item({ type: 'tv', runtime: 11, vc: 600 }), { time: '40' });
+    return { ok: a === 'too_short' && b === 'too_short' && c === 'проходит', got: '40 мин: ' + a + '; неважно: ' + b + '; сериал: ' + c };
+  } },
   { id: 'F27', title: 'poster_path с кавычками не ломает разметку', fn: async () => {
     const env = await tasteEnv('/x.jpg\')" onmouseover="alert(1)" data-x="');
     const n = env.$('[onmouseover]').length;
