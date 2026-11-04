@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.12.4-dev';
+  var VERSION = '0.12.5-dev';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -2568,7 +2568,9 @@
     (shown || []).forEach(function (it) {
       if (it.kp || it.imdb || !it.kpMiss || it.kpMiss === 'not_requested') return;
       var p = it.kpProbe;
-      rows.push([short(it.title, 16), it.kpMiss].concat(p ? [p.imdb === 'empty' ? 'e' : p.imdb, p.total,
+      var im = p ? (p.imdb === 'empty' ? 'e' : p.imdb) : null;
+      if (p && p.found) rows.push([short(it.title, 16), it.kpMiss, im, 'id' + p.found, (p.type || '?') + ' ' + (p.year || '?') + ' ' + short(p.name, 14)]);
+      else rows.push([short(it.title, 16), it.kpMiss].concat(p ? [im, p.total,
         (p.top || []).slice(0, 2).map(function (x) { return (x[0] || '?').replace('TV_SERIES', 'TVS').replace('MINI_SERIES', 'MS') + ' ' + (x[1] || '?'); }).join('|')] : []));
     });
     return rows.length ? rows.slice(0, 8) : undefined;
@@ -2643,6 +2645,7 @@
         if (entry.shown[i].k === it.k) {
           entry.shown[i].kp = it.kp || null; entry.shown[i].imdb = it.imdbR || null;
           entry.shown[i].kpMiss = it.kp || it.imdbR ? undefined : (it.kpMiss || entry.shown[i].kpMiss);
+          entry.shown[i].kpProbe = it.kp || it.imdbR ? undefined : (it.kpProbe || entry.shown[i].kpProbe);
         }
       }
       this.saveEntry(entry);
@@ -3121,7 +3124,8 @@
     var legacyMiss = m && !m.kp && !m.imdb && !m.id && (!m.probe || (m.probe.total > 0 && m.mv !== KP_MATCH_V));
     // Фильм на КП найден, но оценку ещё не спрашивали: запись от «С детьми» (возраст) или из старой версии
     // без отметки r — сразу за оценкой по id
-    var ageOnly = m && !m.kp && !m.imdb && m.id && !m.r;
+    // …или «нашёлся без оценки» от прежней версии (оценку брали из списка по IMDb, а не из карточки) — тоже по id, один раз
+    var ageOnly = m && !m.kp && !m.imdb && m.id && (!m.r || m.mv !== KP_MATCH_V);
     if (m && now() - m.t < 14 * DAY && !legacyMiss && !ageOnly) {
       if (m.kp || m.imdb) return cb({ kp: m.kp, imdb: m.imdb, src: 'cache' });
       if (m.probe) it.kpProbe = m.probe;
@@ -3134,10 +3138,10 @@
       imdb = parseFloat(imdb) || 0;
       var mp = Durable.get('kpmap', {});
       var prev = mp[it.k];
-      mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now(), va: c.va || 0, r: 1 };   // r — оценку спрашивали
+      mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now(), va: c.va || 0, r: 1, mv: KP_MATCH_V };   // r — оценку спрашивали
       if (typeof age === 'number') mp[it.k].age = age;
       else if (prev && typeof prev.age === 'number' && prev.id === mp[it.k].id) mp[it.k].age = prev.age;
-      if (!kp && !imdb && it.kpProbe) { mp[it.k].probe = it.kpProbe; mp[it.k].mv = KP_MATCH_V; }   // что ответил КП — до следующей проверки
+      if (!kp && !imdb && it.kpProbe) mp[it.k].probe = it.kpProbe;   // что ответил КП — до следующей проверки
       var keys = Object.keys(mp);
       if (keys.length > 1500) {
         keys.sort(function (a, b) { return mp[a].t - mp[b].t; });
@@ -3155,6 +3159,11 @@
     var byId = function (kpId) {
       if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
       KpNet.get(KP_API + 'api/v2.2/films/' + kpId, function (j) {
+        if (j && !(parseFloat(j.ratingKinopoisk) > 0 || parseFloat(j.ratingImdb) > 0)) {
+          // Для журнала: какой фильм КП сопоставил — вдруг не тот (короткометражка, видео с тем же названием)
+          it.kpProbe = { imdb: imdbRes || (c.imdb ? 'skip' : 'none'), found: kpId, type: String(j.type || ''), year: String(j.year || ''),
+            name: String(j.nameRu || j.nameOriginal || j.nameEn || '').slice(0, 30), votes: j.ratingKinopoiskVoteCount || 0 };
+        }
         finish(j && j.ratingKinopoisk, j && j.ratingImdb, kpId, kpAgeOf(j));
       }, kpFail(cb), kpHeaders(), ctx);
     };
@@ -3202,7 +3211,9 @@
       if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
       KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
         var x = j && j.items && j.items[0];
-        if (x) finish(x.ratingKinopoisk, x.ratingImdb, x.kinopoiskId);
+        // Список по IMDb-номеру иногда отдаёт фильм без оценок, хотя у карточки КП они есть — переспрашиваем по id
+        if (x && !(parseFloat(x.ratingKinopoisk) > 0 || parseFloat(x.ratingImdb) > 0) && x.kinopoiskId) { imdbRes = 'item_no_rating'; byId(x.kinopoiskId); }
+        else if (x) finish(x.ratingKinopoisk, x.ratingImdb, x.kinopoiskId);
         else { imdbRes = 'empty'; byTitle(); }
       }, function (status) {
         if (status === 401 || status === 402 || status === 403 || status === 429 || status <= 0) return kpFail(cb)(status);
