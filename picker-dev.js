@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.12.3-dev';
+  var VERSION = '0.12.4-dev';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -2533,7 +2533,7 @@
       imdb: it.imdbR || null,
       rsrc: it.rt ? it.rt.src : null,
       kpProbe: it.kp || it.imdbR ? undefined : (it.kpProbe || undefined),
-      // Почему нет оценки КП/IMDb: not_found, no_rating, cached_miss, deadline, run_budget, daily_limit, blocked,
+      // Почему нет оценки КП/IMDb: not_found, no_rating, cached_miss, cached_no_rating, deadline, run_budget, daily_limit, blocked,
       // paused, offline, no_key, net, http_NNN; not_requested — не среди финалистов, спрашивали только кеш
       kpMiss: it.kp || it.imdbR ? undefined : (it.kpMiss || 'not_requested'),
       rc: round3(p.rc), rb: round3(p.rb), d: p.d === 1 || p.d === undefined ? undefined : round3(p.d),
@@ -3099,6 +3099,14 @@
 
   function kpHeaders() { return { headers: { 'X-API-KEY': kpKey() } }; }
 
+  var KP_YEAR_SLACK = 3;   // ±лет при совпадении названия
+  var KP_MATCH_V = 2;      // версия сопоставления: «не найден» от прежней версии переспрашиваем один раз
+
+  // Название для сравнения: без регистра, знаков и «ё»
+  function normTitle(t) {
+    return String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, '');
+  }
+
   function fetchRatings(it, cb, ctx) {
     var c = it.c;
     var cached = c.type === 'tv' ? null : kpCache()[c.id];   // см. cachedRatings: ключ без типа
@@ -3110,14 +3118,14 @@
     var m = map[it.k];
     // Второй аргумент cb — почему оценки нет (для журнала)
     // «Не найден» из старых версий (без записи, что ответил КП) переспрашиваем один раз — ради диагностики
-    var legacyMiss = m && !m.kp && !m.imdb && !m.id && !m.probe;
+    var legacyMiss = m && !m.kp && !m.imdb && !m.id && (!m.probe || (m.probe.total > 0 && m.mv !== KP_MATCH_V));
     // Фильм на КП найден, но оценку ещё не спрашивали: запись от «С детьми» (возраст) или из старой версии
     // без отметки r — сразу за оценкой по id
     var ageOnly = m && !m.kp && !m.imdb && m.id && !m.r;
     if (m && now() - m.t < 14 * DAY && !legacyMiss && !ageOnly) {
       if (m.kp || m.imdb) return cb({ kp: m.kp, imdb: m.imdb, src: 'cache' });
       if (m.probe) it.kpProbe = m.probe;
-      return cb(null, 'cached_miss');
+      return cb(null, m.id ? 'cached_no_rating' : 'cached_miss');   // нашёлся без оценки / не нашёлся
     }
 
 
@@ -3129,7 +3137,7 @@
       mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now(), va: c.va || 0, r: 1 };   // r — оценку спрашивали
       if (typeof age === 'number') mp[it.k].age = age;
       else if (prev && typeof prev.age === 'number' && prev.id === mp[it.k].id) mp[it.k].age = prev.age;
-      if (!kp && !imdb && it.kpProbe) mp[it.k].probe = it.kpProbe;   // что ответил КП — до следующей проверки
+      if (!kp && !imdb && it.kpProbe) { mp[it.k].probe = it.kpProbe; mp[it.k].mv = KP_MATCH_V; }   // что ответил КП — до следующей проверки
       var keys = Object.keys(mp);
       if (keys.length > 1500) {
         keys.sort(function (a, b) { return mp[a].t - mp[b].t; });
@@ -3164,15 +3172,21 @@
           var isTv = /SERIES|TV_SHOW/.test(ft);
           return c.type === 'tv' ? isTv : !isTv;
         };
-        var pick = function (tol) {
+        // Год на КП бывает годом производства, а на TMDB — годом проката («Связь»: КП 2012, TMDB 2014).
+        // Поэтому при совпадении названия допускаем разницу до 3 лет
+        var nameOk = function (f) {
+          return (c.original && normTitle(f.nameEn) === normTitle(c.original)) || (c.title && normTitle(f.nameRu) === normTitle(c.title));
+        };
+        var pick = function (tol, needName) {
           for (var i = 0; i < films.length; i++) {
             if (!typeOk(films[i])) continue;
+            if (needName && !nameOk(films[i])) continue;
             var fy = parseInt(films[i].year, 10);
             if (!y || (!isNaN(fy) && Math.abs(fy - y) <= tol)) return films[i];
           }
           return null;
         };
-        var hit = pick(0) || pick(1);
+        var hit = pick(0) || pick(1) || pick(KP_YEAR_SLACK, true);
         if (hit) return byId(hit.filmId);
         // Для журнала: что вернул поиск (до 5 вариантов: тип, год, название) — чтобы понять, почему не совпало
         it.kpProbe = {

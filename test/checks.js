@@ -773,6 +773,35 @@ const CHECKS = [
     const r = res && res[0];
     return { ok: !!r && r.kp === 7.9 && urls.length === 1 && /films\/77$/.test(urls[0]), got: (r ? 'КП ' + r.kp : 'нет оценки (' + (res && res[1]) + ')') + ', запросы: ' + urls.join(', ') };
   } },
+  { id: 'P3g', title: 'КП: год расходится на 2 («Связь»: КП 2012, TMDB 2014) — находится по совпадению названия; чужое название — нет', fn: async () => {
+    const mk = (nameEn) => (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        if (url.indexOf('imdbId=') > -1) return { body: { items: [] } };
+        if (url.indexOf('search-by-keyword') > -1) return { body: { films: [{ filmId: 4000, type: 'FILM', year: '2012', nameRu: 'Связь', nameEn }, { filmId: 4001, type: 'FILM', year: '2017', nameRu: 'Другое' }] } };
+        if (/films\/4000$/.test(url)) return { body: { kinopoiskId: 4000, ratingKinopoisk: 7.0, ratingImdb: 7.2 } };
+      }
+      return def(url);
+    };
+    const it = () => ({ k: 'movie:220289', c: { id: 220289, type: 'movie', imdb: 'tt1', title: 'Связь', original: 'Coherence', year: '2014', va: 7.2 } });
+    const e1 = makeEnv({ kp: true, router: mk('Coherence') });
+    const a = await e1.cb(cb => e1.pk.fetchRatings(it(), cb));
+    const e2 = makeEnv({ kp: true, router: mk('Something Else') });
+    const it2 = it(); it2.c.title = 'Связь 2';
+    const b = await e2.cb(cb => e2.pk.fetchRatings(it2, cb));
+    return { ok: !!(a && a[0] && a[0].kp === 7) && !(b && b[0]), got: 'Coherence: ' + (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + '; другое название: ' + (b && b[0] ? 'КП ' + b[0].kp : b && b[1]) };
+  } },
+  { id: 'P3h', title: 'КП: «не найден» прежней версией сопоставления переспрашивается один раз', fn: async () => {
+    let n = 0;
+    const router = (url, p, def) => { if (url.indexOf('kinopoiskapiunofficial') > -1) { n++; return url.indexOf('imdbId=') > -1 ? { body: { items: [] } } : { body: { films: [] } }; } return def(url); };
+    const env = makeEnv({ kp: true, router });
+    env.pk.Durable.vals.kpmap = { 'movie:5': { kp: 0, imdb: 0, id: null, t: env.clock.now - 86400000, va: 7, r: 1, probe: { imdb: 'empty', q: 'X', year: 2014, total: 3, top: [] } } };
+    env.pk.Durable.loaded.kpmap = true;
+    const c = { id: 5, type: 'movie', imdb: 'tt5', title: 'X', original: 'X', year: '2014', va: 7 };
+    await env.cb(cb => env.pk.fetchRatings({ k: 'movie:5', c }, cb));
+    const n1 = n;
+    await env.cb(cb => env.pk.fetchRatings({ k: 'movie:5', c }, cb));
+    return { ok: n1 > 0 && n === n1, got: 'запросов: после первого ' + n1 + ', после второго ' + n };
+  } },
   { id: 'P6', title: 'Причина «Высоко на Кинопоиске» в запасном варианте — только от 7,5', fn: async () => {
     const { pk } = makeEnv();
     const mk = kp => ({ k: 'movie:1', kp, c: { type: 'movie', title: 'X', genres: [80], va: 6.8, vc: 2000, dir: [], cast: [], names: {} }, src: 'disc', srcs: { disc: true }, seedHits: 0, seeds: [] });
