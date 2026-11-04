@@ -729,6 +729,58 @@ const CHECKS = [
     const c = why(pk, item({ type: 'tv', runtime: 11, vc: 600 }), { time: '40' });
     return { ok: a === 'too_short' && b === 'too_short' && c === 'проходит', got: '40 мин: ' + a + '; неважно: ' + b + '; сериал: ' + c };
   } },
+  { id: 'P3c', title: 'Журнал: при «не найден» записано, что ответил КП (IMDb пусто, варианты поиска)', fn: async () => {
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        if (url.indexOf('imdbId=') > -1) return { body: { items: [] } };
+        if (url.indexOf('search-by-keyword') > -1) return { body: { films: [{ filmId: 9, type: 'TV_SHOW', year: '2012', nameRu: 'Связь' }] } };
+      }
+      return def(url);
+    };
+    const env = makeEnv(Object.assign(baseWorld(), { kp: true, router }));
+    const r = await env.run(ANY);
+    const x = (r.st.journal.top || []).find(t => t.kpMiss === 'not_found' && t.kpProbe);
+    const r2 = await env.run(ANY);
+    const y = (r2.st.journal.top || []).find(t => t.kpMiss === 'cached_miss' && t.kpProbe);
+    const ok = !!x && x.kpProbe.imdb === 'empty' && x.kpProbe.total === 1 && x.kpProbe.top[0][0] === 'TV_SHOW' && !!y;
+    return { ok, got: (x ? JSON.stringify(x.kpProbe) : 'нет kpProbe') + '; из кеша: ' + (y ? 'с ответом КП' : 'без') };
+  } },
+  { id: 'P3d', title: 'Старое «не найден» без записи ответа КП переспрашивается один раз', fn: async () => {
+    let n = 0;
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) { n++; if (url.indexOf('imdbId=') > -1) return { body: { items: [] } }; return { body: { films: [] } }; }
+      return def(url);
+    };
+    const env = makeEnv({ kp: true, router });
+    env.pk.Durable.vals.kpmap = { 'movie:5': { kp: 0, imdb: 0, id: null, t: env.clock.now - 86400000, va: 7 } };
+    env.pk.Durable.loaded.kpmap = true;
+    const it = { k: 'movie:5', c: { id: 5, type: 'movie', imdb: 'tt5', title: 'X', original: 'X', year: '2014', va: 7 } };
+    const a = await env.cb(cb => env.pk.fetchRatings(it, cb));
+    const n1 = n;
+    const b = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:5', c: it.c }, cb));
+    return { ok: n1 > 0 && n === n1 && a[1] === 'not_found' && b[1] === 'cached_miss', got: 'запросов после первого ' + n1 + ', после второго ' + n + ', причины ' + a[1] + ' / ' + b[1] };
+  } },
+  { id: 'P3e', title: 'Запись КП только с возрастом («С детьми») не считается «нет оценки»: оценка запрашивается по id', fn: async () => {
+    const urls = [];
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) { urls.push(url.replace(/^.*\/api\//, '')); return { body: { kinopoiskId: 77, ratingKinopoisk: 7.9, ratingImdb: 7.6 } }; }
+      return def(url);
+    };
+    const env = makeEnv({ kp: true, router });
+    env.pk.Durable.vals.kpmap = { 'movie:5': { kp: 0, imdb: 0, id: 77, age: 6, t: env.clock.now - 86400000, va: 7 } };
+    env.pk.Durable.loaded.kpmap = true;
+    const res = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:5', c: { id: 5, type: 'movie', imdb: 'tt5', title: 'X', year: '2014', va: 7 } }, cb));
+    const r = res && res[0];
+    return { ok: !!r && r.kp === 7.9 && urls.length === 1 && /films\/77$/.test(urls[0]), got: (r ? 'КП ' + r.kp : 'нет оценки (' + (res && res[1]) + ')') + ', запросы: ' + urls.join(', ') };
+  } },
+  { id: 'P6', title: 'Причина «Высоко на Кинопоиске» в запасном варианте — только от 7,5', fn: async () => {
+    const { pk } = makeEnv();
+    const mk = kp => ({ k: 'movie:1', kp, c: { type: 'movie', title: 'X', genres: [80], va: 6.8, vc: 2000, dir: [], cast: [], names: {} }, src: 'disc', srcs: { disc: true }, seedHits: 0, seeds: [] });
+    const parts = { best: null, rb: 0, s: 0, a: 0.5, q: 0.9, n: 0, m: 0.6, r: 6.8 };
+    const w = { q: 0.3, a: 0.35, m: 0.2, n: 0.05, s: 0.1 }, prof = { f: { genre: { 80: 0.4 } }, names: {} }, ans = { mood: 'any', company: 'solo' };
+    const a = pk.reasonOf(mk(7.1), parts, w, prof, ans), b = pk.reasonOf(mk(7.8), parts, w, prof, ans);
+    return { ok: !/Кинопоиске/.test(a) && b === 'Высоко на Кинопоиске: 7,8', got: 'КП 7,1 → «' + a + '»; КП 7,8 → «' + b + '»' };
+  } },
   { id: 'F27', title: 'poster_path с кавычками не ломает разметку', fn: async () => {
     const env = await tasteEnv('/x.jpg\')" onmouseover="alert(1)" data-x="');
     const n = env.$('[onmouseover]').length;

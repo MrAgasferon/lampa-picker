@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.12.1-dev';
+  var VERSION = '0.12.2-dev';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -1920,6 +1920,7 @@
   function rating1(x) { return x.toFixed(1).replace('.', ','); }
 
   var HIGH_RATING = 7.0;   // ниже «Высокий рейтинг» звучит странно — ищем другое объяснение
+  var HIGH_KP = 7.5;       // «Высоко на Кинопоиске» — как и в основной причине про КП
 
   var MOOD_REASON = {
     relax: 'под «Расслабиться»', laugh: 'чтобы посмеяться', nerves: 'чтобы пощекотать нервы',
@@ -2001,7 +2002,7 @@
       if (k === 'q' && parts.r) {
         // Рейтинг — объяснение, только если он и правда высокий (на TMDB или на Кинопоиске)
         if (parts.r >= HIGH_RATING) return 'Высокий рейтинг: ' + rating1(parts.r) + ', ' + votesText(c.vc);
-        if (it.kp >= HIGH_RATING) return 'Высоко на Кинопоиске: ' + rating1(it.kp);
+        if (it.kp >= HIGH_KP) return 'Высоко на Кинопоиске: ' + rating1(it.kp);
       }
       if (k === 'n' && parts.n > 0 && c.genres.length) return 'Что-то новое: ' + (GENRE_NAMES[c.genres[0]] || '').toLowerCase();
     }
@@ -2488,7 +2489,7 @@
             top: finalList.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).map(journalItem),
             shadow: shadow,
             repeats: finalList.filter(function (x) { return x.rp < 1; }).length,
-            franchises: frLog && frLog.length ? frLog.slice(0, 12) : undefined,
+            franchises: frLog && frLog.length ? frLog.slice(0, 30) : undefined,
             detailsCut: detailsCut || undefined
           });
           if (h.done) h.done(st);
@@ -2524,6 +2525,7 @@
       kp: it.kp || null,
       imdb: it.imdbR || null,
       rsrc: it.rt ? it.rt.src : null,
+      kpProbe: it.kp || it.imdbR ? undefined : (it.kpProbe || undefined),
       // Почему нет оценки КП/IMDb: not_found, no_rating, cached_miss, deadline, run_budget, daily_limit, blocked,
       // paused, offline, no_key, net, http_NNN; not_requested — не среди финалистов, спрашивали только кеш
       kpMiss: it.kp || it.imdbR ? undefined : (it.kpMiss || 'not_requested'),
@@ -3085,7 +3087,16 @@
     var map = Durable.get('kpmap', {});
     var m = map[it.k];
     // Второй аргумент cb — почему оценки нет (для журнала)
-    if (m && now() - m.t < 14 * DAY) return m.kp || m.imdb ? cb({ kp: m.kp, imdb: m.imdb, src: 'cache' }) : cb(null, 'cached_miss');
+    // «Не найден» из старых версий (без записи, что ответил КП) переспрашиваем один раз — ради диагностики
+    var legacyMiss = m && !m.kp && !m.imdb && !m.id && !m.probe;
+    // Фильм на КП найден, но оценку ещё не спрашивали: запись от «С детьми» (возраст) или из старой версии
+    // без отметки r — сразу за оценкой по id
+    var ageOnly = m && !m.kp && !m.imdb && m.id && !m.r;
+    if (m && now() - m.t < 14 * DAY && !legacyMiss && !ageOnly) {
+      if (m.kp || m.imdb) return cb({ kp: m.kp, imdb: m.imdb, src: 'cache' });
+      if (m.probe) it.kpProbe = m.probe;
+      return cb(null, 'cached_miss');
+    }
 
 
     var finish = function (kp, imdb, kpId, age) {
@@ -3093,9 +3104,10 @@
       imdb = parseFloat(imdb) || 0;
       var mp = Durable.get('kpmap', {});
       var prev = mp[it.k];
-      mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now(), va: c.va || 0 };
+      mp[it.k] = { kp: kp, imdb: imdb, id: kpId || null, t: now(), va: c.va || 0, r: 1 };   // r — оценку спрашивали
       if (typeof age === 'number') mp[it.k].age = age;
       else if (prev && typeof prev.age === 'number' && prev.id === mp[it.k].id) mp[it.k].age = prev.age;
+      if (!kp && !imdb && it.kpProbe) mp[it.k].probe = it.kpProbe;   // что ответил КП — до следующей проверки
       var keys = Object.keys(mp);
       if (keys.length > 1500) {
         keys.sort(function (a, b) { return mp[a].t - mp[b].t; });
@@ -3107,6 +3119,8 @@
         cb({ kp: kp, imdb: imdb, src: 'net' });
       } else cb(null, kpId ? 'no_rating' : 'not_found');
     };
+
+    var imdbRes = '';   // что ответил поиск по IMDb-номеру — для журнала
 
     var byId = function (kpId) {
       if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
@@ -3138,18 +3152,25 @@
         };
         var hit = pick(0) || pick(1);
         if (hit) return byId(hit.filmId);
+        // Для журнала: что вернул поиск (до 5 вариантов: тип, год, название) — чтобы понять, почему не совпало
+        it.kpProbe = {
+          imdb: c.imdb ? imdbRes : 'none', q: String(c.original || c.title).slice(0, 40), year: y || null, total: films.length,
+          top: films.slice(0, 5).map(function (f) { return [String(f.type || ''), String(f.year || ''), String(f.nameRu || f.nameEn || '').slice(0, 30)]; })
+        };
         finish(0, 0, null);
       }, kpFail(cb), kpHeaders(), ctx);
     };
 
+    if (ageOnly) return byId(m.id);   // фильм на КП уже найден — сразу за оценкой
     if (c.imdb) {
       if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
       KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
         var x = j && j.items && j.items[0];
         if (x) finish(x.ratingKinopoisk, x.ratingImdb, x.kinopoiskId);
-        else byTitle();
+        else { imdbRes = 'empty'; byTitle(); }
       }, function (status) {
         if (status === 401 || status === 402 || status === 403 || status === 429 || status <= 0) return kpFail(cb)(status);
+        imdbRes = 'http_' + status;
         byTitle();
       }, kpHeaders(), ctx);
     } else byTitle();
@@ -4293,7 +4314,8 @@
           } : fetchRatings;
           getR(it, function (r, why) {
             if (!r) {
-              if (why && !it.kp && !it.imdbR) { it.kpMiss = why; Journal.rating(state.journal, it); }
+              // «не найден» из кеша — следствие того же поиска: исходную причину подбора не затираем
+              if (why && !it.kp && !it.imdbR && !(why === 'cached_miss' && it.kpMiss)) { it.kpMiss = why; Journal.rating(state.journal, it); }
               return;
             }
             it.kpMiss = null;
