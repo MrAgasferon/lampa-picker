@@ -890,6 +890,30 @@ const CHECKS = [
     const row = (o.km || [])[0];
     return { ok: !!row && row[1] === 'not_found' && row[2] === 'e' && row[3] === 1 && row[4] === 'FILM 2012', got: JSON.stringify(o.km) };
   } },
+  { id: 'P10', title: 'Причины: «Что-то новое» не называет нелюбимый жанр; «Высокий рейтинг» при 239 голосах без КП — нет', fn: async () => {
+    const { pk } = makeEnv();
+    const w = { q: 0.3, a: 0.35, m: 0.2, n: 0.05, s: 0.1 }, ans = { mood: 'nerves', company: 'solo' };
+    const horror = { k: 'movie:1', c: { type: 'movie', title: 'H', genres: [27, 53], va: 6.7, vc: 3000, dir: [], cast: [], names: {} }, src: 'disc', srcs: { disc: true }, seedHits: 0, seeds: [] };
+    const a = pk.reasonOf(horror, { best: null, rb: 0, s: 0, a: 0.4, q: 0.3, n: 0.15, m: 0.6, r: 6.7 }, w, { f: { genre: { 27: -0.51 } }, names: {}, recentGenres: [] }, ans);
+    const few = { k: 'movie:2', kp: 0, c: { type: 'movie', title: 'E', genres: [53, 80, 18], va: 7.4, vc: 239, dir: [], cast: [], names: {} }, src: 'disc', srcs: { disc: true }, seedHits: 0, seeds: [] };
+    const b = pk.reasonOf(few, { best: null, rb: 0, s: 0, a: 0.5, q: 0.6, n: 0, m: 0.8, r: 7.4 }, w, { f: { genre: {} }, names: {}, recentGenres: [] }, ans);
+    return { ok: !/^Что-то новое: ужасы/.test(a) && !/^Высокий рейтинг/.test(b), got: 'ужасы (нелюбимые): «' + a + '»; 239 голосов: «' + b + '»' };
+  } },
+  { id: 'P9a', title: 'IndexedDB не отвечает на чтение — подбор идёт дальше (сторож 8 с), а не ждёт до ошибки', fn: async () => {
+    const env = makeEnv(Object.assign(baseWorld(), { idb: 'fake', idbDelay: 600000, idbData: { 'durable:journal': { t: 1, v: [{ id: 'old1' }] } } }));
+    const t0 = env.clock.now;
+    const r = await env.run(ANY, 120000);
+    const sec = Math.round((env.clock.now - t0) / 1000);
+    return { ok: !!r.st && !r.error && sec < 20, got: (r.error ? 'ошибка ' + r.error : (r.st ? 'готово' : 'нет результата')) + ' за ' + sec + ' с' };
+  } },
+  { id: 'P9b', title: 'Журнал не прочитался вовремя — старый журнал на диске не перезаписывается', fn: async () => {
+    const env = makeEnv(Object.assign(baseWorld(), { idb: 'fake', idbDelay: 600000, idbData: { 'durable:journal': { t: 1, v: [{ id: 'old1' }, { id: 'old2' }] } } }));
+    await env.run(ANY, 120000);
+    await env.clock.advance(5000);
+    const disk = env.idb.data['durable:journal'];
+    const v = disk && disk.v;
+    return { ok: Array.isArray(v) && v.length === 2 && v[0].id === 'old1', got: JSON.stringify(v) };
+  } },
   { id: 'F27', title: 'poster_path с кавычками не ломает разметку', fn: async () => {
     const env = await tasteEnv('/x.jpg\')" onmouseover="alert(1)" data-x="');
     const n = env.$('[onmouseover]').length;
@@ -922,6 +946,14 @@ const CHECKS = [
     const { pk } = makeEnv({ noTmdbApi: true });
     const u = pk.tmdbUrl('movie/1', {});
     return { ok: u.indexOf('bylampa') < 0, got: u.replace(/api_key=[^&]+/, 'api_key=…') };
+  } },
+  { id: 'F31b', title: 'Без Lampa.TMDB.api: свой прокси из настроек → прокси CUB → напрямую (как в самой Lampa)', fn: async () => {
+    const url = st => makeEnv({ noTmdbApi: true, storage: st }).pk.tmdbUrl('movie/1', {}).replace(/\?.*$/, '');
+    const own = url({ proxy_tmdb: true, tmdb_proxy_api: 'my.proxy.example/' });
+    const cub = url({ proxy_tmdb: true });
+    const dir = url({});
+    const ok = own === 'https://my.proxy.example/https://api.themoviedb.org/3/movie/1' && cub === 'https://apitmdb.cub.test/3/movie/1' && dir === 'https://api.themoviedb.org/3/movie/1';
+    return { ok, got: [own, cub, dir].join(' | ') };
   } }
 ];
 
