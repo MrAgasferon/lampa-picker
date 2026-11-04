@@ -838,6 +838,22 @@ const CHECKS = [
     const b = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:7', c }, cb));
     return { ok: !!(a && a[0] && a[0].kp === 7.6) && !!(b && b[0] && b[0].src === 'cache') && n === 1, got: 'первый: ' + (a && a[0] ? a[0].kp : a && a[1]) + ', второй: ' + (b && b[0] ? b[0].src : b && b[1]) + ', запросов ' + n };
   } },
+  { id: 'P8', title: 'Опорные — только «Нравится» и просмотренное; открытое из подборки и закладки — нет', fn: async () => {
+    const w = baseWorld();
+    w.fav.like = [card(100, { title: 'Liked' })];
+    w.fav.viewed = [card(101, { title: 'Viewed' })];
+    w.fav.book = [card(102, { title: 'Bookmarked' })];
+    w.fav.history = [card(103, { title: 'Finished' })];
+    const env = makeEnv(w);
+    env.timeline[hash('Finished')] = { percent: 100, time: 6000, duration: 6000 };
+    env.storage.picker_feedback = { rejected: {}, seen: {}, opened: { 'movie:104': { t: env.clock.now, card: { id: 104, title: 'Opened', genre_ids: [28, 878], method: 'movie' } } } };
+    const r = await env.run(ANY);
+    const seeds = (r.st && r.st.journal.profile.seeds) || [];
+    // названия опорных — из деталей TMDB: Film 100 (Нравится), 101 (Просмотрено), 103 (досмотрено), 102 (закладка), 104 (открыто)
+    const has = id => seeds.indexOf('Film ' + id) > -1;
+    const ok = has(100) && has(101) && has(103) && !has(102) && !has(104);
+    return { ok, got: 'опорные: ' + seeds.join(', ') };
+  } },
   { id: 'P6', title: 'Причина «Высоко на Кинопоиске» в запасном варианте — только от 7,5', fn: async () => {
     const { pk } = makeEnv();
     const mk = kp => ({ k: 'movie:1', kp, c: { type: 'movie', title: 'X', genres: [80], va: 6.8, vc: 2000, dir: [], cast: [], names: {} }, src: 'disc', srcs: { disc: true }, seedHits: 0, seeds: [] });

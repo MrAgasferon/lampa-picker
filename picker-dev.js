@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.12.5-dev';
+  var VERSION = '0.12.6-dev';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -1346,7 +1346,9 @@
       if (!profile.yearFloor || oldFloor > profile.yearFloor) { profile.yearFloor = oldFloor; profile.yearFloorBy = 'rejects'; }
     }
 
-    var seeds = events.filter(function (e) { return e.s > 0.25; });
+    // Опорные — только то, что вы видели и оценили: «Нравится» и просмотренное (список «Просмотрено» или досмотрено).
+    // Открытое из подборки, закладки и «Позже» влияют на вкус, но «Похож на …» по ним не строим — фильм вы ещё не видели
+    var seeds = events.filter(function (e) { return e.s > 0.25 && e.flags && (e.flags.like || e.flags.viewed); });
     seeds.sort(function (a, b) { return b.s * decay(b.date) - a.s * decay(a.date); });
     // Пачка отметок не занимает все опорные места
     var seedMax = 15, batchMax = Math.round(seedMax * SEED_BATCH_SHARE), nb = 0, picked = [];
