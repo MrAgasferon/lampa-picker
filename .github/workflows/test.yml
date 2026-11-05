@@ -19,10 +19,10 @@ jobs:
     name: Сторож релиза
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
       - run: node test/release-check.js
 
   test:
@@ -36,7 +36,7 @@ jobs:
       run:
         working-directory: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Есть ли файл
         id: has
         run: |
@@ -46,10 +46,10 @@ jobs:
           else
             echo "${{ matrix.file }} нет в репозитории — пропускаю"
           fi
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         if: steps.has.outputs.yes == '1'
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: test/package-lock.json
       - if: steps.has.outputs.yes == '1'
