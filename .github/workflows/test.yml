@@ -1,7 +1,8 @@
 name: test
 
-# Проверка плагина стендом из папки test/ при каждой загрузке файлов.
-# Проверяется picker-dev.js, если он есть в репозитории, иначе picker.js.
+# Стенд из папки test/ на каждую загрузку файлов.
+# 1. Сторож релиза: в picker.js версия без «-dev»; picker.js и picker-dev.js с одной версией не расходятся в коде.
+# 2. Полный набор проверок — отдельно для picker.js и для picker-dev.js (если он есть).
 
 on:
   push:
@@ -14,23 +15,48 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  release:
+    name: Сторож релиза
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - run: node test/release-check.js
+
+  test:
+    name: Стенд — ${{ matrix.file }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        file: [picker.js, picker-dev.js]
+    defaults:
+      run:
+        working-directory: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Есть ли файл
+        id: has
+        run: |
+          if [ -f "../${{ matrix.file }}" ]; then
+            echo "yes=1" >> "$GITHUB_OUTPUT"
+            echo "PICKER=$(realpath ../${{ matrix.file }})" >> "$GITHUB_ENV"
+          else
+            echo "${{ matrix.file }} нет в репозитории — пропускаю"
+          fi
+      - uses: actions/setup-node@v4
+        if: steps.has.outputs.yes == '1'
+        with:
+          node-version: 20
           cache: npm
           cache-dependency-path: test/package-lock.json
-      - name: Какой файл проверяем
-        run: |
-          if [ -f ../picker-dev.js ]; then echo "PICKER=$(realpath ../picker-dev.js)" >> "$GITHUB_ENV"; else echo "PICKER=$(realpath ../picker.js)" >> "$GITHUB_ENV"; fi
-      - run: npm ci --no-audit --no-fund
+      - if: steps.has.outputs.yes == '1'
+        run: npm ci --no-audit --no-fund
       - name: Синтаксис
+        if: steps.has.outputs.yes == '1'
         run: node --check "$PICKER"
       - name: Проверки стенда
+        if: steps.has.outputs.yes == '1'
         run: echo "Проверяю $PICKER" && npm test
