@@ -827,16 +827,52 @@ const CHECKS = [
     const x = env.pk.Journal.list().slice(-1)[0].shown.find(s => s.k === it.k);
     return { ok: !!(x && x.kpProbe && x.kpMiss === 'not_found'), got: x ? JSON.stringify({ kpMiss: x.kpMiss, kpProbe: x.kpProbe }) : 'нет' };
   } },
-  { id: 'P3k', title: 'КП: «без оценки» от прежней версии переспрашивается по id один раз', fn: async () => {
-    let n = 0;
-    const router = (url, p, def) => { if (url.indexOf('kinopoiskapiunofficial') > -1) { n++; return { body: { kinopoiskId: 555, ratingKinopoisk: 7.6, ratingImdb: 7.4 } }; } return def(url); };
+  { id: 'P3k', title: 'КП: «нашёлся без оценки» от прежней версии сопоставляется заново один раз (не по старому id)', fn: async () => {
+    const urls = [];
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        urls.push(url.replace(/^.*\/api\//, ''));
+        if (url.indexOf('imdbId=') > -1) return { body: { items: [] } };
+        if (url.indexOf('search-by-keyword') > -1) return { body: { films: [{ filmId: 900, type: 'FILM', year: '2019', nameRu: 'Чужое', nameEn: 'Entangled' }, { filmId: 555, type: 'FILM', year: '2018', nameRu: 'Мультивселенная', nameEn: 'Multiverse' }] } };
+        if (/films\/555$/.test(url)) return { body: { kinopoiskId: 555, ratingKinopoisk: 5.9, ratingImdb: 5.5 } };
+        return { body: { kinopoiskId: 900 } };
+      }
+      return def(url);
+    };
     const env = makeEnv({ kp: true, router });
-    env.pk.Durable.vals.kpmap = { 'movie:7': { kp: 0, imdb: 0, id: 555, r: 1, t: env.clock.now - 86400000, va: 7.4 } };
+    env.pk.Durable.vals.kpmap = { 'movie:7': { kp: 0, imdb: 0, id: 900, r: 1, mv: 2, t: env.clock.now - 86400000, va: 6 } };
     env.pk.Durable.loaded.kpmap = true;
-    const c = { id: 7, type: 'movie', imdb: 'tt7', title: 'X', year: '2014', va: 7.4 };
+    const c = { id: 7, type: 'movie', imdb: 'tt7', title: 'Мультивселенная', original: 'Multiverse', year: '2019', va: 6 };
     const a = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:7', c }, cb));
+    const n1 = urls.length;
     const b = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:7', c }, cb));
-    return { ok: !!(a && a[0] && a[0].kp === 7.6) && !!(b && b[0] && b[0].src === 'cache') && n === 1, got: 'первый: ' + (a && a[0] ? a[0].kp : a && a[1]) + ', второй: ' + (b && b[0] ? b[0].src : b && b[1]) + ', запросов ' + n };
+    const ok = !!(a && a[0] && a[0].kp === 5.9) && !!(b && b[0] && b[0].src === 'cache') && urls.length === n1 && !urls.some(u => /films\/900$/.test(u));
+    return { ok, got: 'первый: ' + (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + ', второй: ' + (b && b[0] ? b[0].src : b && b[1]) + ', запросы: ' + urls.join(', ') };
+  } },
+  { id: 'P3l', title: 'КП: по названию — чужой фильм того же года не берётся, нужный с разницей в год — да («Мультивселенная»)', fn: async () => {
+    const urls = [];
+    const films = [{ filmId: 900, type: 'FILM', year: '2019', nameRu: 'Запутанные', nameEn: 'Entangled' }, { filmId: 555, type: 'FILM', year: '2018', nameRu: 'Мультивселенная', nameEn: 'Multiverse' }];
+    const mk = (list) => (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        urls.push(url.replace(/^.*\/api\//, ''));
+        if (url.indexOf('imdbId=') > -1) return { body: { items: [] } };
+        if (url.indexOf('search-by-keyword') > -1) return { body: { films: list } };
+        const m = url.match(/films\/(\d+)$/);
+        if (m) return { body: m[1] === '555' ? { kinopoiskId: 555, ratingKinopoisk: 5.9, ratingImdb: 5.5 } : { kinopoiskId: +m[1] } };
+      }
+      return def(url);
+    };
+    const c = { id: 7, type: 'movie', imdb: 'tt7', title: 'Мультивселенная', original: 'Multiverse', year: '2019', va: 6 };
+    const e1 = makeEnv({ kp: true, router: mk(films) });
+    const a = await e1.cb(cb => e1.pk.fetchRatings({ k: 'movie:7', c }, cb));
+    // Только чужой фильм того же года, название не совпадает, но вариант один — берётся (другой перевод)
+    const e2 = makeEnv({ kp: true, router: mk([films[0]]) });
+    const b = await e2.cb(cb => e2.pk.fetchRatings({ k: 'movie:7', c }, cb));
+    // Два чужих того же года — не берётся ни один
+    const e3 = makeEnv({ kp: true, router: mk([films[0], { filmId: 901, type: 'FILM', year: '2019', nameRu: 'Ещё', nameEn: 'Other' }]) });
+    const d = await e3.cb(cb => e3.pk.fetchRatings({ k: 'movie:7', c }, cb));
+    const ok = !!(a && a[0] && a[0].kp === 5.9) && b && b[1] === 'no_rating' && d && d[1] === 'not_found';
+    return { ok, got: 'нужный: ' + (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + '; один чужой: ' + (b && (b[0] ? 'КП ' + b[0].kp : b[1])) + '; два чужих: ' + (d && (d[0] ? 'КП ' + d[0].kp : d[1])) };
   } },
   { id: 'P8', title: 'Опорные — только «Нравится» и просмотренное; открытое из подборки и закладки — нет', fn: async () => {
     const w = baseWorld();

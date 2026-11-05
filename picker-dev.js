@@ -3140,7 +3140,7 @@
   function kpHeaders() { return { headers: { 'X-API-KEY': kpKey() } }; }
 
   var KP_YEAR_SLACK = 3;   // ±лет при совпадении названия
-  var KP_MATCH_V = 2;      // версия сопоставления: «не найден» от прежней версии переспрашиваем один раз
+  var KP_MATCH_V = 3;      // версия сопоставления: записи прежних версий без оценки переспрашиваем один раз
 
   // Название для сравнения: без регистра, знаков и «ё»
   function normTitle(t) {
@@ -3158,12 +3158,14 @@
     var m = map[it.k];
     // Второй аргумент cb — почему оценки нет (для журнала)
     // «Не найден» из старых версий (без записи, что ответил КП) переспрашиваем один раз — ради диагностики
-    var legacyMiss = m && !m.kp && !m.imdb && !m.id && (!m.probe || (m.probe.total > 0 && m.mv !== KP_MATCH_V));
+    var legacyMiss = m && !m.kp && !m.imdb && !m.id && (!m.probe || (m.probe.total > 0 && !(m.mv >= 2)));
     // Фильм на КП найден, но оценку ещё не спрашивали: запись от «С детьми» (возраст) или из старой версии
     // без отметки r — сразу за оценкой по id
-    // …или «нашёлся без оценки» от прежней версии (оценку брали из списка по IMDb, а не из карточки) — тоже по id, один раз
-    var ageOnly = m && !m.kp && !m.imdb && m.id && (!m.r || m.mv !== KP_MATCH_V);
-    if (m && now() - m.t < 14 * DAY && !legacyMiss && !ageOnly) {
+    var ageOnly = m && !m.kp && !m.imdb && m.id && !m.r;
+    // «Нашёлся без оценки» от прежней версии сопоставления: по названию мог найтись чужой фильм того же года
+    // («Мультивселенная» → Entangled) — сопоставляем заново, один раз
+    var staleNoRating = m && !m.kp && !m.imdb && m.id && m.r && !(m.mv >= KP_MATCH_V);
+    if (m && now() - m.t < 14 * DAY && !legacyMiss && !ageOnly && !staleNoRating) {
       if (m.kp || m.imdb) return cb({ kp: m.kp, imdb: m.imdb, src: 'cache' });
       if (m.probe) it.kpProbe = m.probe;
       return cb(null, m.id ? 'cached_no_rating' : 'cached_miss');   // нашёлся без оценки / не нашёлся
@@ -3220,19 +3222,27 @@
         };
         // Год на КП бывает годом производства, а на TMDB — годом проката («Связь»: КП 2012, TMDB 2014).
         // Поэтому при совпадении названия допускаем разницу до 3 лет
+        // Название сверяем всегда: поиск по слову отдаёт и чужие фильмы того же года
+        // («Multiverse» → Entangled 2019 раньше нужной «Мультивселенной» 2018)
         var nameOk = function (f) {
-          return (c.original && normTitle(f.nameEn) === normTitle(c.original)) || (c.title && normTitle(f.nameRu) === normTitle(c.title));
+          var o = normTitle(c.original), t = normTitle(c.title), en = normTitle(f.nameEn), ru = normTitle(f.nameRu);
+          return !!((o && (en === o || ru === o)) || (t && (ru === t || en === t)));
         };
-        var pick = function (tol, needName) {
-          for (var i = 0; i < films.length; i++) {
-            if (!typeOk(films[i])) continue;
-            if (needName && !nameOk(films[i])) continue;
-            var fy = parseInt(films[i].year, 10);
-            if (!y || (!isNaN(fy) && Math.abs(fy - y) <= tol)) return films[i];
-          }
-          return null;
+        var gap = function (f) {
+          var fy = parseInt(f.year, 10);
+          return !y ? 0 : isNaN(fy) ? 99 : Math.abs(fy - y);
         };
-        var hit = pick(0) || pick(1) || pick(KP_YEAR_SLACK, true);
+        var cands = films.filter(typeOk);
+        var hit = null;
+        // Совпало название — ближайший по году в пределах допуска
+        cands.forEach(function (f) {
+          if (nameOk(f) && gap(f) <= KP_YEAR_SLACK && (!hit || gap(f) < gap(hit))) hit = f;
+        });
+        // Названия не совпали (другой перевод, нет английского) — берём, только если вариант того же года один
+        if (!hit) {
+          var same = cands.filter(function (f) { return gap(f) === 0; });
+          if (same.length === 1) hit = same[0];
+        }
         if (hit) return byId(hit.filmId);
         // Для журнала: что вернул поиск (до 5 вариантов: тип, год, название) — чтобы понять, почему не совпало
         it.kpProbe = {
