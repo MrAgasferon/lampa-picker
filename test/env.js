@@ -16,7 +16,7 @@ const NAMES = ['certOf', 'kidsOk', 'kidsTargeted', 'adultRated', 'harshAdult', '
   'pickWeights', 'moodScore', 'postReason', 'prefilter', 'scoreAll', 'ratingOffsets', 'cachedRatings', 'tmdb', 'tmdbUrl',
   'details', 'compact', 'cubMeta', 'Cache', 'Durable', 'Net', 'KpNet', 'CubNet', 'attachRatings', 'attachCubMeta', 'kpQuota',
   'fetchRatings', 'run', 'cancelRun', 'nextPage', 'PickerComponent', 'feedback', 'saveFeedback', 'Journal', 'progress',
-  'startedAny', 'seriesStarted', 'moodFromScales', 'reasonOf', 'todaySeed', 'jitter', 'dislikeMult', 'shadowPick', 'votesText', 'repeatMult', 'markShownToday', 'shownToday', 'attachRatings', 'normTitle'];
+  'startedAny', 'seriesStarted', 'moodFromScales', 'reasonOf', 'todaySeed', 'jitter', 'dislikeMult', 'shadowPick', 'votesText', 'repeatMult', 'markShownToday', 'shownToday', 'attachRatings', 'normTitle', 'attachKidsAge'];
 const HOOK = '\n  window.__pk = {' + NAMES.map(n => n + ": (typeof " + n + " !== 'undefined' ? " + n + ' : undefined)').join(', ') +
   ", getKpRunCap: function () { return typeof kpRunCap !== 'undefined' ? kpRunCap : undefined; } };\n";
 const END = RAW.lastIndexOf('})()');
@@ -25,6 +25,8 @@ const SRC = RAW.slice(0, END) + HOOK + RAW.slice(END);
 
 // ---------------------------------------------------------------- виртуальное время
 const flush = () => new Promise(r => setImmediate(r));
+// Исключения внутри таймеров плагина: раньше только печатались, теперь проверка их видит (run.js)
+const ERRORS = [];
 
 function makeClock(start) {
   let now = start, seq = 0;
@@ -42,7 +44,7 @@ function makeClock(start) {
   const fire = (b) => {
     now = Math.max(now, b.t.at);
     if (b.t.every) { b.t.at = now + b.t.every; b.t.seq = ++seq; } else timers.delete(b.id);
-    try { b.t.fn.apply(null, b.t.args || []); } catch (e) { console.error('[timer]', e && e.stack || e); }
+    try { b.t.fn.apply(null, b.t.args || []); } catch (e) { ERRORS.push(String(e && e.stack || e).split('\n').slice(0, 2).join(' | ')); }
   };
   return {
     get now() { return now; },
@@ -178,7 +180,8 @@ function makeEnv(o) {
     const r = router(url, params, defaultRouter) || { status: 404 };
     if (r.hang) return;                                   // никогда не отвечает ни успехом, ни ошибкой
     const delay = r.delay || 3;
-    if (delay > this._t) { clock.setTimeout(function () { fail({ status: 0 }); }, this._t); return; }
+    // ignoreTimeout: запрос «не замечает» свой таймаут и отвечает позже (как зависшая сеть на ТВ)
+    if (delay > this._t && !r.ignoreTimeout) { clock.setTimeout(function () { fail({ status: 0 }); }, this._t); return; }
     clock.setTimeout(function () {
       if ('status' in r && r.status !== 200) fail({ status: r.status });
       else ok(JSON.parse(JSON.stringify(r.body)));
@@ -257,6 +260,8 @@ function makeEnv(o) {
       error: e => { out = { error: e || true }; }
     });
     await clock.until(() => !!out, maxMs || 120000);
+    // Хвост после подбора (запись журнала через 2 с, поздние колбэки) тоже должен отработать без исключений
+    if (out) await clock.advance(3000);
     return Object.assign({ stages, timedOut: !out }, out || {});
   };
   // Профиль по текущим данным (collect → enrichEvents → buildProfile)
@@ -268,4 +273,4 @@ function makeEnv(o) {
   return env;
 }
 
-module.exports = { makeEnv, makeClock, movie, detailsOf, card, hash, fakeIdb, PICKER, RAW };
+module.exports = { ERRORS, makeEnv, makeClock, movie, detailsOf, card, hash, fakeIdb, PICKER, RAW };

@@ -459,10 +459,13 @@ const CHECKS = [
     const m = pk.moodFromScales({ moods: { humor: 7 } }, { mood: 'relax', company: 'solo' });
     return { ok: m === null, got: 'оценка по шкалам ' + m };
   } },
-  { id: 'F23b', title: 'picker_seen: даты пропавших из списков карточек вычищаются', fn: async () => {
+  { id: 'F23b', title: 'picker_seen: даты пропавших из списков карточек вычищаются (не позже чем через 31 день)', fn: async () => {
+    // Сразу или с отсрочкой — решает код (см. N3: смена профиля CUB не должна стирать даты в тот же день)
     const likes = []; for (let i = 0; i < 30; i++) likes.push(card(100 + i));
     const seen = {}; for (let i = 0; i < 300; i++) seen['movie:' + (5000 + i)] = 1700000000000;
     const env = makeEnv({ fav: { like: likes }, storage: { picker_seen: seen, picker_seen_init: 1700000000000 } });
+    env.pk.collect();
+    await env.clock.advance(31 * 864e5);
     env.pk.collect();
     const n = Object.keys(env.storage.picker_seen).length;
     return { ok: n === 30, got: 'дат в picker_seen: ' + n };
@@ -993,4 +996,156 @@ const CHECKS = [
   } }
 ];
 
+// ------------------------------------------------------------------ аудит 0.13.1 (AUDIT_lampa-picker_0.13.1.md)
+CHECKS.push(
+  { id: 'N1', title: 'Любитель анимации: семейный мультфильм не тонет в оценке настроения (−0,4)', fn: async () => {
+    const { pk } = makeEnv();
+    const prof = { n: 20, pos: 20, animShare: 0.6, f: { genre: {} } };
+    const ans = { time: 'any', mood: 'any', company: 'solo' };
+    const fam = pk.moodScore({ genres: [16, 10751], cert: null, moods: null }, ans, prof);
+    const adv = pk.moodScore({ genres: [16, 12], cert: null, moods: null }, ans, prof);
+    const pass = why(pk, item({ genres: [16, 10751], cert: certObj(pk, 'PG', '6+') }), { company: 'solo' }, { n: 20, pos: 20, animShare: 0.6, f: {} });
+    return { ok: fam >= adv - 0.05, got: 'фильтр: ' + pass + '; M семейного ' + r2(fam) + ', M приключенческого ' + r2(adv) };
+  } },
+  { id: 'N2', title: 'reset() забывает и выученные «не мой жанр»', fn: async () => {
+    const likes = []; for (let i = 0; i < 12; i++) likes.push(card(100 + i));
+    const env = makeEnv({ fav: { like: likes } });
+    const t = env.clock.now, rej = {};
+    [900, 901, 902].forEach(id => { rej['movie:' + id] = { t, r: 'genre', card: { id, genre_ids: [27], method: 'movie' } }; });
+    env.storage.picker_feedback = { rejected: rej, seen: {}, opened: {} };
+    const before = (await env.profile()).profile.rejGenres || {};
+    env.w.LampaPicker.reset();
+    const after = (await env.profile()).profile.rejGenres || {};
+    return { ok: !Object.keys(after).length, got: 'до reset: ' + JSON.stringify(before) + ', после: ' + JSON.stringify(after) };
+  } },
+  { id: 'N3', title: 'Смена профиля CUB (другие списки) не стирает даты знакомства прежнего профиля', fn: async () => {
+    // Профиль А: 250 «Нравится» и 40 в истории, знакомы давно. Профиль Б: 25 других «Нравится»
+    const A = []; for (let i = 0; i < 250; i++) A.push(card(1000 + i));
+    const H = []; for (let i = 0; i < 40; i++) H.push(card(5000 + i));
+    const B = []; for (let i = 0; i < 25; i++) B.push(card(8000 + i));
+    const seen = {}, old = Date.now() - 400 * 864e5;
+    A.forEach((c, i) => { seen['movie:' + c.id] = old + i * 864e5; });
+    H.forEach((c, i) => { seen['movie:' + c.id] = old + i * 864e5; });
+    const env = makeEnv({ fav: { like: A, history: H }, storage: { picker_seen: seen, picker_seen_init: old, account: { profile: { id: 1 } } } });
+    env.pk.collect();                                          // профиль А
+    env.storage.account = { profile: { id: 2 } };              // переключились на Б (как profile_select в Lampa)
+    env.fav.like = B; env.fav.history = [];
+    env.pk.collect();
+    await env.clock.advance(864e5);                             // назавтра снова А
+    env.storage.account = { profile: { id: 1 } };
+    env.fav.like = A; env.fav.history = H;
+    const ev = env.pk.collect();
+    const kept = A.filter(c => (env.storage.picker_seen || {})['movie:' + c.id] === seen['movie:' + c.id]).length;
+    const batch = ev.filter(e => e.batch).length;
+    return { ok: kept === A.length, got: 'даты сохранились у ' + kept + ' из ' + A.length + ' «Нравится» профиля А; помечено пачкой: ' + batch };
+  } },
+  { id: 'N6', title: 'Второй профиль CUB: первый запуск на нём — импорт истории, а не «пачка» лайков', fn: async () => {
+    const A = []; for (let i = 0; i < 50; i++) A.push(card(1000 + i));
+    const B = []; for (let i = 0; i < 30; i++) B.push(card(8000 + i));
+    const HB = []; for (let i = 0; i < 60; i++) HB.push(card(9000 + i));
+    const env = makeEnv({ fav: { like: A }, storage: { account: { profile: { id: 1 } } } });
+    env.pk.collect();                                          // первый запуск плагина — на профиле А
+    await env.clock.advance(3 * 864e5);
+    env.storage.account = { profile: { id: 2 } };              // через три дня — профиль Б со своей историей
+    env.fav.like = B; env.fav.history = HB;
+    const likes = env.pk.collect().filter(e => e.flags.like);
+    const b = likes.filter(e => e.batch).length;
+    return { ok: likes.length === 30 && b === 0, got: '«Нравится» профиля Б: ' + likes.length + ', пачкой ' + b + (b ? ' (вес ' + likes[0].s + ')' : '') };
+  } },
+  { id: 'N4', title: 'Отменённый подбор не шлёт новых запросов к КП', fn: async () => {
+    const router = (url, p, def) => (url.indexOf('kinopoiskapiunofficial') > -1
+      ? { delay: 1500, body: { items: [{ ratingKinopoisk: 7.5, ratingImdb: 7.2, kinopoiskId: 1 }] } } : def(url));
+    const env = makeEnv(Object.assign(baseWorld(), { kp: true, router }));
+    const kp = () => env.log.urls.filter(u => u.indexOf('kinopoiskapiunofficial') > -1).length;
+    env.pk.run(ANY, { stage() {}, done() {}, error() {} });
+    await env.clock.until(() => kp() > 0, 60000);
+    const atCancel = kp();
+    env.pk.cancelRun();                                        // «Назад» во время «Уточняю настроение и рейтинги»
+    await env.clock.advance(10000);
+    const after = kp() - atCancel;
+    return { ok: after === 0, got: 'запросов к КП до отмены ' + atCancel + ', после отмены ещё ' + after };
+  } },
+  { id: 'N5', title: 'КП ушёл в офлайн — подбор не ждёт дедлайн впустую', fn: async () => {
+    const env = makeEnv({ kp: true, router: (url, p, def) => (url.indexOf('kinopoisk') > -1 ? { status: 0 } : def(url)) });
+    const list = Array.from({ length: 20 }, (_, i) => ({ k: 'movie:' + (3000 + i), id: 3000 + i, type: 'movie', score: 1 - i / 100,
+      c: { id: 3000 + i, va: 7, vc: 5000, imdb: 'tt' + (3000 + i), title: 'F' } }));
+    const t0 = env.clock.now;
+    await env.cb(cb => env.pk.attachRatings(list, cb));
+    const ms = env.clock.now - t0;
+    return { ok: ms < 1500, got: 'офлайн КП: ' + !!(env.storage.picker_kp_off > env.clock.now) + ', подбор ждал ' + (ms / 1000) + ' с' };
+  } },
+  { id: 'N7', title: 'Кеш в памяти — LRU (как в DOCS): часто читаемое не вытесняется', fn: async () => {
+    const { pk } = makeEnv();
+    pk.Cache.set('hot', { v: 1 });
+    for (let i = 0; i < 450; i++) { pk.Cache.set('k' + i, i); if (i % 10 === 0) pk.Cache.get('hot', 1e9, () => {}); }
+    return { ok: !!pk.Cache.mem.hot, got: pk.Cache.mem.hot ? 'горячий ключ в памяти' : 'горячий ключ вытеснен (FIFO)' };
+  } },
+  { id: 'N8', title: 'Экран журнала без отладки не сериализует весь журнал', fn: async () => {
+    const likes = []; for (let i = 0; i < 6; i++) likes.push(card(100 + i));
+    const env = makeEnv({ fav: { like: likes } });
+    env.pk.Durable.vals.journal = [{ id: env.clock.now, answers: 'a', counts: {}, shown: [], actions: [] }];
+    let calls = 0; const orig = env.pk.Journal.exportText;
+    env.pk.Journal.exportText = function () { calls++; return orig.apply(this, arguments); };
+    const comp = new env.pk.PickerComponent({});
+    env.w.document.body.appendChild(comp.create()[0]);
+    env.$('.pkr-btn').filter(function () { return env.$(this).text().indexOf('Журнал') > -1; }).eq(0).trigger('hover:enter');
+    await env.clock.advance(100);
+    return { ok: calls === 0, got: 'exportText при открытии экрана: ' + calls };
+  } }
+);
+
+
+CHECKS.push(
+  { id: 'N17', title: '«С детьми»: возраст с КП — в том же бюджете подбора, что и оценки (≤ 12 запросов со встроенным ключом)', fn: async () => {
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        if (/films\/\d+$/.test(url)) return { delay: 50, body: { kinopoiskId: 1, ratingKinopoisk: 7, ratingAgeLimits: 'age6' } };
+        return { delay: 50, body: { items: [{ kinopoiskId: 1 }] } };          // по IMDb: нашёлся, без оценок
+      }
+      return def(url);
+    };
+    const o = baseWorld({ kp: true, router });
+    for (let i = 0; i < 40; i++) o.world.movies[300 + i] = movie(300 + i, { genre_ids: [10751, 12], cert: cert('PG-13', null) });
+    const env = makeEnv(o);
+    const r = await env.run({ time: 'any', mood: 'any', company: 'kids' });
+    const n = env.log.urls.filter(u => u.indexOf('kinopoiskapiunofficial') > -1).length;
+    return { ok: !!r.st && n <= 12, got: 'запросов к КП за один подбор: ' + n };
+  } },
+  { id: 'N17b', title: '«С детьми»: у фильма с российским рейтингом возраст на КП не спрашивается', fn: async () => {
+    const urls = [];
+    const env = makeEnv({ kp: true, router: (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) { urls.push(url); return { body: { kinopoiskId: 1, ratingAgeLimits: 'age6', items: [{ kinopoiskId: 1 }] } }; }
+      return def(url);
+    } });
+    const list = [
+      { k: 'movie:1', score: 1, c: { id: 1, type: 'movie', imdb: 'tt1', cert: { ru: '6+', us: 'PG' } } },
+      { k: 'movie:2', score: 0.9, c: { id: 2, type: 'movie', imdb: 'tt2', cert: { us: 'PG-13' } } }
+    ];
+    await env.cb(cb => env.pk.attachKidsAge(list, cb));
+    const askedRu = urls.some(u => u.indexOf('tt1') > -1);
+    return { ok: !askedRu && list[1].c.kpAge === 6, got: 'с RU: ' + (askedRu ? 'спрошен' : 'не спрошен') + '; без RU: возраст КП ' + list[1].c.kpAge };
+  } },
+  { id: 'N12', title: 'КП ушёл в офлайн — задания из очереди сразу получают отказ, а не ждут дедлайн', fn: async () => {
+    const env = makeEnv({ kp: true, router: (url, p, def) => (url.indexOf('kinopoisk') > -1 ? { delay: 200, status: 0 } : def(url)) });
+    const mk = base => Array.from({ length: 10 }, (_, i) => ({ k: 'movie:' + (base + i), score: 1 - i / 100,
+      c: { id: base + i, type: 'movie', va: 7, vc: 5000, imdb: 'tt' + (base + i), title: 'F', cert: { us: 'PG' } } }));
+    const t0 = env.clock.now;
+    let tA = 0, tB = 0;
+    env.pk.attachRatings(mk(3000), () => { tA = env.clock.now - t0; });     // оценки и возраст идут одновременно —
+    env.pk.attachKidsAge(mk(4000), () => { tB = env.clock.now - t0; });    // в очереди КП есть ждущие задания
+    await env.clock.until(() => tA && tB, 20000);
+    return { ok: tA < 1500 && tB < 1500, got: 'оценки закончили через ' + tA / 1000 + ' с, возраст — через ' + tB / 1000 + ' с' };
+  } },
+  { id: 'N13', title: 'Один зависший запрос КП — один сбой, а не два (КП не выключается на час)', fn: async () => {
+    let n = 0;
+    const env = makeEnv({ kp: true, router: (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) { n++; return { delay: 6000, status: 0, ignoreTimeout: true }; }
+      return def(url);
+    } });
+    env.pk.fetchRatings({ k: 'movie:5', c: { id: 5, type: 'movie', imdb: 'tt5', title: 'X', original: 'X', year: '2014', va: 7 } }, () => {});
+    await env.clock.advance(8000);
+    const off = env.storage.picker_kp_off > env.clock.now;
+    return { ok: n === 1 && !off, got: 'запросов ' + n + ', КП выключен на час: ' + (off ? 'да' : 'нет') };
+  } }
+);
 module.exports = CHECKS;
