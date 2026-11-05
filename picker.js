@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.13.0';
+  var VERSION = '0.13.1';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -255,6 +255,7 @@
   // Кеш: IndexedDB с запасным вариантом в памяти
   // =========================================================================
 
+  var CACHE_GET_TIMEOUT = 8000;    // мс на чтение из IndexedDB: обычно — миллисекунды; 8 с — явно зависла
   var CACHE_MEM_MAX = 400;          // записей в памяти; источник правды — IndexedDB
   var CACHE_IDB_MAX_AGE = 35 * DAY;  // старше — удаляется при суточной чистке
 
@@ -323,21 +324,28 @@
       } catch (e) { done(); }
     },
 
+    // cb(значение) или cb(null). Второй аргумент 'timeout' — база не ответила вовремя: значение неизвестно,
+    // а не «пусто» (Durable по нему не перезаписывает данные на диске)
     get: function (key, ttl, cb) {
       var self = this;
       self.init(function () {
         var m = self.mem[key];
         if (m) return cb(now() - m.t < ttl ? m.v : null);
         if (!self.db) return cb(null);
+        if (self.stalled) return cb(null, 'timeout');   // база уже не ответила — в этой сессии не ждём её снова
+        var done = false;
+        var reply = function (v, why) { if (done) return; done = true; clearTimeout(guard); cb(v, why); };
+        // WebView иногда не вызывает ни onsuccess, ни onerror — подбор не должен ждать вечно
+        var guard = setTimeout(function () { log('IndexedDB: нет ответа', key); self.stalled = true; reply(null, 'timeout'); }, CACHE_GET_TIMEOUT);
         try {
           var r = self.db.transaction('kv', 'readonly').objectStore('kv').get(key);
           r.onsuccess = function () {
             var x = r.result;
-            if (x) { self.remember(key, x); cb(now() - x.t < ttl ? x.v : null); }
-            else cb(null);
+            if (x) self.remember(key, x);       // поздний ответ тоже идёт в память — пригодится следующему чтению
+            if (x) reply(now() - x.t < ttl ? x.v : null); else reply(null);
           };
-          r.onerror = function () { cb(null); };
-        } catch (e) { cb(null); }
+          r.onerror = function () { reply(null); };
+        } catch (e) { reply(null); }
       });
     },
 
@@ -361,6 +369,7 @@
     waiting: {},
     timers: {},
     loading: {},    // чтение из IndexedDB в полёте
+    readOnly: {},   // чтение не удалось (таймаут) — на диск не пишем до перезапуска
     touched: {},    // во время чтения записали: 'merge' — дописать к прочитанному, 'replace' — прочитанное не нужно
 
     // Однократный перенос старых данных из localStorage
@@ -380,8 +389,11 @@
       if (self.waiting[key].length > 1) return;
       self.loading[key] = true;
 
-      Cache.get('durable:' + key, Infinity, function (v) {
-        var legacy = self.takeLegacy(key);
+      Cache.get('durable:' + key, Infinity, function (v, why) {
+        // Не дождались базы: на диске, возможно, лежит журнал — работаем в памяти и на диск не пишем,
+        // иначе запишем поверх него пустой или частичный
+        if (why === 'timeout') self.readOnly[key] = true;
+        var legacy = why === 'timeout' ? null : self.takeLegacy(key);
         if ((v === null || v === undefined) && legacy !== null) v = legacy;
         var touched = self.touched[key], local = self.vals[key];
         self.loading[key] = false;
@@ -420,9 +432,11 @@
       self.timers[key] = setTimeout(function () { self.flush(key); }, 2000);
     },
 
-    flush: function (key) {
+    // force — явная очистка пользователем: пишем, даже если база в этой сессии не прочиталась
+    flush: function (key, force) {
       if (this.timers[key]) { clearTimeout(this.timers[key]); this.timers[key] = null; }
       if (this.loading[key] && this.touched[key] !== 'replace') return;  // запишем после чтения, уже слитое
+      if (this.readOnly[key] && !force) return;
       Cache.set('durable:' + key, this.vals[key]);
     },
 
@@ -446,6 +460,21 @@
     } catch (e) { return 'ru'; }
   }
 
+  // В сборке нет Lampa.TMDB.api — повторяем логику самой Lampa: свой прокси из настроек →
+  // прокси CUB → напрямую. Чужих адресов в коде нет: какой прокси, решает пользователь в настройках Lampa
+  function tmdbFallback(rel) {
+    var proto = 'https://';
+    try { proto = Lampa.Utils.protocol(); } catch (e) {}
+    var direct = proto + 'api.themoviedb.org/3/' + rel;
+    var field = function (n) { try { return Lampa.Storage.field ? Lampa.Storage.field(n) : Lampa.Storage.get(n, ''); } catch (e) { return ''; } };
+    if (!field('proxy_tmdb')) return direct;
+    var own = String(field('tmdb_proxy_api') || '').replace(/\/+$/, '');
+    if (own) return (/^https?:\/\//.test(own) ? own : proto + own) + '/' + direct;
+    var cub = '';
+    try { cub = Lampa.Manifest && Lampa.Manifest.cub_domain; } catch (e) {}
+    return cub ? proto + 'apitmdb.' + cub + '/3/' + rel : direct;
+  }
+
   function tmdbUrl(path, params) {
     var lang = tmdbLang();
 
@@ -460,9 +489,7 @@
       if (Lampa.TMDB && typeof Lampa.TMDB.api === 'function') return Lampa.TMDB.api(rel);
     } catch (e) {}
 
-    var proto = 'https://';
-    try { proto = Lampa.Utils.protocol(); } catch (e) {}
-    return proto + 'tmdbapi.bylampa.online/3/' + rel;
+    return tmdbFallback(rel);
   }
 
   var LIST_TTL = 7 * DAY; // рекомендации и discover меняются медленно
@@ -1923,6 +1950,8 @@
 
   var HIGH_RATING = 7.0;   // ниже «Высокий рейтинг» звучит странно — ищем другое объяснение
   var HIGH_KP = 7.5;       // «Высоко на Кинопоиске» — как и в основной причине про КП
+  var HIGH_VOTES = 1000;
+  var NEW_GENRE_MAX = 0.1; // «Что-то новое» — жанр с весом в профиле по модулю меньше этого   // «Высокий рейтинг» без подтверждения КП — только от стольких голосов на TMDB
 
   var MOOD_REASON = {
     relax: 'под «Расслабиться»', laugh: 'чтобы посмеяться', nerves: 'чтобы пощекотать нервы',
@@ -2005,13 +2034,19 @@
         // Рейтинг — объяснение, только если он и правда высокий (на TMDB или на Кинопоиске).
         // TMDB 8,8 при КП 6,5 — не «высокий»: свежие фильмы TMDB завышает
         var kpLow = it.kp > 0 && it.kp < HIGH_RATING;
-        if (parts.r >= HIGH_RATING && !kpLow) return 'Высокий рейтинг: ' + rating1(parts.r) + ', ' + votesText(c.vc);
+        // Мало голосов на TMDB (239 — это ещё не «высокий») — нужен КП в подтверждение
+        var trusted = (c.vc || 0) >= HIGH_VOTES || it.kp >= HIGH_RATING;
+        if (parts.r >= HIGH_RATING && !kpLow && trusted) return 'Высокий рейтинг: ' + rating1(parts.r) + ', ' + votesText(c.vc);
         if (it.kp >= HIGH_KP) return 'Высоко на Кинопоиске: ' + rating1(it.kp);
       }
       if (k === 'n' && parts.n > 0) {
-        // Называем жанр, который и правда новый для вас, — не первый попавшийся
-        var ng = null, recentG = profile.recentGenres || [];
-        for (var ni = 0; ni < c.genres.length && !ng; ni++) if (recentG.indexOf(c.genres[ni]) < 0 && GENRE_NAMES[c.genres[ni]]) ng = c.genres[ni];
+        // Называем жанр, который и правда новый для вас: не из недавних и без отношения в профиле.
+        // Нелюбимый жанр «новым» не бывает
+        var ng = null, recentG = profile.recentGenres || [], pgw = (profile.f && profile.f.genre) || {};
+        for (var ni = 0; ni < c.genres.length && !ng; ni++) {
+          var g0 = c.genres[ni], w0 = pgw[g0];
+          if (recentG.indexOf(g0) < 0 && GENRE_NAMES[g0] && !(typeof w0 === 'number' && Math.abs(w0) >= NEW_GENRE_MAX)) ng = g0;
+        }
         if (ng) return 'Что-то новое: ' + GENRE_NAMES[ng].toLowerCase();
       }
     }
@@ -2662,7 +2697,7 @@
       this.saveEntry(entry);
     },
 
-    clear: function () { Durable.set('journal', [], true); Durable.flush('journal'); },
+    clear: function () { Durable.set('journal', [], true); Durable.flush('journal', true); },
 
     // Последний подбор в компактном виде — помещается в одно сообщение мессенджера
     exportLast: function () {
@@ -3105,7 +3140,7 @@
   function kpHeaders() { return { headers: { 'X-API-KEY': kpKey() } }; }
 
   var KP_YEAR_SLACK = 3;   // ±лет при совпадении названия
-  var KP_MATCH_V = 2;      // версия сопоставления: «не найден» от прежней версии переспрашиваем один раз
+  var KP_MATCH_V = 3;      // версия сопоставления: записи прежних версий без оценки переспрашиваем один раз
 
   // Название для сравнения: без регистра, знаков и «ё»
   function normTitle(t) {
@@ -3123,12 +3158,14 @@
     var m = map[it.k];
     // Второй аргумент cb — почему оценки нет (для журнала)
     // «Не найден» из старых версий (без записи, что ответил КП) переспрашиваем один раз — ради диагностики
-    var legacyMiss = m && !m.kp && !m.imdb && !m.id && (!m.probe || (m.probe.total > 0 && m.mv !== KP_MATCH_V));
+    var legacyMiss = m && !m.kp && !m.imdb && !m.id && (!m.probe || (m.probe.total > 0 && !(m.mv >= 2)));
     // Фильм на КП найден, но оценку ещё не спрашивали: запись от «С детьми» (возраст) или из старой версии
     // без отметки r — сразу за оценкой по id
-    // …или «нашёлся без оценки» от прежней версии (оценку брали из списка по IMDb, а не из карточки) — тоже по id, один раз
-    var ageOnly = m && !m.kp && !m.imdb && m.id && (!m.r || m.mv !== KP_MATCH_V);
-    if (m && now() - m.t < 14 * DAY && !legacyMiss && !ageOnly) {
+    var ageOnly = m && !m.kp && !m.imdb && m.id && !m.r;
+    // «Нашёлся без оценки» от прежней версии сопоставления: по названию мог найтись чужой фильм того же года
+    // («Мультивселенная» → Entangled) — сопоставляем заново, один раз
+    var staleNoRating = m && !m.kp && !m.imdb && m.id && m.r && !(m.mv >= KP_MATCH_V);
+    if (m && now() - m.t < 14 * DAY && !legacyMiss && !ageOnly && !staleNoRating) {
       if (m.kp || m.imdb) return cb({ kp: m.kp, imdb: m.imdb, src: 'cache' });
       if (m.probe) it.kpProbe = m.probe;
       return cb(null, m.id ? 'cached_no_rating' : 'cached_miss');   // нашёлся без оценки / не нашёлся
@@ -3176,7 +3213,7 @@
       KpNet.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(c.original || c.title), function (j) {
         var films = (j && j.films) || [];
         var y = parseInt(c.year, 10);
-        // Тип должен совпасть (фильм ≠ сериал), год — сначала точный, потом ±1
+        // Тип должен совпасть (фильм ≠ сериал)
         var typeOk = function (f) {
           var ft = String(f.type || '');
           if (!ft) return true;
@@ -3185,19 +3222,27 @@
         };
         // Год на КП бывает годом производства, а на TMDB — годом проката («Связь»: КП 2012, TMDB 2014).
         // Поэтому при совпадении названия допускаем разницу до 3 лет
+        // Название сверяем всегда: поиск по слову отдаёт и чужие фильмы того же года
+        // («Multiverse» → Entangled 2019 раньше нужной «Мультивселенной» 2018)
         var nameOk = function (f) {
-          return (c.original && normTitle(f.nameEn) === normTitle(c.original)) || (c.title && normTitle(f.nameRu) === normTitle(c.title));
+          var o = normTitle(c.original), t = normTitle(c.title), en = normTitle(f.nameEn), ru = normTitle(f.nameRu);
+          return !!((o && (en === o || ru === o)) || (t && (ru === t || en === t)));
         };
-        var pick = function (tol, needName) {
-          for (var i = 0; i < films.length; i++) {
-            if (!typeOk(films[i])) continue;
-            if (needName && !nameOk(films[i])) continue;
-            var fy = parseInt(films[i].year, 10);
-            if (!y || (!isNaN(fy) && Math.abs(fy - y) <= tol)) return films[i];
-          }
-          return null;
+        var gap = function (f) {
+          var fy = parseInt(f.year, 10);
+          return !y ? 0 : isNaN(fy) ? 99 : Math.abs(fy - y);
         };
-        var hit = pick(0) || pick(1) || pick(KP_YEAR_SLACK, true);
+        var cands = films.filter(typeOk);
+        var hit = null;
+        // Совпало название — ближайший по году в пределах допуска
+        cands.forEach(function (f) {
+          if (nameOk(f) && gap(f) <= KP_YEAR_SLACK && (!hit || gap(f) < gap(hit))) hit = f;
+        });
+        // Названия не совпали (другой перевод, нет английского) — берём, только если вариант того же года один
+        if (!hit) {
+          var same = cands.filter(function (f) { return gap(f) === 0; });
+          if (same.length === 1) hit = same[0];
+        }
         if (hit) return byId(hit.filmId);
         // Для журнала: что вернул поиск (до 5 вариантов: тип, год, название) — чтобы понять, почему не совпало
         it.kpProbe = {
@@ -3432,12 +3477,18 @@
     });
   }
 
+  // Путь постера TMDB — «/abc123.jpg». Всё остальное (кавычки, скобки, пробелы) — не постер: в разметку не пускаем
+  var POSTER_PATH = /^\/[A-Za-z0-9_\-]+\.(jpg|jpeg|png|webp)$/i;
+  function cssUrl(u) {
+    return String(u || '').replace(/["'()\\\s<>]/g, function (ch) { return '%' + ('0' + ch.charCodeAt(0).toString(16)).slice(-2); });
+  }
+
   function img(path, size) {
-    if (!path) return '';
+    if (!path || !POSTER_PATH.test(String(path))) return '';
     try {
-      if (Lampa.TMDB && typeof Lampa.TMDB.image === 'function') return Lampa.TMDB.image('t/p/' + size + path);
+      if (Lampa.TMDB && typeof Lampa.TMDB.image === 'function') return cssUrl(Lampa.TMDB.image('t/p/' + size + path));
     } catch (e) {}
-    return 'https://image.tmdb.org/t/p/' + size + path;
+    return cssUrl('https://image.tmdb.org/t/p/' + size + path);
   }
 
   var CSS = [
@@ -4509,7 +4560,7 @@
       }));
       wrap.append(actions);
 
-      try { console.log('[Picker] journal\n' + text); } catch (e) {}
+      if (isDebug()) { try { console.log('[Picker] journal\n' + text); } catch (e) {} }
 
       var rows = $('<div class="pkr-j__list"></div>');
       for (var i = list.length - 1; i >= 0 && i >= list.length - 8; i--) rows.append(sessionLine(list[i]));
@@ -4725,6 +4776,11 @@
   }
 
   // Диагностика из консоли: LampaPicker.diag()
+  // api_key=…, email=… в адресах для отчёта — маской
+  function maskKeys(u) {
+    return String(u || '').replace(/(api_key|key|email|token)=([^&]+)/gi, function (m, k) { return k + '=…'; });
+  }
+
   function diag() {
     var report = { version: VERSION, favorites: {}, timelineSample: null, tmdbUrl: null, kpCache: 0, manifest: null };
     each(SIGNALS, function (v, ft) { report.favorites[ft] = favList(ft).length; });
@@ -4733,7 +4789,7 @@
       var p = progress(hist[i]);
       if (p) report.timelineSample = { title: hist[i].title || hist[i].name, progress: p };
     }
-    report.tmdbUrl = tmdbUrl('movie/27205', {});
+    report.tmdbUrl = maskKeys(tmdbUrl('movie/27205', {}));
     try { report.kpCache = Object.keys(kpCache()).length; } catch (e) {}
     try { report.manifest = Lampa.Manifest && Lampa.Manifest.origin; } catch (e) {}
     report.hasTmdbKey = !!(Lampa.TMDB && Lampa.TMDB.key);
@@ -4756,7 +4812,7 @@
 
     console.log('[Picker] diag', report);
     tmdb('movie/27205', {}, 0, function (d) {
-      console.log('[Picker] TMDB test:', d && d.id ? 'OK — ' + (d.title || d.original_title) : 'FAIL', d);
+      console.log('[Picker] TMDB test:', d && d.id ? 'OK — ' + (d.title || d.original_title) : 'FAIL');
     });
     return report;
   }
