@@ -877,6 +877,94 @@ const CHECKS = [
     const ok = !!(a && a[0] && a[0].kp === 5.9) && b && b[1] === 'no_rating' && d && d[1] === 'not_found';
     return { ok, got: 'нужный: ' + (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + '; один чужой: ' + (b && (b[0] ? 'КП ' + b[0].kp : b[1])) + '; два чужих: ' + (d && (d[0] ? 'КП ' + d[0].kp : d[1])) };
   } },
+  { id: 'P3m', title: 'КП: по IMDb-номеру пустой дубль и настоящая карточка — берётся карточка с оценкой («Патруль времени»)', fn: async () => {
+    const urls = [];
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        urls.push(url.replace(/^.*\/api\//, ''));
+        if (url.indexOf('imdbId=') > -1) return { body: { items: [
+          { kinopoiskId: 1155501, type: 'FILM', year: 2014, nameOriginal: 'Predestination', ratingKinopoisk: null, ratingImdb: null },
+          { kinopoiskId: 679924, type: 'FILM', year: 2014, nameRu: 'Патруль времени', ratingKinopoisk: 6.9, ratingImdb: 7.4 }] } };
+        return { body: {} };
+      }
+      return def(url);
+    };
+    const env = makeEnv({ kp: true, router });
+    const c = { id: 206487, type: 'movie', imdb: 'tt2397535', title: 'Патруль времени', original: 'Predestination', year: '2014', va: 7.4 };
+    const a = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:206487', c }, cb));
+    const ok = !!(a && a[0] && a[0].kp === 6.9) && urls.length === 1;
+    return { ok, got: (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + ', запросы: ' + urls.join(', ') };
+  } },
+  { id: 'P3n', title: 'КП: по IMDb только пустой дубль — один запасной поиск по названию находит настоящую карточку', fn: async () => {
+    const urls = [];
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        urls.push(url.replace(/^.*\/api\//, ''));
+        if (url.indexOf('imdbId=') > -1) return { body: { items: [{ kinopoiskId: 1155501, type: 'FILM', year: 2014, nameOriginal: 'Predestination' }] } };
+        if (url.indexOf('search-by-keyword') > -1) return { body: { films: [
+          { filmId: 1155501, type: 'FILM', year: '2014', nameEn: 'Predestination', rating: 'null', ratingVoteCount: 38 },
+          { filmId: 679924, type: 'FILM', year: '2014', nameRu: 'Патруль времени', nameEn: 'Predestination', rating: '6.9', ratingVoteCount: 300000 }] } };
+        if (/films\/679924$/.test(url)) return { body: { kinopoiskId: 679924, ratingKinopoisk: 6.9, ratingImdb: 7.4 } };
+        if (/films\/1155501$/.test(url)) return { body: { kinopoiskId: 1155501, type: 'FILM', year: 2014, nameOriginal: 'Predestination', ratingKinopoiskVoteCount: 38 } };
+      }
+      return def(url);
+    };
+    const env = makeEnv({ kp: true, router });
+    const c = { id: 206487, type: 'movie', imdb: 'tt2397535', title: 'Патруль времени', original: 'Predestination', year: '2014', va: 7.4 };
+    const a = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:206487', c }, cb));
+    const n1 = urls.length;
+    const b = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:206487', c }, cb));
+    const ok = !!(a && a[0] && a[0].kp === 6.9) && n1 === 4 && !!(b && b[0] && b[0].src === 'cache') && urls.length === n1;
+    return { ok, got: 'первый: ' + (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + ', второй: ' + (b && b[0] ? b[0].src : b && b[1]) + ', запросы: ' + urls.join(', ') };
+  } },
+  { id: 'P3o', title: 'КП: запись «пустой дубль без оценки» от прежней версии и запись «только возраст» переспрашиваются и находят настоящую карточку', fn: async () => {
+    const urls = [];
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        urls.push(url.replace(/^.*\/api\//, ''));
+        if (url.indexOf('imdbId=') > -1) return { body: { items: [{ kinopoiskId: 1155501, type: 'FILM', year: 2014 }] } };
+        if (url.indexOf('search-by-keyword') > -1) return { body: { films: [
+          { filmId: 1155501, type: 'FILM', year: '2014', nameEn: 'Predestination', rating: 'null', ratingVoteCount: 38 },
+          { filmId: 679924, type: 'FILM', year: '2014', nameRu: 'Патруль времени', nameEn: 'Predestination', rating: '6.9', ratingVoteCount: 300000 }] } };
+        if (/films\/679924$/.test(url)) return { body: { kinopoiskId: 679924, ratingKinopoisk: 6.9, ratingImdb: 7.4, ratingAgeLimits: 'age16' } };
+        if (/films\/1155501$/.test(url)) return { body: { kinopoiskId: 1155501, ratingKinopoiskVoteCount: 38, ratingAgeLimits: 'age18' } };
+      }
+      return def(url);
+    };
+    const env = makeEnv({ kp: true, router });
+    env.pk.Durable.vals.kpmap = {
+      'movie:206487': { kp: 0, imdb: 0, id: 1155501, r: 1, mv: 3, t: env.clock.now - 86400000, va: 7.4 },
+      'movie:206488': { kp: 0, imdb: 0, id: 1155501, age: 18, t: env.clock.now - 86400000, va: 7.4 }
+    };
+    env.pk.Durable.loaded.kpmap = true;
+    const c1 = { id: 206487, type: 'movie', imdb: 'tt2397535', title: 'Патруль времени', original: 'Predestination', year: '2014', va: 7.4 };
+    const c2 = Object.assign({}, c1, { id: 206488 });
+    const a = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:206487', c: c1 }, cb));
+    const b = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:206488', c: c2 }, cb));
+    const rec = env.pk.Durable.vals.kpmap['movie:206488'];
+    const ok = !!(a && a[0] && a[0].kp === 6.9) && !!(b && b[0] && b[0].kp === 6.9) && rec && rec.id === 679924 && rec.age === 16;
+    return { ok, got: 'прежняя запись: ' + (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + '; «только возраст»: ' + (b && b[0] ? 'КП ' + b[0].kp : b && b[1]) + ', id ' + (rec && rec.id) + ', возраст ' + (rec && rec.age) };
+  } },
+  { id: 'P3p', title: 'КП: оценки нет нигде — после пустой карточки ровно один поиск, дальше «без оценки» из кеша', fn: async () => {
+    const urls = [];
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        urls.push(url.replace(/^.*\/api\//, ''));
+        if (url.indexOf('imdbId=') > -1) return { body: { items: [{ kinopoiskId: 700, type: 'FILM', year: 2020 }] } };
+        if (url.indexOf('search-by-keyword') > -1) return { body: { films: [{ filmId: 700, type: 'FILM', year: '2020', nameEn: 'Elize', rating: 'null', ratingVoteCount: 3 }] } };
+        if (/films\/700$/.test(url)) return { body: { kinopoiskId: 700, type: 'FILM', year: 2020, nameOriginal: 'Elize', ratingKinopoiskVoteCount: 3 } };
+      }
+      return def(url);
+    };
+    const env = makeEnv({ kp: true, router });
+    const c = { id: 9, type: 'movie', imdb: 'tt9', title: 'Elize', original: 'Elize', year: '2020', va: 6 };
+    const a = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:9', c }, cb));
+    const n1 = urls.length;
+    const b = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:9', c }, cb));
+    const rec = env.pk.Durable.vals.kpmap['movie:9'];
+    const ok = a && a[1] === 'no_rating' && n1 === 3 && b && b[1] === 'cached_no_rating' && urls.length === n1 && rec && rec.id === 700;
+    return { ok, got: 'первый: ' + (a && a[1]) + ', второй: ' + (b && b[1]) + ', запросы (' + urls.length + '): ' + urls.join(', ') };
+  } },
   { id: 'P8', title: 'Опорные — только «Нравится» и просмотренное; открытое из подборки и закладки — нет', fn: async () => {
     const w = baseWorld();
     w.fav.like = [card(100, { title: 'Liked' })];

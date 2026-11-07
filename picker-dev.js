@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.13.2-dev';
+  var VERSION = '0.13.3-dev';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -3177,7 +3177,30 @@
   function kpHeaders() { return { headers: { 'X-API-KEY': kpKey() } }; }
 
   var KP_YEAR_SLACK = 3;   // ±лет при совпадении названия
-  var KP_MATCH_V = 3;      // версия сопоставления: записи прежних версий без оценки переспрашиваем один раз
+  var KP_MATCH_V = 4;      // версия сопоставления: записи прежних версий без оценки переспрашиваем один раз
+
+  // Тип карточки КП совпадает с типом TMDB (фильм ≠ сериал); пустой тип не мешает
+  function kpTypeOk(ft, ctype) {
+    ft = String(ft || '');
+    if (!ft) return true;
+    var isTv = /SERIES|TV_SHOW/.test(ft);
+    return ctype === 'tv' ? isTv : !isTv;
+  }
+  // Есть ли у варианта оценка: карточка/список (ratingKinopoisk, ratingImdb) или поиск (rating; «86%» — ожидание, не оценка)
+  function kpRated(x) {
+    if (!x) return false;
+    if (parseFloat(x.ratingKinopoisk) > 0 || parseFloat(x.ratingImdb) > 0) return true;
+    var r = String(x.rating == null ? '' : x.rating);
+    return r.indexOf('%') < 0 && parseFloat(r) > 0;
+  }
+  // Из списка по IMDb-номеру: КП бывает отдаёт на один номер и пустую карточку-дубль («Патруль времени»:
+  // 1155501 без оценок раньше настоящей 679924) — берём карточку нужного типа с оценкой
+  function kpPickItem(items, ctype) {
+    var list = (items || []).filter(function (x) { return x && x.kinopoiskId; });
+    var typed = list.filter(function (x) { return kpTypeOk(x.type, ctype); });
+    var rated = typed.filter(kpRated);
+    return rated[0] || typed[0] || list[0] || null;
+  }
 
   // Название для сравнения: без регистра, знаков и «ё»
   function normTitle(t) {
@@ -3232,13 +3255,20 @@
 
     var imdbRes = '';   // что ответил поиск по IMDb-номеру — для журнала
 
-    var byId = function (kpId) {
+    // Карточка, найденная по IMDb или из kpmap, оказалась без оценки: возможно, это пустой дубль, а настоящая
+    // карточка — другая. Один раз ищем по названию без неё; не нашлось — остаёмся с этой («без оценки»)
+    var stub = null;
+    var byId = function (kpId, fromTitle) {
       if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
       KpNet.get(KP_API + 'api/v2.2/films/' + kpId, function (j) {
-        if (j && !(parseFloat(j.ratingKinopoisk) > 0 || parseFloat(j.ratingImdb) > 0)) {
+        if (j && !kpRated(j)) {
           // Для журнала: какой фильм КП сопоставил — вдруг не тот (короткометражка, видео с тем же названием)
           it.kpProbe = { imdb: imdbRes || (c.imdb ? 'skip' : 'none'), found: kpId, type: String(j.type || ''), year: String(j.year || ''),
             name: String(j.nameRu || j.nameOriginal || j.nameEn || '').slice(0, 30), votes: j.ratingKinopoiskVoteCount || 0 };
+          if (!fromTitle && !stub && c.title) {
+            stub = { id: kpId, age: kpAgeOf(j), probe: it.kpProbe };
+            return byTitle();
+          }
         }
         finish(j && j.ratingKinopoisk, j && j.ratingImdb, kpId, kpAgeOf(j));
       }, kpFail(cb), kpHeaders(), ctx);
@@ -3250,13 +3280,8 @@
       KpNet.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(c.original || c.title), function (j) {
         var films = (j && j.films) || [];
         var y = parseInt(c.year, 10);
-        // Тип должен совпасть (фильм ≠ сериал)
-        var typeOk = function (f) {
-          var ft = String(f.type || '');
-          if (!ft) return true;
-          var isTv = /SERIES|TV_SHOW/.test(ft);
-          return c.type === 'tv' ? isTv : !isTv;
-        };
+        // Тип должен совпасть (фильм ≠ сериал); пустой дубль, уже найденный без оценки, не берём
+        var typeOk = function (f) { return kpTypeOk(f.type, c.type) && !(stub && String(f.filmId) === String(stub.id)); };
         // Год на КП бывает годом производства, а на TMDB — годом проката («Связь»: КП 2012, TMDB 2014).
         // Поэтому при совпадении названия допускаем разницу до 3 лет
         // Название сверяем всегда: поиск по слову отдаёт и чужие фильмы того же года
@@ -3271,16 +3296,27 @@
         };
         var cands = films.filter(typeOk);
         var hit = null;
-        // Совпало название — ближайший по году в пределах допуска
+        // Совпало название — в пределах допуска по году: сначала с оценкой (пустые дубли без оценок бывают
+        // с тем же названием и годом), потом ближайший по году, потом с большим числом голосов
+        var better = function (f, h) {
+          if (kpRated(f) !== kpRated(h)) return kpRated(f);
+          if (gap(f) !== gap(h)) return gap(f) < gap(h);
+          return (parseInt(f.ratingVoteCount, 10) || 0) > (parseInt(h.ratingVoteCount, 10) || 0);
+        };
         cands.forEach(function (f) {
-          if (nameOk(f) && gap(f) <= KP_YEAR_SLACK && (!hit || gap(f) < gap(hit))) hit = f;
+          if (nameOk(f) && gap(f) <= KP_YEAR_SLACK && (!hit || better(f, hit))) hit = f;
         });
         // Названия не совпали (другой перевод, нет английского) — берём, только если вариант того же года один
         if (!hit) {
           var same = cands.filter(function (f) { return gap(f) === 0; });
           if (same.length === 1) hit = same[0];
         }
-        if (hit) return byId(hit.filmId);
+        if (hit) return byId(hit.filmId, true);
+        // Запасной поиск после пустой карточки ничего лучше не нашёл — остаёмся с ней
+        if (stub) {
+          it.kpProbe = stub.probe; it.kpProbe.alt = films.length;
+          return finish(0, 0, stub.id, stub.age);
+        }
         // Для журнала: что вернул поиск (до 5 вариантов: тип, год, название) — чтобы понять, почему не совпало
         it.kpProbe = {
           imdb: c.imdb ? imdbRes : 'none', q: String(c.original || c.title).slice(0, 40), year: y || null, total: films.length,
@@ -3294,9 +3330,10 @@
     if (c.imdb) {
       if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
       KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
-        var x = j && j.items && j.items[0];
+        var x = kpPickItem(j && j.items, c.type);
         // Список по IMDb-номеру иногда отдаёт фильм без оценок, хотя у карточки КП они есть — переспрашиваем по id
-        if (x && !(parseFloat(x.ratingKinopoisk) > 0 || parseFloat(x.ratingImdb) > 0) && x.kinopoiskId) { imdbRes = 'item_no_rating'; byId(x.kinopoiskId); }
+        // (а если и у карточки их нет — byId один раз поищет по названию)
+        if (x && !kpRated(x) && x.kinopoiskId) { imdbRes = 'item_no_rating'; byId(x.kinopoiskId); }
         else if (x) finish(x.ratingKinopoisk, x.ratingImdb, x.kinopoiskId);
         else { imdbRes = 'empty'; byTitle(); }
       }, function (status) {
@@ -3342,7 +3379,7 @@
     var c = it.c || {};
     if (!c.imdb || !kpCan(ctx)) return cb(null);          // поиск по названию ради возраста не тратим
     KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
-      var x = j && j.items && j.items[0];
+      var x = kpPickItem(j && j.items, c.type);
       if (x && x.kinopoiskId) byId(x.kinopoiskId);
       else cb(null);
     }, function () { cb(null); }, kpHeaders(), ctx);
