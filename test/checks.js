@@ -965,6 +965,51 @@ const CHECKS = [
     const ok = a && a[1] === 'no_rating' && n1 === 3 && b && b[1] === 'cached_no_rating' && urls.length === n1 && rec && rec.id === 700;
     return { ok, got: 'первый: ' + (a && a[1]) + ', второй: ' + (b && b[1]) + ', запросы (' + urls.length + '): ' + urls.join(', ') };
   } },
+  { id: 'P3q', title: 'КП: оригинал на TMDB и на КП разный — после пустой карточки находит по русскому названию, латинская «M» в нём не мешает («Мультивселенная»)', fn: async () => {
+    const urls = [];
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        const u = decodeURIComponent(url);
+        urls.push(u.replace(/^.*\/api\//, ''));
+        if (u.indexOf('imdbId=') > -1) return { body: { items: [{ kinopoiskId: 4892996, type: 'FILM', year: 2021, nameOriginal: 'Entangled' }] } };
+        if (u.indexOf('keyword=Entangled') > -1) return { body: { films: [
+          { filmId: 4892996, type: 'FILM', year: '2021', nameEn: 'Entangled', rating: 'null', ratingVoteCount: 1 },
+          { filmId: 3000, type: 'FILM', year: '2019', nameEn: 'Entangled', rating: 'null', ratingVoteCount: 4 }] } };
+        if (u.indexOf('keyword=Мультивселенная') > -1) return { body: { films: [
+          { filmId: 1180000, type: 'FILM', year: '2018', nameRu: 'Мультивселенная', nameEn: 'Multiverse', rating: '5.9', ratingVoteCount: 25695 }] } };
+        if (u.indexOf('keyword=') > -1) return { body: { films: [] } };
+        if (/films\/1180000$/.test(u)) return { body: { kinopoiskId: 1180000, ratingKinopoisk: 5.9, ratingImdb: 5.6 } };
+        if (/films\/3000$/.test(u)) return { body: { kinopoiskId: 3000, ratingKinopoiskVoteCount: 4 } };
+        if (/films\/4892996$/.test(u)) return { body: { kinopoiskId: 4892996, type: 'FILM', year: 2021, nameOriginal: 'Entangled', ratingKinopoiskVoteCount: 1 } };
+      }
+      return def(url);
+    };
+    const env = makeEnv({ kp: true, router });
+    const c = { id: 660833, type: 'movie', imdb: 'tt15706538', title: 'Mультивселенная', original: 'Entangled', year: '2021', va: 6.6 };
+    const a = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:660833', c }, cb));
+    const ok = !!(a && a[0] && a[0].kp === 5.9) && urls.some(u => u.indexOf('keyword=Мультивселенная') > -1);
+    return { ok, got: (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + ', запросы: ' + urls.join(', ') };
+  } },
+  { id: 'P3r', title: 'КП: по оригинальному названию ничего — находит по русскому («Шерлок: Безобразная невеста»)', fn: async () => {
+    const urls = [];
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        const u = decodeURIComponent(url);
+        urls.push(u.replace(/^.*\/api\//, ''));
+        if (u.indexOf('imdbId=') > -1) return { body: { items: [] } };
+        if (u.indexOf('keyword=Шерлок') > -1) return { body: { films: [
+          { filmId: 893621, type: 'FILM', year: '2015', nameRu: 'Шерлок: Безобразная невеста', nameEn: 'Sherlock: The Abominable Bride', rating: '7.8', ratingVoteCount: 90000 }] } };
+        if (u.indexOf('keyword=') > -1) return { body: { films: [] } };
+        if (/films\/893621$/.test(u)) return { body: { kinopoiskId: 893621, ratingKinopoisk: 7.8, ratingImdb: 7.6 } };
+      }
+      return def(url);
+    };
+    const env = makeEnv({ kp: true, router });
+    const c = { id: 379170, type: 'movie', imdb: 'tt3845232', title: 'Шерлок: Безобразная Невеста', original: 'Sherlock: The Abominable Bride', year: '2016', va: 7.8 };
+    const a = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:379170', c }, cb));
+    const ok = !!(a && a[0] && a[0].kp === 7.8) && urls.length === 4;
+    return { ok, got: (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + ', запросы (' + urls.length + '): ' + urls.join(', ') };
+  } },
   { id: 'P8', title: 'Опорные — только «Нравится» и просмотренное; открытое из подборки и закладки — нет', fn: async () => {
     const w = baseWorld();
     w.fav.like = [card(100, { title: 'Liked' })];

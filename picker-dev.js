@@ -3177,7 +3177,7 @@
   function kpHeaders() { return { headers: { 'X-API-KEY': kpKey() } }; }
 
   var KP_YEAR_SLACK = 3;   // ±лет при совпадении названия
-  var KP_MATCH_V = 4;      // версия сопоставления: записи прежних версий без оценки переспрашиваем один раз
+  var KP_MATCH_V = 5;      // версия сопоставления: записи прежних версий без оценки переспрашиваем один раз
 
   // Тип карточки КП совпадает с типом TMDB (фильм ≠ сериал); пустой тип не мешает
   function kpTypeOk(ft, ctype) {
@@ -3203,8 +3203,16 @@
   }
 
   // Название для сравнения: без регистра, знаков и «ё»
+  // Латинские буквы-двойники внутри русского слова → кириллица (на TMDB бывает «Mультивселенная» с латинской M)
+  var LAT_CYR = { A: 'А', B: 'В', C: 'С', E: 'Е', H: 'Н', K: 'К', M: 'М', O: 'О', P: 'Р', T: 'Т', X: 'Х', a: 'а', c: 'с', e: 'е', o: 'о', p: 'р', x: 'х', y: 'у' };
+  function fixMixedTitle(t) {
+    return String(t || '').replace(/[A-Za-zА-Яа-яЁё]+/g, function (w) {
+      if (!/[А-Яа-яЁё]/.test(w) || !/[A-Za-z]/.test(w)) return w;
+      return w.replace(/[A-Za-z]/g, function (ch) { return LAT_CYR[ch] || ch; });
+    });
+  }
   function normTitle(t) {
-    return String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, '');
+    return fixMixedTitle(t).toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, '');
   }
 
   function fetchRatings(it, cb, ctx) {
@@ -3274,35 +3282,38 @@
       }, kpFail(cb), kpHeaders(), ctx);
     };
 
+    // Поиск по названию: сначала оригинальное, потом русское (если отличается). Второй запрос — только когда
+    // первый не дал совпадения с оценкой: у КП оригинал бывает другим («Мультивселенная»: TMDB — Entangled, КП — Multiverse)
     var byTitle = function () {
-      if (!c.title) return cb(null, 'not_found');
-      if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
-      KpNet.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(c.original || c.title), function (j) {
-        var films = (j && j.films) || [];
-        var y = parseInt(c.year, 10);
-        // Тип должен совпасть (фильм ≠ сериал); пустой дубль, уже найденный без оценки, не берём
-        var typeOk = function (f) { return kpTypeOk(f.type, c.type) && !(stub && String(f.filmId) === String(stub.id)); };
-        // Год на КП бывает годом производства, а на TMDB — годом проката («Связь»: КП 2012, TMDB 2014).
-        // Поэтому при совпадении названия допускаем разницу до 3 лет
-        // Название сверяем всегда: поиск по слову отдаёт и чужие фильмы того же года
-        // («Multiverse» → Entangled 2019 раньше нужной «Мультивселенной» 2018)
-        var nameOk = function (f) {
-          var o = normTitle(c.original), t = normTitle(c.title), en = normTitle(f.nameEn), ru = normTitle(f.nameRu);
-          return !!((o && (en === o || ru === o)) || (t && (ru === t || en === t)));
-        };
-        var gap = function (f) {
-          var fy = parseInt(f.year, 10);
-          return !y ? 0 : isNaN(fy) ? 99 : Math.abs(fy - y);
-        };
-        var cands = films.filter(typeOk);
-        var hit = null;
-        // Совпало название — в пределах допуска по году: сначала с оценкой (пустые дубли без оценок бывают
-        // с тем же названием и годом), потом ближайший по году, потом с большим числом голосов
-        var better = function (f, h) {
-          if (kpRated(f) !== kpRated(h)) return kpRated(f);
-          if (gap(f) !== gap(h)) return gap(f) < gap(h);
-          return (parseInt(f.ratingVoteCount, 10) || 0) > (parseInt(h.ratingVoteCount, 10) || 0);
-        };
+      if (!c.title && !c.original) return cb(null, 'not_found');
+      var qo = String(c.original || c.title), qt = fixMixedTitle(c.title || '');
+      var queries = [qo];
+      if (qt && normTitle(qt) !== normTitle(qo)) queries.push(qt);
+      var y = parseInt(c.year, 10);
+      // Тип должен совпасть (фильм ≠ сериал); пустой дубль, уже найденный без оценки, не берём
+      var typeOk = function (f) { return kpTypeOk(f.type, c.type) && !(stub && String(f.filmId) === String(stub.id)); };
+      // Год на КП бывает годом производства, а на TMDB — годом проката («Связь»: КП 2012, TMDB 2014).
+      // Поэтому при совпадении названия допускаем разницу до 3 лет
+      // Название сверяем всегда: поиск по слову отдаёт и чужие фильмы того же года
+      // («Multiverse» → Entangled 2019 раньше нужной «Мультивселенной» 2018)
+      var nameOk = function (f) {
+        var o = normTitle(c.original), t = normTitle(c.title), en = normTitle(f.nameEn), ru = normTitle(f.nameRu);
+        return !!((o && (en === o || ru === o)) || (t && (ru === t || en === t)));
+      };
+      var gap = function (f) {
+        var fy = parseInt(f.year, 10);
+        return !y ? 0 : isNaN(fy) ? 99 : Math.abs(fy - y);
+      };
+      // Совпало название — в пределах допуска по году: сначала с оценкой (пустые дубли без оценок бывают
+      // с тем же названием и годом), потом ближайший по году, потом с большим числом голосов
+      var better = function (f, h) {
+        if (kpRated(f) !== kpRated(h)) return kpRated(f);
+        if (gap(f) !== gap(h)) return gap(f) < gap(h);
+        return (parseInt(f.ratingVoteCount, 10) || 0) > (parseInt(h.ratingVoteCount, 10) || 0);
+      };
+      var all = [], seen = {};
+      var pick = function () {
+        var cands = all.filter(typeOk), hit = null;
         cands.forEach(function (f) {
           if (nameOk(f) && gap(f) <= KP_YEAR_SLACK && (!hit || better(f, hit))) hit = f;
         });
@@ -3311,19 +3322,32 @@
           var same = cands.filter(function (f) { return gap(f) === 0; });
           if (same.length === 1) hit = same[0];
         }
-        if (hit) return byId(hit.filmId, true);
-        // Запасной поиск после пустой карточки ничего лучше не нашёл — остаёмся с ней
-        if (stub) {
-          it.kpProbe = stub.probe; it.kpProbe.alt = films.length;
-          return finish(0, 0, stub.id, stub.age);
-        }
-        // Для журнала: что вернул поиск (до 5 вариантов: тип, год, название) — чтобы понять, почему не совпало
-        it.kpProbe = {
-          imdb: c.imdb ? imdbRes : 'none', q: String(c.original || c.title).slice(0, 40), year: y || null, total: films.length,
-          top: films.slice(0, 5).map(function (f) { return [String(f.type || ''), String(f.year || ''), String(f.nameRu || f.nameEn || '').slice(0, 30)]; })
-        };
-        finish(0, 0, null);
-      }, kpFail(cb), kpHeaders(), ctx);
+        return hit;
+      };
+      var step = function (qi) {
+        if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
+        KpNet.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(queries[qi]), function (j) {
+          ((j && j.films) || []).forEach(function (f) {
+            var id = String(f && f.filmId);
+            if (f && !seen[id]) { seen[id] = 1; all.push(f); }
+          });
+          var hit = pick();
+          if (hit && (kpRated(hit) || qi + 1 >= queries.length)) return byId(hit.filmId, true);
+          if (qi + 1 < queries.length) return step(qi + 1);
+          // Запасной поиск после пустой карточки ничего лучше не нашёл — остаёмся с ней
+          if (stub) {
+            it.kpProbe = stub.probe; it.kpProbe.alt = all.length;
+            return finish(0, 0, stub.id, stub.age);
+          }
+          // Для журнала: что вернул поиск (до 5 вариантов: тип, год, название) — чтобы понять, почему не совпало
+          it.kpProbe = {
+            imdb: c.imdb ? imdbRes : 'none', q: queries.join(' | ').slice(0, 60), year: y || null, total: all.length,
+            top: all.slice(0, 5).map(function (f) { return [String(f.type || ''), String(f.year || ''), String(f.nameRu || f.nameEn || '').slice(0, 30)]; })
+          };
+          finish(0, 0, null);
+        }, kpFail(cb), kpHeaders(), ctx);
+      };
+      step(0);
     };
 
     if (ageOnly) return byId(m.id);   // фильм на КП уже найден — сразу за оценкой
