@@ -1010,6 +1010,32 @@ const CHECKS = [
     const ok = !!(a && a[0] && a[0].kp === 7.8) && urls.length === 4;
     return { ok, got: (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + ', запросы (' + urls.length + '): ' + urls.join(', ') };
   } },
+  { id: 'P3s', title: 'КП: «не найден» от прежней версии переспрашивается один раз (теперь находится по русскому названию)', fn: async () => {
+    const urls = [];
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) {
+        const u = decodeURIComponent(url);
+        urls.push(u.replace(/^.*\/api\//, ''));
+        if (u.indexOf('imdbId=') > -1) return { body: { items: [] } };
+        if (u.indexOf('keyword=Шерлок') > -1) return { body: { films: [
+          { filmId: 893621, type: 'FILM', year: '2015', nameRu: 'Шерлок: Безобразная невеста', rating: '7.8', ratingVoteCount: 90000 }] } };
+        if (u.indexOf('keyword=') > -1) return { body: { films: [] } };
+        if (/films\/893621$/.test(u)) return { body: { kinopoiskId: 893621, ratingKinopoisk: 7.8, ratingImdb: 7.6 } };
+      }
+      return def(url);
+    };
+    const env = makeEnv({ kp: true, router });
+    const old = { kp: 0, imdb: 0, id: null, r: 1, mv: 4, t: env.clock.now - 86400000, va: 7.8,
+      probe: { imdb: 'empty', q: 'Sherlock: The Abominable Bride', year: 2016, total: 0, top: [] } };
+    env.pk.Durable.vals.kpmap = { 'movie:379170': old, 'movie:5': Object.assign({}, old, { mv: 99 }) };
+    env.pk.Durable.loaded.kpmap = true;
+    const c = { id: 379170, type: 'movie', imdb: 'tt3845232', title: 'Шерлок: Безобразная Невеста', original: 'Sherlock: The Abominable Bride', year: '2016', va: 7.8 };
+    const a = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:379170', c }, cb));
+    const n1 = urls.length;
+    const b = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:5', c: Object.assign({}, c, { id: 5 }) }, cb));
+    const ok = !!(a && a[0] && a[0].kp === 7.8) && b && b[1] === 'cached_miss' && urls.length === n1;
+    return { ok, got: 'прежняя запись: ' + (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + '; запись текущей версии: ' + (b && (b[0] ? 'КП ' + b[0].kp : b[1])) + ', запросов ' + urls.length };
+  } },
   { id: 'P8', title: 'Опорные — только «Нравится» и просмотренное; открытое из подборки и закладки — нет', fn: async () => {
     const w = baseWorld();
     w.fav.like = [card(100, { title: 'Liked' })];
