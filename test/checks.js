@@ -535,6 +535,35 @@ const CHECKS = [
     const ok = v[0] === 1 && raw[1] > 0.85 && raw[1] < 0.9 && Math.abs(raw[1] - raw[2]) < 0.03 && v[3] === 0.6 && v[4] === 0.6;
     return { ok, got: v.join(' · ') };
   } },
+  { id: 'M28b', title: 'Нелюбимый жанр — только с настоящим минусом: один открытый ТВ-фильм в положительной истории штрафа не даёт, три «Не то» — дают', fn: async () => {
+    const { pk } = makeEnv();
+    const now = Date.now();
+    const ev = (s, genres, i) => ({ k: 'movie:' + i, s, date: now - i * 86400000, c: { id: i, type: 'movie', genres, year: '2015', lang: 'en' } });
+    const base = [];
+    for (let i = 1; i <= 30; i++) base.push(ev(1, i % 2 ? [18, 878] : [18, 35], i));
+    // ТВ-фильм (10770): один открытый из подборки, +0,5
+    const p1 = pk.buildProfile(base.concat([ev(0.5, [10770, 80], 100)]));
+    // Ужасы (27): три отказа «Не то» (−0,2) и ни одного лайка
+    const p2 = pk.buildProfile(base.concat([ev(-0.2, [27], 101), ev(-0.2, [27, 53], 102), ev(-0.2, [27], 103)]));
+    const tvW = p1.f.genre[10770], tvD = pk.dislikeMult([10770, 80], p1), hD = pk.dislikeMult([27], p2);
+    const ok = tvW < -0.45 && tvD === 1 && !p1.gneg[10770] && !!p2.gneg[27] && hD < 0.8;
+    return { ok, got: 'ТВ-фильм: вес ' + tvW.toFixed(2) + ', штраф ×' + tvD.toFixed(2) + '; ужасы после трёх «Не то»: ×' + hD.toFixed(2) };
+  } },
+  { id: 'P10b', title: 'Причины: «Что-то новое» называет редкий в истории жанр, хотя после центрирования у него минус; любимый — нет', fn: async () => {
+    const { pk } = makeEnv();
+    const now = Date.now();
+    const ev = (s, genres, i) => ({ k: 'movie:' + i, s, date: now - i * 86400000, c: { id: i, type: 'movie', genres, year: '2015', lang: 'en' } });
+    const evs = [];
+    for (let i = 1; i <= 30; i++) evs.push(ev(1, i % 2 ? [18, 878] : [18, 35], i));
+    evs.push(ev(0.5, [37], 100));                               // вестерн — один раз
+    const prof = pk.buildProfile(evs); prof.recentGenres = [];
+    const w = { q: 0.3, a: 0.35, m: 0.2, n: 0.05, s: 0.1 }, ans = { mood: 'think', company: 'solo' };
+    const mk = (id, genres) => ({ k: 'movie:' + id, c: { type: 'movie', title: 'W', genres, va: 6.5, vc: 800, dir: [], cast: [], names: {} }, src: 'disc', srcs: { disc: true }, seedHits: 0, seeds: [] });
+    const a = pk.reasonOf(mk(500, [37]), { best: 'n', rb: 0, s: 0, a: 0.3, q: 0.3, n: 0.8, m: 0.2, r: 6.5 }, w, prof, ans);
+    const b = pk.reasonOf(mk(501, [18]), { best: 'n', rb: 0, s: 0, a: 0.3, q: 0.3, n: 0.8, m: 0.2, r: 6.5 }, w, prof, ans);
+    const ok = /^Что-то новое: вестерн/.test(a) && !/^Что-то новое/.test(b);
+    return { ok, got: 'вестерн (вес ' + prof.f.genre[37].toFixed(2) + '): «' + a + '»; драма: «' + b + '»' };
+  } },
   { id: 'M29', title: 'Теневая формула пишет свою пятёрку в журнал, выдача не меняется', fn: async () => {
     const env = makeEnv(baseWorld());
     const r = await env.run({ time: 'any', mood: 'any', company: 'solo' });

@@ -1274,6 +1274,12 @@
 
     // pos — положительные события: по ним решаем, «знаем ли мы вкус» (одни отказы вкус не описывают)
     var profile = { n: n, pos: pos, f: {}, names: names };
+    // Нелюбимый жанр — только с настоящим минусом: сумма событий по нему отрицательна (отказы перевешивают)
+    // и событий хотя бы DISLIKE_MIN_N. Ниже среднего после центрирования оказывается и просто редкий жанр:
+    // один открытый ТВ-фильм в почти сплошь положительной истории делал «ТВ-фильм» самым «нелюбимым» (07.11)
+    profile.gcnt = cnt.genre || {};
+    profile.gneg = {};
+    each(acc.genre || {}, function (v, g) { if (v < 0 && (profile.gcnt[g] || 0) >= DISLIKE_MIN_N) profile.gneg[g] = 1; });
     for (var lb = 0; lb < events.length; lb++) if (events[lb].batch) profile.likeBatch = (profile.likeBatch || 0) + 1;
 
     each(acc, function (vals, t) {
@@ -1969,7 +1975,8 @@
   var HIGH_RATING = 7.0;   // ниже «Высокий рейтинг» звучит странно — ищем другое объяснение
   var HIGH_KP = 7.5;       // «Высоко на Кинопоиске» — как и в основной причине про КП
   var HIGH_VOTES = 1000;   // «Высокий рейтинг» без подтверждения КП — только от стольких голосов на TMDB
-  var NEW_GENRE_MAX = 0.1; // «Что-то новое» — жанр с весом в профиле по модулю меньше этого
+  var NEW_GENRE_MAX = 0.1; // «Что-то новое» — жанр с весом в профиле меньше этого (не из любимых)…
+  var NEW_GENRE_N = 2;     // …встречался в истории не больше стольких раз и не из нелюбимых
 
   var MOOD_REASON = {
     relax: 'под «Расслабиться»', laugh: 'чтобы посмеяться', nerves: 'чтобы пощекотать нервы',
@@ -2058,12 +2065,17 @@
         if (it.kp >= HIGH_KP) return 'Высоко на Кинопоиске: ' + rating1(it.kp);
       }
       if (k === 'n' && parts.n > 0) {
-        // Называем жанр, который и правда новый для вас: не из недавних и без отношения в профиле.
-        // Нелюбимый жанр «новым» не бывает
+        // Называем жанр, который и правда новый для вас: не из недавних, редкий в истории, не любимый и не нелюбимый.
+        // (Редкий жанр после центрирования профиля уходит в минус — по весу его «новизну» не узнать)
         var ng = null, recentG = profile.recentGenres || [], pgw = (profile.f && profile.f.genre) || {};
+        var gcnt = profile.gcnt, gneg = profile.gneg || {};
         for (var ni = 0; ni < c.genres.length && !ng; ni++) {
           var g0 = c.genres[ni], w0 = pgw[g0];
-          if (recentG.indexOf(g0) < 0 && GENRE_NAMES[g0] && !(typeof w0 === 'number' && Math.abs(w0) >= NEW_GENRE_MAX)) ng = g0;
+          if (recentG.indexOf(g0) >= 0 || !GENRE_NAMES[g0]) continue;
+          var isNew = gcnt
+            ? !gneg[g0] && (gcnt[g0] || 0) <= NEW_GENRE_N && !(typeof w0 === 'number' && w0 >= NEW_GENRE_MAX)
+            : !(typeof w0 === 'number' && Math.abs(w0) >= NEW_GENRE_MAX);
+          if (isNew) ng = g0;
         }
         if (ng) return 'Что-то новое: ' + GENRE_NAMES[ng].toLowerCase();
       }
@@ -2082,10 +2094,13 @@
 
   // Нелюбимый жанр: штраф плавно от DISLIKE_FROM (×1) до DISLIKE_FULL (×DISLIKE_MULT), без ступеньки
   var DISLIKE_FROM = -0.45, DISLIKE_FULL = -0.9, DISLIKE_MULT = 0.6;
+  var DISLIKE_MIN_N = 3;   // нелюбимым жанр становится от стольких событий с ним (и при отрицательной сумме — см. buildProfile)
 
   function dislikeMult(genres, profile) {
     var gw = (profile.f && profile.f.genre) || {}, worst = 0;
+    var neg = profile.gneg;   // профиль из buildProfile — штраф только настоящим нелюбимым; без gneg — по весу
     for (var i = 0; i < (genres || []).length; i++) {
+      if (neg && !neg[genres[i]]) continue;
       var v = gw[genres[i]];
       if (typeof v === 'number' && v < worst) worst = v;
     }
@@ -2641,9 +2656,10 @@
       likeBatch: profile.likeBatch || 0,
       rejGenres: profile.rejGenres && Object.keys(profile.rejGenres).length ? profile.rejGenres : null,
       genres: topOf(profile.f.genre, 6, function (g) { return GENRE_NAMES[g]; }),
+      // Только настоящие нелюбимые (отказы перевешивают, см. buildProfile), а не «ниже среднего»
       dislikedGenres: topOf((function () {
         var neg = {};
-        each(profile.f.genre || {}, function (v, k) { if (v < 0) neg[k] = -v; });
+        each(profile.f.genre || {}, function (v, k) { if (v < 0 && (!profile.gneg || profile.gneg[k])) neg[k] = -v; });
         return neg;
       })(), 3, function (g) { return GENRE_NAMES[g]; }),
       directors: topOf(profile.f.director, 4, function (id) { return profile.names['p' + id]; }),
