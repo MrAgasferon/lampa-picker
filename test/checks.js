@@ -1065,6 +1065,44 @@ const CHECKS = [
     const ok = !!(a && a[0] && a[0].kp === 7.8) && b && b[1] === 'cached_miss' && urls.length === n1;
     return { ok, got: 'прежняя запись: ' + (a && a[0] ? 'КП ' + a[0].kp : a && a[1]) + '; запись текущей версии: ' + (b && (b[0] ? 'КП ' + b[0].kp : b[1])) + ', запросов ' + urls.length };
   } },
+  { id: 'CS1', title: 'Карточки из CUB Sync / сторонних каталогов: дата числом, жанры объектами и null — подбор проходит, dateFixes в журнале', fn: async () => {
+    const odd = [
+      Object.assign(card(901, {}), { release_date: 2019 }),
+      Object.assign(card(902, {}), { genre_ids: undefined, genres: [{ id: 18, name: 'Драма' }, null], release_date: 2015 }),
+      Object.assign(card(903, {}), { vote_average: '7.5', vote_count: '1200' })
+    ];
+    const likes = []; for (let i = 0; i < 10; i++) likes.push(card(100 + i, { genre_ids: [[35], [18], [878]][i % 3] }));
+    const res = [];
+    for (const ans of [{ time: 'any', mood: 'any', company: 'solo' }, { time: '120', mood: 'think', company: 'couple' }, { time: 'any', mood: 'any', company: 'kids' }]) {
+      const env = makeEnv({ fav: { like: likes.concat(odd.slice(0, 2)), wath: [odd[0], odd[2]], history: [odd[1]] } });
+      const errs = [];
+      env.w.addEventListener('error', e => errs.push(e.message || String(e.error)));
+      const r = await env.run(ans);
+      const j = r.st && r.st.journal;
+      res.push({ ok: !!r.st && !r.error && !errs.length && !(j && j.errors), err: r.error || errs[0] || (j && j.errors && j.errors[0].msg), df: j && j.dateFixes });
+    }
+    return { ok: res.every(x => x.ok) && res.every(x => x.df > 0), got: JSON.stringify(res) };
+  } },
+  { id: 'CS2', title: 'Исключение на шаге подбора — экран ошибки сразу (не сторож через 20 с), запись в журнале ошибок, в окно не уходит', fn: async () => {
+    const likes = []; for (let i = 0; i < 10; i++) likes.push(card(100 + i, { genre_ids: [18] }));
+    const bad = card(950, {});
+    Object.defineProperty(bad, 'id', { get() { throw new Error('boom id'); }, enumerable: true });
+    const env = makeEnv({ fav: { like: likes.concat([bad]) } });
+    const errs = [];
+    env.w.addEventListener('error', e => errs.push(e.message || String(e.error)));
+    const t0 = env.clock.now;
+    const r = await env.run({ time: 'any', mood: 'any', company: 'solo' });
+    const saved = env.w.LampaPicker && env.w.LampaPicker.errors ? env.w.LampaPicker.errors() : null;
+    const exp = env.w.LampaPicker && env.w.LampaPicker.journal ? String(env.w.LampaPicker.journal()) : '';
+    return { ok: !r.st && r.error === 'error' && !errs.length && (env.clock.now - t0) <= 5000 && !!saved && saved.length > 0 && exp.indexOf('boom id') > -1,
+      got: JSON.stringify({ st: !!r.st, error: r.error, ms: env.clock.now - t0, winErrs: errs, saved: saved && saved.map(x => x.tag + ': ' + x.msg), inExport: exp.indexOf('boom id') > -1 }) };
+  } },
+  { id: 'CS3', title: 'cardCompact: рейтинг и голоса строкой — числа, дата числом — строка, жанры без null', fn: async () => {
+    const { pk } = makeEnv();
+    const c = pk.cardCompact({ id: 5, title: 'X', release_date: 2019, vote_average: '7.5', vote_count: '1200', genres: [{ id: 18 }, null, 35] });
+    const ok = c.va === 7.5 && c.vc === 1200 && c.year === '2019' && JSON.stringify(c.genres) === JSON.stringify([18, 35]);
+    return { ok, got: JSON.stringify({ va: c.va, vc: c.vc, year: c.year, genres: c.genres }) };
+  } },
   { id: 'P8', title: 'Опорные — только «Нравится» и просмотренное; открытое из подборки и закладки — нет', fn: async () => {
     const w = baseWorld();
     w.fav.like = [card(100, { title: 'Liked' })];
