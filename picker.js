@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.13.2';
+  var VERSION = '0.13.3';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -1274,6 +1274,12 @@
 
     // pos — положительные события: по ним решаем, «знаем ли мы вкус» (одни отказы вкус не описывают)
     var profile = { n: n, pos: pos, f: {}, names: names };
+    // Нелюбимый жанр — только с настоящим минусом: сумма событий по нему отрицательна (отказы перевешивают)
+    // и событий хотя бы DISLIKE_MIN_N. Ниже среднего после центрирования оказывается и просто редкий жанр:
+    // один открытый ТВ-фильм в почти сплошь положительной истории делал «ТВ-фильм» самым «нелюбимым» (07.11)
+    profile.gcnt = cnt.genre || {};
+    profile.gneg = {};
+    each(acc.genre || {}, function (v, g) { if (v < 0 && (profile.gcnt[g] || 0) >= DISLIKE_MIN_N) profile.gneg[g] = 1; });
     for (var lb = 0; lb < events.length; lb++) if (events[lb].batch) profile.likeBatch = (profile.likeBatch || 0) + 1;
 
     each(acc, function (vals, t) {
@@ -1969,7 +1975,8 @@
   var HIGH_RATING = 7.0;   // ниже «Высокий рейтинг» звучит странно — ищем другое объяснение
   var HIGH_KP = 7.5;       // «Высоко на Кинопоиске» — как и в основной причине про КП
   var HIGH_VOTES = 1000;   // «Высокий рейтинг» без подтверждения КП — только от стольких голосов на TMDB
-  var NEW_GENRE_MAX = 0.1; // «Что-то новое» — жанр с весом в профиле по модулю меньше этого
+  var NEW_GENRE_MAX = 0.1; // «Что-то новое» — жанр с весом в профиле меньше этого (не из любимых)…
+  var NEW_GENRE_N = 2;     // …встречался в истории не больше стольких раз и не из нелюбимых
 
   var MOOD_REASON = {
     relax: 'под «Расслабиться»', laugh: 'чтобы посмеяться', nerves: 'чтобы пощекотать нервы',
@@ -2058,12 +2065,17 @@
         if (it.kp >= HIGH_KP) return 'Высоко на Кинопоиске: ' + rating1(it.kp);
       }
       if (k === 'n' && parts.n > 0) {
-        // Называем жанр, который и правда новый для вас: не из недавних и без отношения в профиле.
-        // Нелюбимый жанр «новым» не бывает
+        // Называем жанр, который и правда новый для вас: не из недавних, редкий в истории, не любимый и не нелюбимый.
+        // (Редкий жанр после центрирования профиля уходит в минус — по весу его «новизну» не узнать)
         var ng = null, recentG = profile.recentGenres || [], pgw = (profile.f && profile.f.genre) || {};
+        var gcnt = profile.gcnt, gneg = profile.gneg || {};
         for (var ni = 0; ni < c.genres.length && !ng; ni++) {
           var g0 = c.genres[ni], w0 = pgw[g0];
-          if (recentG.indexOf(g0) < 0 && GENRE_NAMES[g0] && !(typeof w0 === 'number' && Math.abs(w0) >= NEW_GENRE_MAX)) ng = g0;
+          if (recentG.indexOf(g0) >= 0 || !GENRE_NAMES[g0]) continue;
+          var isNew = gcnt
+            ? !gneg[g0] && (gcnt[g0] || 0) <= NEW_GENRE_N && !(typeof w0 === 'number' && w0 >= NEW_GENRE_MAX)
+            : !(typeof w0 === 'number' && Math.abs(w0) >= NEW_GENRE_MAX);
+          if (isNew) ng = g0;
         }
         if (ng) return 'Что-то новое: ' + GENRE_NAMES[ng].toLowerCase();
       }
@@ -2082,10 +2094,13 @@
 
   // Нелюбимый жанр: штраф плавно от DISLIKE_FROM (×1) до DISLIKE_FULL (×DISLIKE_MULT), без ступеньки
   var DISLIKE_FROM = -0.45, DISLIKE_FULL = -0.9, DISLIKE_MULT = 0.6;
+  var DISLIKE_MIN_N = 3;   // нелюбимым жанр становится от стольких событий с ним (и при отрицательной сумме — см. buildProfile)
 
   function dislikeMult(genres, profile) {
     var gw = (profile.f && profile.f.genre) || {}, worst = 0;
+    var neg = profile.gneg;   // профиль из buildProfile — штраф только настоящим нелюбимым; без gneg — по весу
     for (var i = 0; i < (genres || []).length; i++) {
+      if (neg && !neg[genres[i]]) continue;
       var v = gw[genres[i]];
       if (typeof v === 'number' && v < worst) worst = v;
     }
@@ -2641,9 +2656,10 @@
       likeBatch: profile.likeBatch || 0,
       rejGenres: profile.rejGenres && Object.keys(profile.rejGenres).length ? profile.rejGenres : null,
       genres: topOf(profile.f.genre, 6, function (g) { return GENRE_NAMES[g]; }),
+      // Только настоящие нелюбимые (отказы перевешивают, см. buildProfile), а не «ниже среднего»
       dislikedGenres: topOf((function () {
         var neg = {};
-        each(profile.f.genre || {}, function (v, k) { if (v < 0) neg[k] = -v; });
+        each(profile.f.genre || {}, function (v, k) { if (v < 0 && (!profile.gneg || profile.gneg[k])) neg[k] = -v; });
         return neg;
       })(), 3, function (g) { return GENRE_NAMES[g]; }),
       directors: topOf(profile.f.director, 4, function (id) { return profile.names['p' + id]; }),
@@ -3177,11 +3193,42 @@
   function kpHeaders() { return { headers: { 'X-API-KEY': kpKey() } }; }
 
   var KP_YEAR_SLACK = 3;   // ±лет при совпадении названия
-  var KP_MATCH_V = 3;      // версия сопоставления: записи прежних версий без оценки переспрашиваем один раз
+  var KP_MATCH_V = 5;      // версия сопоставления: записи прежних версий без оценки переспрашиваем один раз
+
+  // Тип карточки КП совпадает с типом TMDB (фильм ≠ сериал); пустой тип не мешает
+  function kpTypeOk(ft, ctype) {
+    ft = String(ft || '');
+    if (!ft) return true;
+    var isTv = /SERIES|TV_SHOW/.test(ft);
+    return ctype === 'tv' ? isTv : !isTv;
+  }
+  // Есть ли у варианта оценка: карточка/список (ratingKinopoisk, ratingImdb) или поиск (rating; «86%» — ожидание, не оценка)
+  function kpRated(x) {
+    if (!x) return false;
+    if (parseFloat(x.ratingKinopoisk) > 0 || parseFloat(x.ratingImdb) > 0) return true;
+    var r = String(x.rating == null ? '' : x.rating);
+    return r.indexOf('%') < 0 && parseFloat(r) > 0;
+  }
+  // Из списка по IMDb-номеру: КП бывает отдаёт на один номер и пустую карточку-дубль («Патруль времени»:
+  // 1155501 без оценок раньше настоящей 679924) — берём карточку нужного типа с оценкой
+  function kpPickItem(items, ctype) {
+    var list = (items || []).filter(function (x) { return x && x.kinopoiskId; });
+    var typed = list.filter(function (x) { return kpTypeOk(x.type, ctype); });
+    var rated = typed.filter(kpRated);
+    return rated[0] || typed[0] || list[0] || null;
+  }
 
   // Название для сравнения: без регистра, знаков и «ё»
+  // Латинские буквы-двойники внутри русского слова → кириллица (на TMDB бывает «Mультивселенная» с латинской M)
+  var LAT_CYR = { A: 'А', B: 'В', C: 'С', E: 'Е', H: 'Н', K: 'К', M: 'М', O: 'О', P: 'Р', T: 'Т', X: 'Х', a: 'а', c: 'с', e: 'е', o: 'о', p: 'р', x: 'х', y: 'у' };
+  function fixMixedTitle(t) {
+    return String(t || '').replace(/[A-Za-zА-Яа-яЁё]+/g, function (w) {
+      if (!/[А-Яа-яЁё]/.test(w) || !/[A-Za-z]/.test(w)) return w;
+      return w.replace(/[A-Za-z]/g, function (ch) { return LAT_CYR[ch] || ch; });
+    });
+  }
   function normTitle(t) {
-    return String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, '');
+    return fixMixedTitle(t).toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, '');
   }
 
   function fetchRatings(it, cb, ctx) {
@@ -3194,8 +3241,9 @@
     var map = Durable.get('kpmap', {});
     var m = map[it.k];
     // Второй аргумент cb — почему оценки нет (для журнала)
-    // «Не найден» из старых версий (без записи, что ответил КП) переспрашиваем один раз — ради диагностики
-    var legacyMiss = m && !m.kp && !m.imdb && !m.id && (!m.probe || (m.probe.total > 0 && !(m.mv >= 2)));
+    // «Не найден» от прежней версии сопоставления переспрашиваем один раз: поиск с тех пор менялся
+    // (с 0.13.3 — ещё и по русскому названию: «Шерлок: Безобразная невеста» по оригиналу на КП не находится)
+    var legacyMiss = m && !m.kp && !m.imdb && !m.id && (!m.probe || !(m.mv >= KP_MATCH_V));
     // Фильм на КП найден, но оценку ещё не спрашивали: запись от «С детьми» (возраст) или из старой версии
     // без отметки r — сразу за оценкой по id
     var ageOnly = m && !m.kp && !m.imdb && m.id && !m.r;
@@ -3232,71 +3280,101 @@
 
     var imdbRes = '';   // что ответил поиск по IMDb-номеру — для журнала
 
-    var byId = function (kpId) {
+    // Карточка, найденная по IMDb или из kpmap, оказалась без оценки: возможно, это пустой дубль, а настоящая
+    // карточка — другая. Один раз ищем по названию без неё; не нашлось — остаёмся с этой («без оценки»)
+    var stub = null;
+    var byId = function (kpId, fromTitle) {
       if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
       KpNet.get(KP_API + 'api/v2.2/films/' + kpId, function (j) {
-        if (j && !(parseFloat(j.ratingKinopoisk) > 0 || parseFloat(j.ratingImdb) > 0)) {
+        if (j && !kpRated(j)) {
           // Для журнала: какой фильм КП сопоставил — вдруг не тот (короткометражка, видео с тем же названием)
           it.kpProbe = { imdb: imdbRes || (c.imdb ? 'skip' : 'none'), found: kpId, type: String(j.type || ''), year: String(j.year || ''),
             name: String(j.nameRu || j.nameOriginal || j.nameEn || '').slice(0, 30), votes: j.ratingKinopoiskVoteCount || 0 };
+          if (!fromTitle && !stub && c.title) {
+            stub = { id: kpId, age: kpAgeOf(j), probe: it.kpProbe };
+            return byTitle();
+          }
         }
         finish(j && j.ratingKinopoisk, j && j.ratingImdb, kpId, kpAgeOf(j));
       }, kpFail(cb), kpHeaders(), ctx);
     };
 
+    // Поиск по названию: сначала оригинальное, потом русское (если отличается). Второй запрос — только когда
+    // первый не дал совпадения с оценкой: у КП оригинал бывает другим («Мультивселенная»: TMDB — Entangled, КП — Multiverse)
     var byTitle = function () {
-      if (!c.title) return cb(null, 'not_found');
-      if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
-      KpNet.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(c.original || c.title), function (j) {
-        var films = (j && j.films) || [];
-        var y = parseInt(c.year, 10);
-        // Тип должен совпасть (фильм ≠ сериал)
-        var typeOk = function (f) {
-          var ft = String(f.type || '');
-          if (!ft) return true;
-          var isTv = /SERIES|TV_SHOW/.test(ft);
-          return c.type === 'tv' ? isTv : !isTv;
-        };
-        // Год на КП бывает годом производства, а на TMDB — годом проката («Связь»: КП 2012, TMDB 2014).
-        // Поэтому при совпадении названия допускаем разницу до 3 лет
-        // Название сверяем всегда: поиск по слову отдаёт и чужие фильмы того же года
-        // («Multiverse» → Entangled 2019 раньше нужной «Мультивселенной» 2018)
-        var nameOk = function (f) {
-          var o = normTitle(c.original), t = normTitle(c.title), en = normTitle(f.nameEn), ru = normTitle(f.nameRu);
-          return !!((o && (en === o || ru === o)) || (t && (ru === t || en === t)));
-        };
-        var gap = function (f) {
-          var fy = parseInt(f.year, 10);
-          return !y ? 0 : isNaN(fy) ? 99 : Math.abs(fy - y);
-        };
-        var cands = films.filter(typeOk);
-        var hit = null;
-        // Совпало название — ближайший по году в пределах допуска
+      if (!c.title && !c.original) return cb(null, 'not_found');
+      var qo = String(c.original || c.title), qt = fixMixedTitle(c.title || '');
+      var queries = [qo];
+      if (qt && normTitle(qt) !== normTitle(qo)) queries.push(qt);
+      var y = parseInt(c.year, 10);
+      // Тип должен совпасть (фильм ≠ сериал); пустой дубль, уже найденный без оценки, не берём
+      var typeOk = function (f) { return kpTypeOk(f.type, c.type) && !(stub && String(f.filmId) === String(stub.id)); };
+      // Год на КП бывает годом производства, а на TMDB — годом проката («Связь»: КП 2012, TMDB 2014).
+      // Поэтому при совпадении названия допускаем разницу до 3 лет
+      // Название сверяем всегда: поиск по слову отдаёт и чужие фильмы того же года
+      // («Multiverse» → Entangled 2019 раньше нужной «Мультивселенной» 2018)
+      var nameOk = function (f) {
+        var o = normTitle(c.original), t = normTitle(c.title), en = normTitle(f.nameEn), ru = normTitle(f.nameRu);
+        return !!((o && (en === o || ru === o)) || (t && (ru === t || en === t)));
+      };
+      var gap = function (f) {
+        var fy = parseInt(f.year, 10);
+        return !y ? 0 : isNaN(fy) ? 99 : Math.abs(fy - y);
+      };
+      // Совпало название — в пределах допуска по году: сначала с оценкой (пустые дубли без оценок бывают
+      // с тем же названием и годом), потом ближайший по году, потом с большим числом голосов
+      var better = function (f, h) {
+        if (kpRated(f) !== kpRated(h)) return kpRated(f);
+        if (gap(f) !== gap(h)) return gap(f) < gap(h);
+        return (parseInt(f.ratingVoteCount, 10) || 0) > (parseInt(h.ratingVoteCount, 10) || 0);
+      };
+      var all = [], seen = {};
+      var pick = function () {
+        var cands = all.filter(typeOk), hit = null;
         cands.forEach(function (f) {
-          if (nameOk(f) && gap(f) <= KP_YEAR_SLACK && (!hit || gap(f) < gap(hit))) hit = f;
+          if (nameOk(f) && gap(f) <= KP_YEAR_SLACK && (!hit || better(f, hit))) hit = f;
         });
         // Названия не совпали (другой перевод, нет английского) — берём, только если вариант того же года один
         if (!hit) {
           var same = cands.filter(function (f) { return gap(f) === 0; });
           if (same.length === 1) hit = same[0];
         }
-        if (hit) return byId(hit.filmId);
-        // Для журнала: что вернул поиск (до 5 вариантов: тип, год, название) — чтобы понять, почему не совпало
-        it.kpProbe = {
-          imdb: c.imdb ? imdbRes : 'none', q: String(c.original || c.title).slice(0, 40), year: y || null, total: films.length,
-          top: films.slice(0, 5).map(function (f) { return [String(f.type || ''), String(f.year || ''), String(f.nameRu || f.nameEn || '').slice(0, 30)]; })
-        };
-        finish(0, 0, null);
-      }, kpFail(cb), kpHeaders(), ctx);
+        return hit;
+      };
+      var step = function (qi) {
+        if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
+        KpNet.get(KP_API + 'api/v2.1/films/search-by-keyword?keyword=' + encodeURIComponent(queries[qi]), function (j) {
+          ((j && j.films) || []).forEach(function (f) {
+            var id = String(f && f.filmId);
+            if (f && !seen[id]) { seen[id] = 1; all.push(f); }
+          });
+          var hit = pick();
+          if (hit && (kpRated(hit) || qi + 1 >= queries.length)) return byId(hit.filmId, true);
+          if (qi + 1 < queries.length) return step(qi + 1);
+          // Запасной поиск после пустой карточки ничего лучше не нашёл — остаёмся с ней
+          if (stub) {
+            it.kpProbe = stub.probe; it.kpProbe.alt = all.length;
+            return finish(0, 0, stub.id, stub.age);
+          }
+          // Для журнала: что вернул поиск (до 5 вариантов: тип, год, название) — чтобы понять, почему не совпало
+          it.kpProbe = {
+            imdb: c.imdb ? imdbRes : 'none', q: queries.join(' | ').slice(0, 60), year: y || null, total: all.length,
+            top: all.slice(0, 5).map(function (f) { return [String(f.type || ''), String(f.year || ''), String(f.nameRu || f.nameEn || '').slice(0, 30)]; })
+          };
+          finish(0, 0, null);
+        }, kpFail(cb), kpHeaders(), ctx);
+      };
+      step(0);
     };
 
     if (ageOnly) return byId(m.id);   // фильм на КП уже найден — сразу за оценкой
     if (c.imdb) {
       if (!kpCan(ctx)) return cb(null, kpWhyNot(ctx));
       KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
-        var x = j && j.items && j.items[0];
+        var x = kpPickItem(j && j.items, c.type);
         // Список по IMDb-номеру иногда отдаёт фильм без оценок, хотя у карточки КП они есть — переспрашиваем по id
-        if (x && !(parseFloat(x.ratingKinopoisk) > 0 || parseFloat(x.ratingImdb) > 0) && x.kinopoiskId) { imdbRes = 'item_no_rating'; byId(x.kinopoiskId); }
+        // (а если и у карточки их нет — byId один раз поищет по названию)
+        if (x && !kpRated(x) && x.kinopoiskId) { imdbRes = 'item_no_rating'; byId(x.kinopoiskId); }
         else if (x) finish(x.ratingKinopoisk, x.ratingImdb, x.kinopoiskId);
         else { imdbRes = 'empty'; byTitle(); }
       }, function (status) {
@@ -3342,7 +3420,7 @@
     var c = it.c || {};
     if (!c.imdb || !kpCan(ctx)) return cb(null);          // поиск по названию ради возраста не тратим
     KpNet.get(KP_API + 'api/v2.2/films?imdbId=' + encodeURIComponent(c.imdb), function (j) {
-      var x = j && j.items && j.items[0];
+      var x = kpPickItem(j && j.items, c.type);
       if (x && x.kinopoiskId) byId(x.kinopoiskId);
       else cb(null);
     }, function () { cb(null); }, kpHeaders(), ctx);
