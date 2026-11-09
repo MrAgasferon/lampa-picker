@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.13.3';
+  var VERSION = '0.13.4';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -93,6 +93,53 @@
     try { Lampa.Noty.show(text); } catch (e) {}
   }
 
+  function isArray(x) { return Object.prototype.toString.call(x) === '[object Array]'; }
+
+  // ---- Ошибки внутри плагина. Плагин грузится с другого домена, и всё, что вылетело наружу,
+  // браузер прячет до «Script error.» без файла и строки. Поэтому ловим сами и пишем в журнал
+  var ERR_MAX = 5;
+  var errSession = [];   // за этот запуск Lampa — уходят в запись журнала
+
+  function noteError(tag, e, extra) {
+    var rec = {
+      at: new Date().toISOString(),
+      v: VERSION,
+      tag: String(tag || ''),
+      msg: String((e && e.message) || e).slice(0, 200),
+      stack: String((e && e.stack) || '').split('\n').slice(0, 6).join(' | ').slice(0, 600)
+    };
+    if (extra !== undefined && extra !== null) rec.x = String(extra).slice(0, 100);
+    errSession.push(rec);
+    if (errSession.length > ERR_MAX) errSession.shift();
+    try {
+      var all = store('errors', []);
+      if (!isArray(all)) all = [];
+      all.push(rec);
+      save('errors', all.slice(-ERR_MAX));
+    } catch (x) {}
+    try { console.error('[Picker]', rec.tag, e); } catch (x) {}
+  }
+
+  function sessionErrors() { return errSession.length ? errSession.slice() : undefined; }
+
+  // Обёртка для колбэков, которые зовёт не наш код (таймеры, IndexedDB, события Lampa)
+  function safe(fn, tag, onErr) {
+    return function () {
+      try { return fn.apply(this, arguments); }
+      catch (e) {
+        noteError(tag, e);
+        if (onErr) { try { onErr(e); } catch (x) {} }
+      }
+    };
+  }
+
+  // То же для действий пользователя: вместо «Script error» — понятное сообщение
+  function safeUi(fn, tag) {
+    return safe(fn, tag, function (e) {
+      noty(DEV ? 'Ошибка подборщика (' + tag + '): ' + String((e && e.message) || e) : 'Не получилось — попробуйте ещё раз');
+    });
+  }
+
   // Детерминированный генератор случайных чисел (mulberry32)
   function rng(seed) {
     var a = seed >>> 0;
@@ -134,6 +181,7 @@
     var out = [];
     for (var i = 0; i < (ids || []).length; i++) {
       var g = ids[i];
+      if (g === null || g === undefined || g === '') continue;
       var mapped = TV_TO_MOVIE[g] || [g];
       for (var j = 0; j < mapped.length; j++) if (out.indexOf(mapped[j]) < 0) out.push(mapped[j]);
     }
@@ -321,7 +369,8 @@
         self.opened = true;
         var w = self.waiting;
         self.waiting = [];
-        for (var i = 0; i < w.length; i++) w[i]();
+        // Исключение одного ожидающего не должно оставлять остальных без ответа
+        for (var i = 0; i < w.length; i++) { try { w[i](); } catch (e) { noteError('cache.init cb', e); } }
       };
 
       try {
@@ -351,7 +400,13 @@
         if (!self.db) return cb(null);
         if (self.stalled) return cb(null, 'timeout');   // база уже не ответила — в этой сессии не ждём её снова
         var done = false;
-        var reply = function (v, why) { if (done) return; done = true; clearTimeout(guard); cb(v, why); };
+        // Ответ IndexedDB приходит из onsuccess: исключение отсюда браузер покажет как «Script error»
+        var reply = function (v, why) {
+          if (done) return;
+          done = true;
+          clearTimeout(guard);
+          try { cb(v, why); } catch (e) { noteError('cache.get cb', e, key); }
+        };
         // WebView иногда не вызывает ни onsuccess, ни onerror — подбор не должен ждать вечно
         var guard = setTimeout(function () { log('IndexedDB: нет ответа', key); self.stalled = true; reply(null, 'timeout'); }, CACHE_GET_TIMEOUT);
         try {
@@ -430,7 +485,9 @@
         if (legacy !== null || touched) self.flush(key);
         var w = self.waiting[key] || [];
         self.waiting[key] = [];
-        for (var i = 0; i < w.length; i++) if (w[i]) w[i](self.vals[key]);
+        for (var i = 0; i < w.length; i++) {
+          if (w[i]) { try { w[i](self.vals[key]); } catch (e) { noteError('durable cb', e, key); } }
+        }
       });
     },
 
@@ -849,20 +906,32 @@
     }
   }
 
+  // Карточки списков Lampa бывают не в формате TMDB: сторонние источники пишут год числом,
+  // импорт закладок кладёт карточки в «favorite» без Utils.clearCard. Считаем, сколько таких поправили
+  var cardDateFixes = 0;
+
+  function cardGenreIds(card) {
+    if (isArray(card.genre_ids)) return card.genre_ids;
+    if (!isArray(card.genres)) return [];
+    return card.genres.map(function (g) { return g && typeof g === 'object' ? g.id : g; });
+  }
+
   // Признаки из карточки списка (без запроса деталей)
   function cardCompact(card) {
     var date = card.release_date || card.first_air_date || '';
+    if (typeof date !== 'string') { cardDateFixes++; date = String(date); }
     return {
       id: card.id,
       type: typeOf(card),
-      title: card.title || card.name || '',
+      title: String(card.title || card.name || ''),
       year: date.slice(0, 4),
       date: date,
-      genres: normGenres(card.genre_ids || (card.genres || []).map(function (g) { return g.id || g; })),
+      genres: normGenres(cardGenreIds(card)),
       kw: [], cast: [], dir: [], names: {},
-      lang: card.original_language || '',
-      va: card.vote_average || 0,
-      vc: card.vote_count || 0,
+      lang: String(card.original_language || ''),
+      // Рейтинг и голоса строкой (сторонние каталоги) — в число: иначе toFixed на экране упадёт
+      va: Number(card.vote_average) || 0,
+      vc: Number(card.vote_count) || 0,
       runtime: null, cert: null, coll: null
     };
   }
@@ -1233,7 +1302,9 @@
 
     var top = [];
     for (var i = 0; i < events.length; i++) {
-      events[i].c = cardCompact(events[i].card);
+      // Одна карточка неожиданного вида выпадает из профиля, а не роняет весь подбор
+      try { events[i].c = cardCompact(events[i].card); }
+      catch (e) { noteError('event card', e, events[i].k); events[i].c = null; events[i].s = 0; continue; }
       if (events[i].s !== 0 && top.length < 25) top.push(events[i]);
     }
 
@@ -2425,6 +2496,7 @@
     var tm = {};                                     // время этапов, мс — для журнала
     var mark = function (k) { poke(); tm[k] = now() - started; };
     var net0 = { ok: Net.oks, fail: Net.netFails };
+    var fixes0 = cardDateFixes;
 
     // Сторож: подбор не может висеть бесконечно
     var finished = false;
@@ -2433,7 +2505,16 @@
       finished = true;
       cancelRun();
       log('run failed', kind);
-      if (h.error) h.error(kind);
+      if (h.error) { try { h.error(kind); } catch (e) { noteError('run.error ui', e); } }
+    };
+    // Исключение на любом шаге: записать в журнал ошибок и сразу показать экран ошибки,
+    // а не ждать сторожа 20 с (и не отдавать браузеру — он покажет «Script error»)
+    var guard = function (fn, tag) {
+      return function () {
+        if (!alive()) return;
+        try { return fn.apply(this, arguments); }
+        catch (e) { noteError('run:' + tag, e); fail('error'); }
+      };
     };
     // Каждую секунду: пришёл ли ответ TMDB или начался новый этап. Тишина 20 с или 90 с всего — ошибка
     var watchdog = setInterval(function () {
@@ -2447,29 +2528,33 @@
       }
     }, 1000);
 
-    save('last_answers', ans);
-    stage('Изучаю вашу историю');
-
-    var events = collect();
+    var events;
+    try {
+      save('last_answers', ans);
+      stage('Изучаю вашу историю');
+      events = collect();
+    } catch (eC) { noteError('run:collect', eC); fail('error'); return; }
 
     Durable.load('journal', []);
     Durable.load('kpmap', {});
-    Durable.load('journal', [], function () {
-    probeMoods(function () {
-    enrichEvents(events, function () {
-      if (!alive()) return;
+    Durable.load('journal', [], guard(function () {
+    probeMoods(guard(function () {
+    enrichEvents(events, guard(function () {
       var profile = buildProfile(events);
       mark('profile');
       stage('Ищу кандидатов');
 
-      gatherPool(profile, events, ans, function (pool) {
-        if (!alive()) return;
+      gatherPool(profile, events, ans, guard(function (pool) {
         mark('pool');
         var stats = {};
         var list = prefilter(pool, events, ans, stats);
 
-        // Предоценка по полям списка, затем детали партиями, пока не наберётся достаточно подходящих
-        for (var i = 0; i < list.length; i++) list[i].c = cardCompact(list[i].r || {});
+        // Предоценка по полям списка, затем детали партиями, пока не наберётся достаточно подходящих.
+        // Карточка неожиданного вида (из «Позже» стороннего источника) выпадает, а не роняет подбор
+        list = list.filter(function (it) {
+          try { it.c = cardCompact(it.r || {}); return true; }
+          catch (eP) { noteError('pool card', eP, it.k); stats.bad_card = (stats.bad_card || 0) + 1; return false; }
+        });
         scoreAll(list, profile, ans);
         list.sort(function (a, b) { return b.score - a.score; });
 
@@ -2485,8 +2570,7 @@
           var batch = list.slice(offset, offset + BATCH);
           offset += batch.length;
           stage('Сравниваю ' + offset + ' вариантов');
-          detailsMany(batch, function () {
-            if (!alive()) return;
+          detailsMany(batch, guard(function () {
             for (var b = 0; b < batch.length; b++) {
               var r = postReason(batch[b], ans, profile);
               if (r) stats[r] = (stats[r] || 0) + 1;
@@ -2497,13 +2581,13 @@
             if (more && now() - started > DETAILS_SOFT && passed.length >= DETAILS_MIN_OK) { more = false; detailsCut = true; }
             if (more) nextBatch();
             else afterDetails();
-          });
+          }, 'details'));
         };
 
         var kpBefore = 0, kpBudget = { kids: ans.company === 'kids' };   // общий бюджет КП на подбор: оценки + возраст
         var cubStat = { got: 0, asked: 0 };
-        var afterDetails = function () {
-          if (!alive()) return;                       // отменённый подбор не тратит квоту КП и слоты CUB
+        // Отменённый подбор не тратит квоту КП и слоты CUB: guard не вызывает шаг, если подбор уже не живой
+        var afterDetails = guard(function () {
           mark('details');
           scoreAll(passed, profile, ans);
           stage('Уточняю настроение и рейтинги');
@@ -2513,71 +2597,75 @@
           var both = function () { if (--pending === 0) afterExtras(); };
           attachCubMeta(passed, function (x) { if (x) cubStat = x; both(); });
           attachRatings(passed, both, kpBudget);
-        };
+        }, 'afterDetails');
 
-        var afterExtras = function () {
-            if (!alive()) return;
-            mark('extras');
-            if (ans.company !== 'kids') return finishPick();
-            // Шкалы CUB пришли после фильтров, плюс возраст с Кинопоиска — для детей проверяем ещё раз
-            scoreAll(passed, profile, ans);
-            attachKidsAge(passed, function () {
-              if (!alive()) return;
-              passed = passed.filter(function (it) {
-                var r = postReason(it, ans, profile, true);
-                if (r) { stats[r] = (stats[r] || 0) + 1; return false; }
-                return true;
-              });
-              finishPick();
-            }, kpBudget);
-        };
-
-        var finishPick = function () {
+        var afterExtras = guard(function () {
+          mark('extras');
+          if (ans.company !== 'kids') return finishPick();
+          // Шкалы CUB пришли после фильтров, плюс возраст с Кинопоиска — для детей проверяем ещё раз
           scoreAll(passed, profile, ans);
-          franchiseFilter(passed, events, ans, stats, profile, function (finalList, frLog) {
-          if (!alive()) return;
-          var top = list.slice(0, offset);
-          var wkey = scoreAll(finalList, profile, ans);
-          jitter(finalList);
-          var shadow = null;
-          try { shadow = shadowPick(finalList, ans, wkey); } catch (eS) { log('shadow error', eS); }
-          var kpReq = Math.max(0, kpQuota().n - kpBefore);
+          attachKidsAge(passed, guard(function () {
+            passed = passed.filter(function (it) {
+              var r = postReason(it, ans, profile, true);
+              if (r) { stats[r] = (stats[r] || 0) + 1; return false; }
+              return true;
+            });
+            finishPick();
+          }, 'kidsAge'), kpBudget);
+        }, 'afterExtras');
 
-          log('events', events.length, 'profile.n', profile.n, 'pool', Object.keys(pool).length - 1,
-            'prefiltered', list.length, 'final', finalList.length, 'ms', now() - started);
+        var finishPick = guard(function () {
+          scoreAll(passed, profile, ans);
+          franchiseFilter(passed, events, ans, stats, profile, guard(function (finalList, frLog) {
+            var top = list.slice(0, offset);
+            var wkey = scoreAll(finalList, profile, ans);
+            jitter(finalList);
+            var shadow = null;
+            try { shadow = shadowPick(finalList, ans, wkey); } catch (eS) { log('shadow error', eS); }
+            var kpReq = Math.max(0, kpQuota().n - kpBefore);
 
-          // Пусто, а запросы к TMDB в основном падали — это не «ничего не нашлось», а нет связи
-          var dOk = Net.oks - net0.ok, dFail = Net.netFails - net0.fail;
-          if (!finalList.length && dFail > 0 && dFail >= dOk) return fail('net');
-          if (finished) return;
-          finished = true;
+            log('events', events.length, 'profile.n', profile.n, 'pool', Object.keys(pool).length - 1,
+              'prefiltered', list.length, 'final', finalList.length, 'ms', now() - started);
 
-          var st = {
-            ans: ans, rest: finalList, shown: [], page: [],
-            profile: profile, wkey: wkey, cold: !(profile.pos >= 5)
-          };
-          st.journal = Journal.begin(ans, {
-            wkey: wkey, ms: now() - started, tm: tm, moods: cubStat.got > 0, cub: [cubStat.got, cubStat.asked],
-            kp: { req: kpReq, off: kpOffline(), rated: finalList.filter(function (x) { return x.rt; }).length },
-            counts: { events: events.length, profile: profile.n, pool: Object.keys(pool).length - 1, prefiltered: list.length, detailed: top.length, final: finalList.length },
-            sources: pool.__src,
-            dropped: stats,
-            profile: profileSummary(profile),
-            top: finalList.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).map(journalItem),
-            shadow: shadow,
-            repeats: finalList.filter(function (x) { return x.rp < 1; }).length,
-            franchises: frLog && frLog.length ? frLog.slice(0, 30) : undefined,
-            detailsCut: detailsCut || undefined
-          });
-          if (h.done) h.done(st);
-          });
-        };
+            // Пусто, а запросы к TMDB в основном падали — это не «ничего не нашлось», а нет связи
+            var dOk = Net.oks - net0.ok, dFail = Net.netFails - net0.fail;
+            if (!finalList.length && dFail > 0 && dFail >= dOk) return fail('net');
+            if (finished) return;
+
+            var st = {
+              ans: ans, rest: finalList, shown: [], page: [],
+              profile: profile, wkey: wkey, cold: !(profile.pos >= 5)
+            };
+            st.journal = Journal.begin(ans, {
+              wkey: wkey, ms: now() - started, tm: tm, moods: cubStat.got > 0, cub: [cubStat.got, cubStat.asked],
+              kp: { req: kpReq, off: kpOffline(), rated: finalList.filter(function (x) { return x.rt; }).length },
+              counts: { events: events.length, profile: profile.n, pool: Object.keys(pool).length - 1, prefiltered: list.length, detailed: top.length, final: finalList.length },
+              sources: pool.__src,
+              dropped: stats,
+              profile: profileSummary(profile),
+              top: finalList.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).map(journalItem),
+              shadow: shadow,
+              repeats: finalList.filter(function (x) { return x.rp < 1; }).length,
+              franchises: frLog && frLog.length ? frLog.slice(0, 30) : undefined,
+              detailsCut: detailsCut || undefined,
+              // Карточки списков Lampa с датой не строкой (поправлены) и пойманные за этот запуск ошибки
+              dateFixes: (cardDateFixes - fixes0) || undefined,
+              errors: sessionErrors()
+            });
+            finished = true;
+            // Экран результатов — уже не конвейер: его сбой показываем экраном ошибки отдельно
+            if (h.done) {
+              try { h.done(st); }
+              catch (eD) { noteError('run:render', eD); if (h.error) { try { h.error('error'); } catch (x) {} } }
+            }
+          }, 'final'));
+        }, 'finishPick');
 
         nextBatch();
-      });
-    });
-    });
-    });
+      }, 'pool'));
+    }, 'profile'));
+    }, 'moods'));
+    }, 'journal'));
   }
 
   // =========================================================================
@@ -2787,6 +2875,9 @@
           return row;
         })
       };
+      // Пойманные ошибки: [где, текст] и сколько карточек с датой не строкой пришлось поправить
+      if (isArray(e.errors) && e.errors.length) out.er = e.errors.map(function (x) { return [x.tag, short(x.msg, 80)]; });
+      if (e.dateFixes) out.df = e.dateFixes;
       // Лимит сообщения Telegram — 4096 символов: сначала убираем причины, потом самые ранние показы
       var txt = JSON.stringify(out);
       if (txt.length > 3900) {
@@ -2845,6 +2936,8 @@
           return row;
         })
       };
+      if (isArray(e.errors) && e.errors.length) o.er = e.errors.map(function (x) { return [x.tag, short(x.msg, 60)]; });
+      if (e.dateFixes) o.df = e.dateFixes;
       var key = JSON.stringify(pr);
       if (key !== prevProfile) o.pr = pr;
       return { o: o, prof: key };
@@ -2895,7 +2988,10 @@
         sessions: a.length,
         ua: (navigator.userAgent || '').slice(0, 120),
         kpQuotaToday: kpQuota().n,
-        cubMeta: { off: cubMetaOff(), got: MoodsApi.got, asked: MoodsApi.asked, statuses: MoodsApi.statuses }
+        cubMeta: { off: cubMetaOff(), got: MoodsApi.got, asked: MoodsApi.asked, statuses: MoodsApi.statuses },
+        // Последние пойманные ошибки — и тех запусков, где подбор не дошёл до записи в журнал
+        errors: (function () { var e = store('errors', []); return isArray(e) && e.length ? e : undefined; })(),
+        dateFixesSession: cardDateFixes || undefined
       };
       var lines = [JSON.stringify(head)];
       for (var i = 0; i < a.length; i++) lines.push(JSON.stringify(a[i]));
@@ -4065,11 +4161,11 @@
     }
 
     function bindFocus(el, onFocus) {
-      el.on('hover:focus', function () {
+      el.on('hover:focus', safe(function () {
         last = el[0];
         ensureVisible(el);
         if (onFocus) onFocus();
-      });
+      }, 'focus'));
     }
 
     function setBody(node) {
@@ -4109,7 +4205,7 @@
         if (prev && prev.time && prev.mood && prev.company) {
           var lastBtn = $('<div class="pkr-last selector">' + svg('refresh') +
             '<span><b>Как в прошлый раз</b><i>' + esc(describeList(prev).join(' · ')) + '</i></span></div>');
-          lastBtn.on('hover:enter', function () { ans = extend(prev, {}); startRun(); });
+          lastBtn.on('hover:enter', safeUi(function () { ans = extend(prev, {}); startRun(); }, 'last'));
           bindFocus(lastBtn);
           wrap.append(lastBtn);
         }
@@ -4122,11 +4218,11 @@
             '<div class="pkr-tile__title">' + esc(item.title) + '</div>' +
             (item.hint ? '<div class="pkr-tile__hint">' + esc(item.hint) + '</div>' : '') + '</div>');
           if (ans[def.key] === item.value) { tile.addClass('is-chosen'); focusEl = tile; }
-          tile.on('hover:enter', function () {
+          tile.on('hover:enter', safeUi(function () {
             ans[def.key] = item.value;
             if (n < STEPS.length - 1) renderWizard(n + 1);
             else startRun();
-          });
+          }, 'tile'));
           bindFocus(tile);
           tiles.append(tile);
           if (!focusEl && t === 0) focusEl = tile;
@@ -4199,6 +4295,7 @@
           picked += next ? 1 : -1;
           upd();
         };
+        tog = safeUi(tog, 'taste:like');
         el.on('hover:enter', tog);
         el.on('click', tog);
         bindFocus(el);
@@ -4210,7 +4307,7 @@
       var fetchMore = function (cb) {
         if (nextP > TASTE_MAX_PAGES) return cb(false);
         var p = nextP++;
-        tasteBatch(p, seen, function (list) { items = items.concat(list); cb(true); });
+        tasteBatch(p, seen, safe(function (list) { items = items.concat(list); cb(true); }, 'taste:load'));
       };
       var exhausted = function () { return nextP > TASTE_MAX_PAGES && !prefetching && !items.length; };
       var show = function () {
@@ -4290,11 +4387,14 @@
     function renderError(kind) {
       view = 'error';
       var net = kind === 'net';
+      var text = net
+        ? 'Подборщик берёт фильмы из TMDB, а он сейчас не отвечает. Проверьте интернет и прокси TMDB в настройках Lampa.'
+        : kind === 'error'
+          ? 'Что-то пошло не так при подборе. Попробуйте ещё раз — если повторится, подробности уже в журнале подборов.'
+          : 'Подбор занял слишком много времени — скорее всего, медленно отвечает сеть. Попробуйте ещё раз.';
       var wrap = $('<div class="pkr-empty">' + svg('search') +
         '<div class="pkr-empty__title">' + (net ? 'Нет связи с TMDB' : 'Не получилось подобрать') + '</div>' +
-        '<div class="pkr-empty__text">' + (net
-          ? 'Подборщик берёт фильмы из TMDB, а он сейчас не отвечает. Проверьте интернет и прокси TMDB в настройках Lampa.'
-          : 'Подбор занял слишком много времени — скорее всего, медленно отвечает сеть. Попробуйте ещё раз.') + '</div></div>');
+        '<div class="pkr-empty__text">' + text + '</div></div>');
       var actions = $('<div class="pkr-actions"></div>');
       actions.append(button('refresh', 'Повторить', 'pkr-btn--primary', function () { startRun(); }));
       actions.append(button('sliders', 'Изменить ответы', '', function () { renderWizard(0); }));
@@ -4385,6 +4485,7 @@
         d.find('.pkr-hero__more').html('<span>' + (open ? 'Свернуть' : 'Читать полностью') + '</span> ' + (open ? '▴' : '▾'));
         if (state) Journal.action(state.journal, open ? 'descr_open' : 'descr_close', current);
       };
+      toggle = safeUi(toggle, 'descr');
       d.on('hover:enter', toggle);
       d.on('click', toggle);
       bindFocus(d);
@@ -4420,17 +4521,17 @@
         '</div>');
 
       bindFocus(el, function () { if (current !== it) setCurrent(it); });
-      el.on('hover:enter', function () {
+      el.on('hover:enter', safeUi(function () {
         // ТВ: фокус уже выбрал карточку — открываем. Телефон: первый тап выбирает, второй открывает.
         if (current === it) openIt(it);
         else setCurrent(it);
-      });
+      }, 'card'));
       return el;
     }
 
     function button(icon, text, cls, fn) {
       var b = $('<div class="pkr-btn selector ' + (cls || '') + '">' + svg(icon) + '<span>' + esc(text) + '</span></div>');
-      b.on('hover:enter', fn);
+      b.on('hover:enter', safeUi(fn, 'btn:' + text));
       bindFocus(b);
       return b;
     }
@@ -4535,7 +4636,7 @@
             var cr = x.c ? cachedRatings(x.c, x.k) : null;
             cb(cr ? { kp: cr.kp, imdb: cr.imdb, src: 'cache' } : null);
           } : fetchRatings;
-          getR(it, function (r, why) {
+          getR(it, safe(function (r, why) {
             if (!r) {
               // «не найден» из кеша — следствие того же поиска: исходную причину подбора не затираем
               if (why && !it.kp && !it.imdbR && !(why === 'cached_miss' && it.kpMiss)) { it.kpMiss = why; Journal.rating(state.journal, it); }
@@ -4554,7 +4655,7 @@
             else cardEls[idx].find('.pkr-card__img').append('<div class="pkr-card__rate">' + txt + '</div>');
             if (it.kp) cardEls[idx].find('.pkr-card__rate').addClass('is-kp');
             if (current === it && !heroEl.find(".pkr-hero__descr.is-open").length) { heroEl.html(heroHtml(it)); bindDescr(); holdHeroHeight(); }
-          });
+          }, 'ratings'));
         })(page[i]);
       }
     }
@@ -4568,7 +4669,7 @@
       Lampa.Select.show({
         title: 'Почему не то?',
         items: REJECT_REASONS.map(function (x) { return { title: x.title, subtitle: x.subtitle, r: x.r }; }),
-        onSelect: function (a) { back(); current = it; dismiss('reject', a.r || ''); },
+        onSelect: safeUi(function (a) { back(); current = it; dismiss('reject', a.r || ''); }, 'reject'),
         onBack: back
       });
     }
@@ -4590,13 +4691,13 @@
       noty(kind === 'reject' ? 'Скрыто на 90 дней' : 'Отмечено как просмотренное');
 
       if (cardEls[idx]) cardEls[idx].addClass('is-gone');
-      setTimeout(function () {
+      setTimeout(safeUi(function () {
         replaceInPage(state, it);
         var fresh = state.page[idx];
         if (fresh && fresh !== it) { Journal.shown(state.journal, [fresh], (state.pageNo || 1) + '-repl'); markShownToday([fresh]); }
         current = state.page[Math.min(idx, state.page.length - 1)];
         renderResults(idx);
-      }, 220);
+      }, 'dismiss'), 220);
     }
 
     function renderEmpty() {
@@ -4712,14 +4813,21 @@
         if (feedbackSending) return;
         feedbackSending = true;
         noty('Отправляю…');
-        sendFeedback(comment).then(function () {
+        try {
+          sendFeedback(comment).then(function () {
+            feedbackSending = false;
+            noty('Отправлено, спасибо!');
+          }, function (e) {
+            feedbackSending = false;
+            log('feedback error', e);
+            noty('Не получилось отправить — попробуйте позже');
+          });
+        } catch (e) {
+          // Например, в движке нет Promise: флаг не должен залипнуть до перезапуска
           feedbackSending = false;
-          noty('Отправлено, спасибо!');
-        }, function (e) {
-          feedbackSending = false;
-          log('feedback error', e);
+          noteError('feedback', e);
           noty('Не получилось отправить — попробуйте позже');
-        });
+        }
       };
       if (!Lampa.Input || !Lampa.Input.edit) return go('');
       Lampa.Input.edit({ title: 'Комментарий (необязательно)', value: '', free: true, nosave: true }, go);
@@ -4737,10 +4845,12 @@
 
     // ---- жизненный цикл компонента
 
+    var fitSafe = safe(function () { fit(); }, 'fit');
+
     this.create = function () {
       injectCss();
       scroller.append(body);
-      $(window).on('resize', fit);
+      $(window).on('resize', fitSafe);
       if (this.activity && this.activity.loader) this.activity.loader(false);
 
       var preset = object && object.answers;
@@ -4758,23 +4868,23 @@
           Lampa.Controller.collectionSet(focusable());
           Lampa.Controller.collectionFocus(last || false, focusable());
         },
-        left: function () {
+        left: safe(function () {
           if (lineMove('left')) return;
           if (Navigator.canmove('left')) Navigator.move('left');
           else Lampa.Controller.toggle('menu');
-        },
-        right: function () { if (!lineMove('right')) Navigator.move('right'); },
-        up: function () {
+        }, 'nav:left'),
+        right: safe(function () { if (!lineMove('right')) Navigator.move('right'); }, 'nav:right'),
+        up: safe(function () {
           if (lineMove('up')) return;
           if (Navigator.canmove('up')) Navigator.move('up');
           else Lampa.Controller.toggle('head');
-        },
-        down: function () { if (!lineMove('down') && Navigator.canmove('down')) Navigator.move('down'); },
-        back: function () { self.back(); }
+        }, 'nav:up'),
+        down: safe(function () { if (!lineMove('down') && Navigator.canmove('down')) Navigator.move('down'); }, 'nav:down'),
+        back: safeUi(function () { self.back(); }, 'back')
       });
       Lampa.Controller.toggle('content');
-      fit();
-      setTimeout(fit, 60);
+      fitSafe();
+      setTimeout(fitSafe, 60);
     };
 
     this.back = function () {
@@ -4791,7 +4901,7 @@
 
     this.destroy = function () {
       cancelRun();
-      $(window).off('resize', fit);
+      $(window).off('resize', fitSafe);
       html.remove();
     };
   }
@@ -4843,7 +4953,7 @@
       var item = $('<li class="menu__item selector" data-action="picker">' +
         '<div class="menu__ico">' + ICON + '</div>' +
         '<div class="menu__text">' + TITLE + '</div></li>');
-      item.on('hover:enter', function () { openPicker(); });
+      item.on('hover:enter', safeUi(function () { openPicker(); }, 'menu'));
       $('.menu .menu__list').eq(0).append(item);
     } catch (e) { log('menu error', e); }
   }
@@ -4885,14 +4995,14 @@
       save('warmup_day', todaySeed());
       Cache.sweep();
       var events = collect();
-      enrichEvents(events, function () {
+      enrichEvents(events, safe(function () {
         var profile = buildProfile(events);
         var seeds = profile.seeds.slice(0, 8);
         for (var i = 0; i < seeds.length; i++) {
           tmdb(seeds[i].type + '/' + seeds[i].id + '/recommendations', { page: 1 }, LIST_TTL, function () {});
         }
         log('warmup done, events', events.length, 'profile.n', profile.n);
-      });
+      }, 'warmup'));
     } catch (e) { log('warmup error', e); }
   }
 
@@ -4949,6 +5059,7 @@
     journalLast: function () { return Journal.exportLast(); },
     journalPacked: function () { return Journal.exportPacked(); },
     journalFit: function () { return Journal.exportFit(); },
+    errors: function () { return store('errors', []); },
     setKpKey: function (k) { save('kp_key', String(k || '')); var q = kpQuota(); q.blocked = false; save('kp_quota', q); return kpPersonal() ? 'личный ключ сохранён' : 'личный ключ удалён, используется встроенный'; },
     // Даты первого знакомства (seen) не трогаем: это служебные данные, без них вся история снова «свежая»
     reset: function () { save('feedback', {}); save('last_answers', null); save('genre_rej', {}); return 'reset'; }
