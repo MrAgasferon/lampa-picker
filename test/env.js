@@ -16,7 +16,7 @@ const NAMES = ['certOf', 'kidsOk', 'kidsTargeted', 'adultRated', 'harshAdult', '
   'pickWeights', 'moodScore', 'postReason', 'prefilter', 'scoreAll', 'ratingOffsets', 'cachedRatings', 'tmdb', 'tmdbUrl',
   'details', 'compact', 'cubMeta', 'Cache', 'Durable', 'Net', 'KpNet', 'CubNet', 'attachRatings', 'attachCubMeta', 'kpQuota',
   'fetchRatings', 'run', 'cancelRun', 'nextPage', 'PickerComponent', 'feedback', 'saveFeedback', 'Journal', 'progress',
-  'startedAny', 'seriesStarted', 'moodFromScales', 'reasonOf', 'todaySeed', 'jitter', 'dislikeMult', 'shadowPick', 'votesText', 'repeatMult', 'markShownToday', 'shownToday', 'attachRatings', 'normTitle', 'attachKidsAge', 'cardCompact'];
+  'startedAny', 'seriesStarted', 'moodFromScales', 'reasonOf', 'todaySeed', 'jitter', 'dislikeMult', 'shadowPick', 'votesText', 'repeatMult', 'markShownToday', 'shownToday', 'attachRatings', 'normTitle', 'attachKidsAge', 'cardCompact', 'sessionKnow', 'replaceInPage', 'openCard'];
 const HOOK = '\n  window.__pk = {' + NAMES.map(n => n + ": (typeof " + n + " !== 'undefined' ? " + n + ' : undefined)').join(', ') +
   ", getKpRunCap: function () { return typeof kpRunCap !== 'undefined' ? kpRunCap : undefined; } };\n";
 const END = RAW.lastIndexOf('})()');

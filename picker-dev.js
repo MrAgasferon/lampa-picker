@@ -29,7 +29,7 @@
 
   // Данные о вкусе — свои у каждого профиля CUB. Общие данные до разделения остаются у профиля,
   // который первым к ним обратился (миграция не нужна); остальные профили получают свои ключи
-  var PROFILE_KEYS = { seen: 1, seen_init: 1, feedback: 1, genre_rej: 1, shown_day: 1, last_answers: 1, taste_offered: 1 };
+  var PROFILE_KEYS = { seen: 1, seen_init: 1, feedback: 1, genre_rej: 1, shown_day: 1, last_answers: 1, taste_offered: 1, ignored: 1 };
   function profileId() {
     try { var a = Lampa.Storage.get('account', '{}'); if (typeof a === 'string') a = JSON.parse(a); return (a && a.profile && a.profile.id) || 0; }
     catch (e) { return 0; }
@@ -2281,29 +2281,119 @@
   }
   // Каждый подбор отмечает показанные карточки один раз (страница отмечается при первом показе, см. state.logged)
   function markShownToday(items) {
-    var map = shownToday(), n = 0;
+    var map = shownToday(), n = 0, firstToday = [];
     for (var i = 0; i < items.length; i++) {
       var k = items[i] && items[i].k;
       if (!k) continue;
+      if (!map[k] && !items[i].wath) firstToday.push(k);
       map[k] = (typeof map[k] === 'number' ? map[k] : 0) + 1;
       n++;
     }
     if (n) save('shown_day', { d: todaySeed(), k: map });
+    if (firstToday.length) noteIgnoredDay(firstToday);
   }
+
+  // ---- Пропускаемое между днями: показан в 3+ разные дни и ни разу не открыт — значит, не интересно.
+  // Штраф с 3-го дня ×0,8, с 4-го ×0,65, с 5-го ×0,5; снимается при открытии или через 2 недели без показов.
+  // Закладки и «Позже» не трогаем — их человек сохранил сам
+  var IGNORE_TTL = 14 * DAY;
+  var IGNORE_MULT = { 3: 0.8, 4: 0.65 }, IGNORE_MIN = 0.5;
+  var IGNORE_MAX_KEYS = 1500;
+  function ignoredMap() {
+    var m = store('ignored', {});
+    return m && typeof m === 'object' && !isArray(m) ? m : {};
+  }
+  function ignoreMult(rec) {
+    if (!rec || !(now() - rec.t < IGNORE_TTL) || !(rec.n >= 3)) return 1;
+    return rec.n >= 5 ? IGNORE_MIN : IGNORE_MULT[rec.n];
+  }
+  function noteIgnoredDay(keys) {
+    var m = ignoredMap(), t = now(), day = todaySeed();
+    for (var i = 0; i < keys.length; i++) {
+      var r = m[keys[i]];
+      if (r && r.d === day) continue;
+      var alive = r && t - r.t < IGNORE_TTL;
+      m[keys[i]] = { n: (alive ? r.n : 0) + 1, d: day, t: t };
+    }
+    trimMap(m, IGNORE_MAX_KEYS, function (v) { return v && t - v.t < IGNORE_TTL; });
+    save('ignored', m);
+  }
+  function forgetIgnored(k) {
+    var m = ignoredMap();
+    if (!m[k]) return;
+    delete m[k];
+    save('ignored', m);
+  }
+
+  // ---- «Знаток жанра»: в жанре много «Уже видел» — человек смотрит его и вне Lampa, и популярное
+  // не новое там он, скорее всего, видел. Мягкий штраф таким фильмам: с 5 отметок ×0,85, к 10 — ×0,7.
+  // В одном подборе три «Уже видел» подряд — ещё ×0,8 популярному в их общих жанрах до конца подбора
+  var KNOW_MIN = 5, KNOW_FULL = 10, KNOW_MULT_MIN = 0.85, KNOW_MULT_FULL = 0.7;
+  var KNOW_VOTES = 3000, KNOW_AGE = 3;   // «популярное и не новое»: от 3000 голосов TMDB и старше 3 лет
+  var KNOW_SESSION = 0.8, KNOW_ROW = 3;
+  function knowCounts() {
+    var fb = feedback(), out = {};
+    each(fb.seen, function (v) {
+      var g = v && v.card && v.card.genre_ids;
+      if (!isArray(g)) return;
+      for (var i = 0; i < g.length; i++) out[g[i]] = (out[g[i]] || 0) + 1;
+    });
+    return out;
+  }
+  function popularOld(c) {
+    var y = parseInt(c && c.year, 10);
+    return !!c && c.vc >= KNOW_VOTES && y > 0 && new Date(now()).getFullYear() - y >= KNOW_AGE;
+  }
+  function knowMult(c, counts) {
+    if (!popularOld(c)) return 1;
+    var best = 0;
+    for (var i = 0; i < (c.genres || []).length; i++) best = Math.max(best, counts[c.genres[i]] || 0);
+    if (best < KNOW_MIN) return 1;
+    var f = Math.min(1, (best - KNOW_MIN) / (KNOW_FULL - KNOW_MIN));
+    return KNOW_MULT_MIN + (KNOW_MULT_FULL - KNOW_MULT_MIN) * f;
+  }
+  // Три «Уже видел» подряд: жанры, общие хотя бы для двух из них; оставшимся популярным не новым в них — ×0,8
+  function sessionKnow(state) {
+    var cnt = {}, gs = [];
+    for (var i = 0; i < state.seenRow.length; i++) {
+      var g = (state.seenRow[i].c && state.seenRow[i].c.genres) || [];
+      for (var j = 0; j < g.length; j++) cnt[g[j]] = (cnt[g[j]] || 0) + 1;
+    }
+    each(cnt, function (v, k) { if (v >= 2) gs.push(+k); });
+    if (!gs.length) return null;
+    var n = 0;
+    for (var r = 0; r < state.rest.length; r++) {
+      var x = state.rest[r];
+      if (x.ks || x.wath || !x.c || !popularOld(x.c)) continue;
+      var hit = false;
+      for (var q = 0; q < x.c.genres.length && !hit; q++) if (gs.indexOf(x.c.genres[q]) > -1) hit = true;
+      if (!hit) continue;
+      x.ks = KNOW_SESSION;
+      x.jscore *= KNOW_SESSION;
+      n++;
+    }
+    state.rest.sort(function (a, b) { return b.jscore - a.jscore; });
+    return { g: gs, n: n };
+  }
+  function modsOf(x) { return (x.rp || 1) * (x.ig || 1) * (x.kn || 1) * (x.ks || 1); }
   function repeatMult(times) {
     if (!(times > 0)) return 1;
     return Math.max(REPEAT_MIN, Math.pow(REPEAT_MULT, times));
   }
 
   // Разброс ×0,92…1,08 привязан к фильму и дню: в течение дня у фильма тот же множитель, где бы он ни стоял.
-  // Показанное сегодня (без «Открыть», «Не то», «Уже видел» — те и так скрыты) — ×0,85 за каждый показ, не ниже ×0,6
-  function jitter(items) {
-    var day = todaySeed(), seenToday = shownToday();
+  // Показанное сегодня (без «Открыть», «Не то», «Уже видел» — те и так скрыты) — ×0,85 за каждый показ, не ниже ×0,6.
+  // Пропускаемое между днями — ig, «знаток жанра» — kn (закладки и «Позже» — без них; kn — не для «С детьми»)
+  function jitter(items, ans) {
+    var day = todaySeed(), seenToday = shownToday(), ign = ignoredMap();
+    var know = ans && ans.company === 'kids' ? null : knowCounts();
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
       it.jmul = 0.92 + 0.16 * rng(day ^ strSeed(it.k))();
       it.rp = repeatMult(seenToday[it.k]);
-      it.jscore = it.score * it.jmul * it.rp;
+      it.ig = it.wath ? 1 : ignoreMult(ign[it.k]);
+      it.kn = it.wath || !know ? 1 : knowMult(it.c, know);
+      it.jscore = it.score * it.jmul * modsOf(it);
     }
     items.sort(function (a, b) { return b.jscore - a.jscore; });
   }
@@ -2327,7 +2417,7 @@
       var base = (w2.q * pt.q + w2.a * an2 + w2.n * pt.n + w2.s * pt.s) / (rest > 0 ? rest : 1);
       var gate = w2.m > 0 ? 0.15 + 0.85 * pt.m : 1;
       var sc = base * gate * (0.3 + 0.7 * pt.f) * pt.y * pt.d;
-      return extend(extend({}, x), { score: sc, jscore: sc * (x.jmul || 1) * (x.rp || 1) });
+      return extend(extend({}, x), { score: sc, jscore: sc * (x.jmul || 1) * modsOf(x) });
     });
     copies.sort(function (a, b) { return b.jscore - a.jscore; });
     var shadowTop = nextPage({ rest: copies, shown: [] }, 5);
@@ -2619,7 +2709,7 @@
           franchiseFilter(passed, events, ans, stats, profile, guard(function (finalList, frLog) {
             var top = list.slice(0, offset);
             var wkey = scoreAll(finalList, profile, ans);
-            jitter(finalList);
+            jitter(finalList, ans);
             var shadow = null;
             try { shadow = shadowPick(finalList, ans, wkey); } catch (eS) { log('shadow error', eS); }
             var kpReq = Math.max(0, kpQuota().n - kpBefore);
@@ -2646,6 +2736,8 @@
               top: finalList.slice().sort(function (a, b) { return b.score - a.score; }).slice(0, 12).map(journalItem),
               shadow: shadow,
               repeats: finalList.filter(function (x) { return x.rp < 1; }).length,
+              ignored: finalList.filter(function (x) { return x.ig < 1; }).length || undefined,
+              known: finalList.filter(function (x) { return x.kn < 1; }).length || undefined,
               franchises: frLog && frLog.length ? frLog.slice(0, 30) : undefined,
               detailsCut: detailsCut || undefined,
               // Карточки списков Lampa с датой не строкой (поправлены) и пойманные за этот запуск ошибки
@@ -2696,6 +2788,9 @@
       kpMiss: it.kp || it.imdbR ? undefined : (it.kpMiss || 'not_requested'),
       rc: round3(p.rc), rb: round3(p.rb), d: p.d === 1 || p.d === undefined ? undefined : round3(p.d),
       rp: it.rp && it.rp < 1 ? round3(it.rp) : undefined,
+      ig: it.ig && it.ig < 1 ? round3(it.ig) : undefined,
+      kn: it.kn && it.kn < 1 ? round3(it.kn) : undefined,
+      ks: it.ks && it.ks < 1 ? round3(it.ks) : undefined,
       score: round3(it.score),
       q: round3(p.q), a: round3(p.a), an: round3(p.an), m: round3(p.m), n: round3(p.n), s: round3(p.s), f: round3(p.f), y: round3(p.y),
       src: it.src || null,
@@ -2835,6 +2930,8 @@
         if (it.coll) f += 'C';
         if (it.rp) f += 'R' + Math.round(it.rp * 100);
         if (it.d) f += 'D' + Math.round(it.d * 100);
+        if (it.ig) f += 'I' + Math.round(it.ig * 100);
+        if (it.kn || it.ks) f += 'K' + Math.round((it.kn || 1) * (it.ks || 1) * 100);
         return f;
       };
       var c = e.counts || {};
@@ -2915,7 +3012,8 @@
         // название, год, тип+источник, флаги, score, q, an, m, n, s, f, y (×100), tmdb/kp/imdb (×10), голоса, cert, стр/поз[, причина]
         sh: (e.shown || []).map(function (it) {
           var row = [short(it.title, 24), it.year, (it.k || '').charAt(0) + String(it.src || '').charAt(0),
-            (it.anim ? 'A' : '') + (it.wath ? 'W' : '') + (it.coll ? 'C' : '') + (it.rp ? 'R' + Math.round(it.rp * 100) : '') + (it.d ? 'D' + Math.round(it.d * 100) : ''),
+            (it.anim ? 'A' : '') + (it.wath ? 'W' : '') + (it.coll ? 'C' : '') + (it.rp ? 'R' + Math.round(it.rp * 100) : '') + (it.d ? 'D' + Math.round(it.d * 100) : '') +
+              (it.ig ? 'I' + Math.round(it.ig * 100) : '') + (it.kn || it.ks ? 'K' + Math.round((it.kn || 1) * (it.ks || 1) * 100) : ''),
             i100(it.score), i100(it.q), i100(it.an), i100(it.m), i100(it.n), i100(it.s), i100(it.f), i100(it.y),
             i100((it.tmdb || 0) / 10), i100((it.kp || 0) / 10), i100((it.imdb || 0) / 10), it.votes || 0,
             it.cert || '', it.page + '/' + it.pos];
@@ -4636,7 +4734,7 @@
     }
 
     function openIt(it) {
-      if (state) { Journal.action(state.journal, 'open', it); state.pageOpened = true; }
+      if (state) { Journal.action(state.journal, 'open', it); state.pageOpened = true; state.seenRow = []; }
       openCard(it);
     }
 
@@ -4702,15 +4800,26 @@
       }
       else fb.seen[it.k] = { t: now(), card: miniCard(it.c) };
       saveFeedback(fb);
+      forgetIgnored(it.k);
       Journal.action(state.journal, kind === 'reject' ? 'reject' : 'seen', it, kind === 'reject' && reason ? { why: reason } : null);
+      // Три «Уже видел» подряд — оставшееся популярное в тех же жанрах опускаем до конца подбора
+      if (kind === 'seen') {
+        state.seenRow = (state.seenRow || []).concat([it]).slice(-KNOW_ROW);
+        if (state.seenRow.length >= KNOW_ROW && ans.company !== 'kids') {
+          var kn = sessionKnow(state);
+          if (kn && kn.n) Journal.action(state.journal, 'know', null, { g: kn.g.map(function (g) { return GENRE_NAMES[g] || g; }), n: kn.n });
+        }
+      }
+      else state.seenRow = [];
       state.logged = true;
       noty(kind === 'reject' ? 'Скрыто на 90 дней' : 'Отмечено как просмотренное');
 
       if (cardEls[idx]) cardEls[idx].addClass('is-gone');
       setTimeout(safeUi(function () {
-        replaceInPage(state, it);
-        var fresh = state.page[idx];
-        if (fresh && fresh !== it) { Journal.shown(state.journal, [fresh], (state.pageNo || 1) + '-repl'); markShownToday([fresh]); }
+        // В журнал и в «показано сегодня» — только настоящая замена из оставшихся кандидатов.
+        // Кандидаты кончились — страница сжимается, и на место встаёт уже показанная карточка
+        var fresh = replaceInPage(state, it);
+        if (fresh) { Journal.shown(state.journal, [fresh], (state.pageNo || 1) + '-repl'); markShownToday([fresh]); }
         current = state.page[Math.min(idx, state.page.length - 1)];
         renderResults(idx);
       }, 'dismiss'), 220);
@@ -4922,18 +5031,21 @@
     };
   }
 
+  // Возвращает новую карточку или null: кандидаты кончились — страница сжимается
   function replaceInPage(state, it) {
     var i = state.page.indexOf(it);
-    if (i < 0) return;
+    if (i < 0) return null;
     var repl = nextPage(state, 1);
-    if (repl.length) state.page[i] = repl[0];
-    else state.page.splice(i, 1);
+    if (repl.length) { state.page[i] = repl[0]; return repl[0]; }
+    state.page.splice(i, 1);
+    return null;
   }
 
   function openCard(it) {
     var fb = feedback();
     fb.opened[it.k] = { t: now(), card: miniCard(it.c) };
     saveFeedback(fb);
+    forgetIgnored(it.k);   // открыл — значит, интересен: штраф «пропускаемого» снимается
 
     Lampa.Activity.push({
       url: '',

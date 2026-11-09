@@ -1144,6 +1144,67 @@ const CHECKS = [
     const ok = !a.net && a.why === 'cache' && b.net && !c.net && c.why === 'cached_miss' && d.net;
     return { ok, got: JSON.stringify({ 'оценка 30 дн': a, 'оценка 61 дн': b, 'не найден 10 дн': c, 'не найден 20 дн': d }) };
   } },
+  { id: 'IG1', title: 'Пропускаемое между днями: показан в 3+ дня и не открыт — ×0,8 → ×0,5; закладки — без штрафа; снимается открытием и через 2 недели', fn: async () => {
+    const env = makeEnv();
+    const pk = env.pk, D = 86400000;
+    const mk = (k, extra) => Object.assign({ k, score: 0.8, c: { id: +k.split(':')[1], type: 'movie', title: k, genres: [18], year: '2010', vc: 100 } }, extra || {});
+    const igAt = (k, wath) => { const it = mk(k, wath ? { wath: true } : null); pk.jitter([it], { company: 'solo' }); return it.ig; };
+    const res = [];
+    for (let d = 1; d <= 5; d++) {
+      pk.markShownToday([mk('movie:1'), mk('movie:2', { wath: true })]);
+      pk.markShownToday([mk('movie:1')]);                       // второй показ в тот же день — день не добавляет
+      res.push(igAt('movie:1'));
+      await env.clock.advance(D);
+    }
+    const wath = igAt('movie:2', true);
+    await env.clock.advance(15 * D);
+    const expired = igAt('movie:1');
+    // заново 3 дня, потом открыл
+    for (let d = 1; d <= 3; d++) { pk.markShownToday([mk('movie:3')]); await env.clock.advance(D); }
+    const before = igAt('movie:3');
+    pk.openCard(mk('movie:3'));
+    const after = igAt('movie:3');
+    const ok = JSON.stringify(res) === JSON.stringify([1, 1, 0.8, 0.65, 0.5]) && wath === 1 && expired === 1 && before === 0.8 && after === 1;
+    return { ok, got: JSON.stringify({ 'дни 1–5': res, wath, 'через 15 дн': expired, 'до открытия': before, 'после': after }) };
+  } },
+  { id: 'KN1', title: '«Знаток жанра»: 5+ «Уже видел» в жанре — популярное старше 3 лет в нём ×0,85…0,7; новое, малоизвестное, закладки и «С детьми» — без штрафа', fn: async () => {
+    const env = makeEnv();
+    const pk = env.pk;
+    const yr = new Date(env.clock.now).getFullYear();
+    const setSeen = (n) => { const fb = pk.feedback(); fb.seen = {}; for (let i = 0; i < n; i++) fb.seen['movie:' + (900 + i)] = { t: env.clock.now, card: { id: 900 + i, genre_ids: [27, 53] } }; pk.saveFeedback(fb); };
+    const mk = (id, g, year, vc, extra) => Object.assign({ k: 'movie:' + id, score: 0.8, c: { id, type: 'movie', title: 'X', genres: g, year: String(year), vc } }, extra || {});
+    const kn = (it, ans) => { pk.jitter([it], ans || { company: 'solo' }); return Math.round(it.kn * 1000) / 1000; };
+    setSeen(4);
+    const four = kn(mk(1, [27], 2010, 9000));
+    setSeen(6);
+    const r = { six: kn(mk(1, [27], 2010, 9000)), fresh: kn(mk(2, [27], yr - 1, 9000)), rare: kn(mk(3, [27], 2010, 800)), drama: kn(mk(4, [18], 2010, 9000)),
+      wath: kn(mk(5, [27], 2010, 9000, { wath: true })), kids: kn(mk(6, [27], 2010, 9000), { company: 'kids' }) };
+    setSeen(12);
+    r.twelve = kn(mk(1, [27], 2010, 9000));
+    const ok = four === 1 && r.six === 0.82 && r.fresh === 1 && r.rare === 1 && r.drama === 1 && r.wath === 1 && r.kids === 1 && r.twelve === 0.7;
+    return { ok, got: JSON.stringify(Object.assign({ four }, r)) };
+  } },
+  { id: 'KN2', title: 'Три «Уже видел» подряд — оставшимся популярным не новым в их общих жанрах ×0,8 до конца подбора, порядок пересчитан', fn: async () => {
+    const { pk } = makeEnv();
+    const mk = (id, g, year, vc, js) => ({ k: 'movie:' + id, jscore: js, c: { id, type: 'movie', title: 'X' + id, genres: g, year: String(year), vc } });
+    const row = [mk(1, [27, 53], 2005, 9000, 1), mk(2, [27], 2008, 9000, 1), mk(3, [27, 9648], 2012, 9000, 1)];
+    const a = mk(10, [27], 2010, 9000, 0.60), b = mk(11, [27], 2025, 9000, 0.55), c = mk(12, [35], 2010, 9000, 0.58), d = mk(13, [27], 2010, 500, 0.50);
+    const st = { seenRow: row, rest: [a, c, b, d], shown: [] };
+    const r = pk.sessionKnow(st);
+    const order = st.rest.map(x => x.k.split(':')[1]).join(',');
+    const ok = r && r.n === 1 && a.ks === 0.8 && !b.ks && !c.ks && !d.ks && order === '12,11,13,10';
+    return { ok, got: JSON.stringify({ r, order }) };
+  } },
+  { id: 'J1', title: 'Замена после «Не то»/«Уже видел»: кандидаты кончились — замены нет (страница сжимается, в журнал не пишется)', fn: async () => {
+    const { pk } = makeEnv();
+    const mk = (id) => ({ k: 'movie:' + id, jscore: 0.5, c: { id, type: 'movie', title: 'X', genres: [18], kw: [], cast: [], dir: [] } });
+    const p1 = mk(1), p2 = mk(2), r1 = mk(3);
+    const st = { page: [p1, p2], rest: [r1], shown: [p1, p2] };
+    const a = pk.replaceInPage(st, p1);
+    const b = pk.replaceInPage(st, p2);
+    const ok = a === r1 && b === null && st.page.length === 1 && st.page[0] === r1;
+    return { ok, got: JSON.stringify({ first: a && a.k, second: b, page: st.page.map(x => x.k) }) };
+  } },
   { id: 'P8', title: 'Опорные — только «Нравится» и просмотренное; открытое из подборки и закладки — нет', fn: async () => {
     const w = baseWorld();
     w.fav.like = [card(100, { title: 'Liked' })];
