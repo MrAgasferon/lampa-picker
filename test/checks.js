@@ -1103,6 +1103,47 @@ const CHECKS = [
     const ok = c.va === 7.5 && c.vc === 1200 && c.year === '2019' && JSON.stringify(c.genres) === JSON.stringify([18, 35]);
     return { ok, got: JSON.stringify({ va: c.va, vc: c.vc, year: c.year, genres: c.genres }) };
   } },
+  { id: 'KL1', title: 'КП: 402 (суточный лимит) у встроенного ключа — сообщение с подсказкой про свой ключ, один раз в день', fn: async () => {
+    const router = (url, p, def) => (url.indexOf('kinopoiskapiunofficial') > -1 ? { status: 402 } : def(url));
+    const env = makeEnv({ kp: true, router });
+    const c = (id) => ({ id, type: 'movie', imdb: 'tt' + id, title: 'X', original: 'X', year: '2014', va: 7 });
+    await env.cb(cb => env.pk.fetchRatings({ k: 'movie:1', c: c(1) }, cb));
+    await env.cb(cb => env.pk.fetchRatings({ k: 'movie:2', c: c(2) }, cb));
+    const n = env.log.noty.filter(t => /Лимит Кинопоиска на сегодня исчерпан/.test(t));
+    return { ok: n.length === 1 && /Ключ Кинопоиска/.test(n[0]), got: JSON.stringify(env.log.noty) };
+  } },
+  { id: 'KL2', title: 'КП: 402 у личного ключа — своё сообщение, без подсказки про ключ', fn: async () => {
+    const router = (url, p, def) => (url.indexOf('kinopoiskapiunofficial') > -1 ? { status: 402 } : def(url));
+    const env = makeEnv({ kp: true, router, storage: { picker_kp_key: 'personal-key-1234' } });
+    await env.cb(cb => env.pk.fetchRatings({ k: 'movie:1', c: { id: 1, type: 'movie', imdb: 'tt1', title: 'X', year: '2014', va: 7 } }, cb));
+    const n = env.log.noty.filter(t => /Лимит вашего ключа Кинопоиска/.test(t));
+    return { ok: n.length === 1 && !/Настройки/.test(n[0]), got: JSON.stringify(env.log.noty) };
+  } },
+  { id: 'KL3', title: 'КП: последний разрешённый на сегодня запрос встроенного ключа — сообщение об исчерпании', fn: async () => {
+    const router = (url, p, def) => (url.indexOf('kinopoiskapiunofficial') > -1 ? { body: { items: [{ kinopoiskId: 5, type: 'FILM', ratingKinopoisk: 7.1, ratingImdb: 7.0 }] } } : def(url));
+    const env = makeEnv({ kp: true, router });
+    const q = env.pk.kpQuota(); q.n = 39; env.w.Lampa.Storage.set('picker_kp_quota', q);
+    await env.cb(cb => env.pk.fetchRatings({ k: 'movie:1', c: { id: 1, type: 'movie', imdb: 'tt1', title: 'X', year: '2014', va: 7 } }, cb));
+    const n = env.log.noty.filter(t => /Лимит Кинопоиска на сегодня исчерпан/.test(t));
+    return { ok: n.length === 1 && env.pk.kpQuota().n === 40, got: 'квота ' + env.pk.kpQuota().n + ', сообщения: ' + JSON.stringify(env.log.noty) };
+  } },
+  { id: 'KL4', title: 'КП: оценки держатся 60 дней, «не найден» — 14 дней', fn: async () => {
+    const urls = [];
+    const router = (url, p, def) => {
+      if (url.indexOf('kinopoiskapiunofficial') > -1) { urls.push(url); return { body: { items: [{ kinopoiskId: 5, type: 'FILM', ratingKinopoisk: 7.1, ratingImdb: 7.0 }] } }; }
+      return def(url);
+    };
+    const env = makeEnv({ kp: true, router });
+    const D = 86400000, now = env.clock.now;
+    const rated = (days) => ({ kp: 7.3, imdb: 7.2, id: 5, r: 1, mv: 5, t: now - days * D, va: 7 });
+    const miss = (days) => ({ kp: 0, imdb: 0, id: null, r: 1, mv: 5, t: now - days * D, va: 7, probe: { imdb: 'empty', q: 'X', year: 2014, total: 0, top: [] } });
+    env.pk.Durable.vals.kpmap = { 'movie:1': rated(30), 'movie:2': rated(61), 'movie:3': miss(10), 'movie:4': miss(20) };
+    env.pk.Durable.loaded.kpmap = true;
+    const go = async (id) => { const n0 = urls.length; const r = await env.cb(cb => env.pk.fetchRatings({ k: 'movie:' + id, c: { id, type: 'movie', imdb: 'tt' + id, title: 'X', original: 'X', year: '2014', va: 7 } }, cb)); return { net: urls.length > n0, why: r && (r[0] ? r[0].src : r[1]) }; };
+    const a = await go(1), b = await go(2), c = await go(3), d = await go(4);
+    const ok = !a.net && a.why === 'cache' && b.net && !c.net && c.why === 'cached_miss' && d.net;
+    return { ok, got: JSON.stringify({ 'оценка 30 дн': a, 'оценка 61 дн': b, 'не найден 10 дн': c, 'не найден 20 дн': d }) };
+  } },
   { id: 'P8', title: 'Опорные — только «Нравится» и просмотренное; открытое из подборки и закладки — нет', fn: async () => {
     const w = baseWorld();
     w.fav.like = [card(100, { title: 'Liked' })];

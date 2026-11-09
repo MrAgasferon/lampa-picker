@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.13.4-dev';
+  var VERSION = '0.13.5-dev';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -1861,7 +1861,7 @@
     var rec = c.type === 'tv' ? null : kpCache()[c.id];
     if (rec && (parseFloat(rec.kp) > 0 || parseFloat(rec.imdb) > 0)) return { kp: parseFloat(rec.kp) || 0, imdb: parseFloat(rec.imdb) || 0 };
     var m = Durable.get('kpmap', {})[k];
-    if (m && now() - m.t < 14 * DAY && (m.kp || m.imdb)) return { kp: m.kp || 0, imdb: m.imdb || 0 };
+    if (m && now() - m.t < KP_RATE_TTL && (m.kp || m.imdb)) return { kp: m.kp || 0, imdb: m.imdb || 0 };
     return null;
   }
 
@@ -3152,6 +3152,10 @@
   // Отдельная очередь КП: не мешает TMDB, короткий таймаут, без повторов.
   // Два сетевых сбоя подряд (источник недоступен) — час только кеш.
   var KP_TIMEOUT = 4500, KP_OFF_FOR = 3600 * 1000;
+  // Сколько держим ответ КП: оценки меняются медленно — 60 дней; «не найден» и «без оценки» —
+  // 14 дней: у новых фильмов карточка и оценки на КП появляются позже
+  var KP_RATE_TTL = 60 * DAY, KP_MISS_TTL = 14 * DAY;
+  function kpTtl(m) { return m && (m.kp || m.imdb) ? KP_RATE_TTL : KP_MISS_TTL; }
   // Контекст подбора для КП: свой потолок квоты и флаг «закончен». Задания очереди помечены контекстом,
   // поэтому дедлайн одного подбора не трогает задания другого, а поздние шаги закончившегося не уходят в сеть
   var kpCtxs = [];
@@ -3247,7 +3251,18 @@
     var q = kpQuota();
     q.n++;
     save('kp_quota', q);
+    if (q.n >= kpLimit()) kpLimitNotice();   // это был последний запрос на сегодня
     return true;
+  }
+
+  // Лимит Кинопоиска на сегодня исчерпан — один раз в день сообщаем: для встроенного ключа (он общий
+  // для всех без личного) — с подсказкой про свой ключ. Без сообщения люди видят только пропавшие оценки КП
+  function kpLimitNotice() {
+    if (store('kp_limit_noty', 0) === todaySeed()) return;
+    save('kp_limit_noty', todaySeed());
+    noty(kpUsingBuiltin()
+      ? 'Лимит Кинопоиска на сегодня исчерпан — оценки КП только из кеша. Свой бесплатный ключ снимает ограничение: Настройки → ' + TITLE + ' → Ключ Кинопоиска'
+      : 'Лимит вашего ключа Кинопоиска на сегодня исчерпан — оценки КП только из кеша');
   }
 
   // Ключ отклонён или исчерпан — до конца дня не запрашиваем
@@ -3256,9 +3271,10 @@
     if (q.blocked) return;
     q.blocked = status || true;
     save('kp_quota', q);
-    if (kpUsingBuiltin()) return; // встроенный ключ исчерпан — молча уходим в кеш
+    if (status === 402) return kpLimitNotice();   // 402 у kinopoiskapiunofficial — суточный лимит ключа
+    if (kpUsingBuiltin()) return;                 // встроенный ключ не принят — молча уходим в кеш
     noty(status === 401 ? 'Ключ Кинопоиска не принят — проверьте его в настройках'
-      : 'Лимит ключа Кинопоиска на сегодня исчерпан — рейтинги КП только из кеша');
+      : 'Ключ Кинопоиска сейчас не работает — рейтинги КП только из кеша');
   }
 
   function kpFail(cb) {
@@ -3346,7 +3362,7 @@
     // «Нашёлся без оценки» от прежней версии сопоставления: по названию мог найтись чужой фильм того же года
     // («Мультивселенная» → Entangled) — сопоставляем заново, один раз
     var staleNoRating = m && !m.kp && !m.imdb && m.id && m.r && !(m.mv >= KP_MATCH_V);
-    if (m && now() - m.t < 14 * DAY && !legacyMiss && !ageOnly && !staleNoRating) {
+    if (m && now() - m.t < kpTtl(m) && !legacyMiss && !ageOnly && !staleNoRating) {
       if (m.kp || m.imdb) return cb({ kp: m.kp, imdb: m.imdb, src: 'cache' });
       if (m.probe) it.kpProbe = m.probe;
       return cb(null, m.id ? 'cached_no_rating' : 'cached_miss');   // нашёлся без оценки / не нашёлся
