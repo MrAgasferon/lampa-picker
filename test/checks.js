@@ -1144,16 +1144,19 @@ const CHECKS = [
     const ok = !a.net && a.why === 'cache' && b.net && !c.net && c.why === 'cached_miss' && d.net;
     return { ok, got: JSON.stringify({ 'оценка 30 дн': a, 'оценка 61 дн': b, 'не найден 10 дн': c, 'не найден 20 дн': d }) };
   } },
-  { id: 'IG1', title: 'Пропускаемое между днями: показан в 3+ дня и не открыт — ×0,8 → ×0,5; закладки — без штрафа; снимается открытием и через 2 недели', fn: async () => {
+  { id: 'IG1', title: 'Пропускаемое между днями: показан в 3+ прошлых дня и не открыт — ×0,8 → ×0,5, весь день одна ступень; закладки — без штрафа; снимается открытием и через 2 недели', fn: async () => {
     const env = makeEnv();
     const pk = env.pk, D = 86400000;
     const mk = (k, extra) => Object.assign({ k, score: 0.8, c: { id: +k.split(':')[1], type: 'movie', title: k, genres: [18], year: '2010', vc: 100 } }, extra || {});
     const igAt = (k, wath) => { const it = mk(k, wath ? { wath: true } : null); pk.jitter([it], { company: 'solo' }); return it.ig; };
-    const res = [];
-    for (let d = 1; d <= 5; d++) {
+    const res = [], midDay = [];
+    for (let d = 1; d <= 6; d++) {
+      const before = igAt('movie:1');                           // первый подбор дня
       pk.markShownToday([mk('movie:1'), mk('movie:2', { wath: true })]);
       pk.markShownToday([mk('movie:1')]);                       // второй показ в тот же день — день не добавляет
-      res.push(igAt('movie:1'));
+      const after = igAt('movie:1');                            // следующий подбор того же дня
+      res.push(before);
+      if (after !== before) midDay.push('день ' + d + ': ' + before + ' → ' + after);
       await env.clock.advance(D);
     }
     const wath = igAt('movie:2', true);
@@ -1164,8 +1167,8 @@ const CHECKS = [
     const before = igAt('movie:3');
     pk.openCard(mk('movie:3'));
     const after = igAt('movie:3');
-    const ok = JSON.stringify(res) === JSON.stringify([1, 1, 0.8, 0.65, 0.5]) && wath === 1 && expired === 1 && before === 0.8 && after === 1;
-    return { ok, got: JSON.stringify({ 'дни 1–5': res, wath, 'через 15 дн': expired, 'до открытия': before, 'после': after }) };
+    const ok = JSON.stringify(res) === JSON.stringify([1, 1, 1, 0.8, 0.65, 0.5]) && !midDay.length && wath === 1 && expired === 1 && before === 0.8 && after === 1;
+    return { ok, got: JSON.stringify({ 'дни 1–6': res, 'посреди дня': midDay, wath, 'через 15 дн': expired, 'до открытия': before, 'после': after }) };
   } },
   { id: 'KN1', title: '«Знаток жанра»: 5+ «Уже видел» в жанре — популярное старше 3 лет в нём ×0,85…0,7; новое, малоизвестное, закладки и «С детьми» — без штрафа', fn: async () => {
     const env = makeEnv();

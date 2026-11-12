@@ -2294,7 +2294,8 @@
   }
 
   // ---- Пропускаемое между днями: показан в 3+ разные дни и ни разу не открыт — значит, не интересно.
-  // Штраф с 3-го дня ×0,8, с 4-го ×0,65, с 5-го ×0,5; снимается при открытии или через 2 недели без показов.
+  // Считаем только прошлые дни — весь день штраф один и тот же: после 3 дней показа ×0,8, после 4 — ×0,65,
+  // после 5 — ×0,5; снимается при открытии или через 2 недели без показов.
   // Закладки и «Позже» не трогаем — их человек сохранил сам
   var IGNORE_TTL = 14 * DAY;
   var IGNORE_MULT = { 3: 0.8, 4: 0.65 }, IGNORE_MIN = 0.5;
@@ -2304,8 +2305,10 @@
     return m && typeof m === 'object' && !isArray(m) ? m : {};
   }
   function ignoreMult(rec) {
-    if (!rec || !(now() - rec.t < IGNORE_TTL) || !(rec.n >= 3)) return 1;
-    return rec.n >= 5 ? IGNORE_MIN : IGNORE_MULT[rec.n];
+    if (!rec || !(now() - rec.t < IGNORE_TTL)) return 1;
+    var n = rec.n - (rec.d === todaySeed() ? 1 : 0);   // сегодняшний показ не в счёт — ступень не меняется посреди дня
+    if (!(n >= 3)) return 1;
+    return n >= 5 ? IGNORE_MIN : IGNORE_MULT[n];
   }
   function noteIgnoredDay(keys) {
     var m = ignoredMap(), t = now(), day = todaySeed();
