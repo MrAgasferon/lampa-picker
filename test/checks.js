@@ -1477,6 +1477,64 @@ CHECKS.push(
     await env.clock.advance(8000);
     const off = env.storage.picker_kp_off > env.clock.now;
     return { ok: n === 1 && !off, got: 'запросов ' + n + ', КП выключен на час: ' + (off ? 'да' : 'нет') };
-  } }
+  } },
+  // ------------------------------------------------------------------ точечные исправления 0.13.6
+  { id: 'M36', title: '«Посмеяться»: все жанровые запросы содержат Комедию, одной Музыки нет', fn: async () => {
+    const { pk } = makeEnv();
+    const ans = { time: 'any', mood: 'laugh', company: 'solo' };
+    const blank = pk.discoverPlan({ f: { genre: {} } }, ans);
+    const taste = pk.discoverPlan({ f: { genre: { 10402: 0.8, 12: 0.5, 18: 0.4, 35: 0.2 } } }, ans);
+    const ok = blank.length > 0 && taste.length > 0 && blank.concat(taste).every(p => p.g.indexOf(35) >= 0)
+      && !taste.some(p => p.g.length === 1 && p.g[0] === 10402);
+    return { ok, got: 'без истории: ' + JSON.stringify(blank.map(p => p.g)) + '; со вкусом: ' + JSON.stringify(taste.map(p => p.g)) };
+  } },
+  { id: 'T36', title: 'Talk/News: исключение в discover TV, до и после загрузки деталей', fn: async () => {
+    const { pk } = makeEnv();
+    const ans = { time: 'series', mood: 'laugh', company: 'solo' };
+    const ex = pk.moodExclude(ans, 'tv');
+    const raw = g => ({ k: 'tv:32415', id: 32415, type: 'tv', r: { genre_ids: [35, g], vote_count: 5000 } });
+    const preTalk = pk.preReason(raw(10767), {}, ans);
+    const preNews = pk.preReason(raw(10763), {}, ans);
+    const preGood = pk.preReason(raw(35), {}, ans);
+    const c = pk.compact('tv', { id: 32415, name: 'Conan', first_air_date: '2010-01-01', genres: [{ id: 35 }, { id: 10767 }] });
+    const post = pk.postReason({ c, r: {} }, ans, { f: {}, n: 0 }, false);
+    const ok = ex.indexOf(10763) >= 0 && ex.indexOf(10767) >= 0 && preTalk === 'tv_talk_news'
+      && preNews === 'tv_talk_news' && !preGood && post === 'tv_talk_news';
+    return { ok, got: 'without_genres ' + ex.join(',') + '; до: Talk ' + preTalk + ', News ' + preNews + ', обычный ' + (preGood || 'OK') + '; после: ' + post };
+  } },
+  { id: 'U36', title: 'После stop() подбор не перехватывает фокус и не заканчивается в фоне', fn: async () => {
+    const env = makeEnv(baseWorld());
+    let sets = 0, handler = null;
+    env.w.Lampa.Controller.collectionSet = () => { sets++; };
+    env.w.Lampa.Controller.add = (name, h) => { handler = h; };
+    env.w.Lampa.Controller.toggle = name => { if (name === 'content' && handler) handler.toggle(); };
+    const comp = new env.pk.PickerComponent({ answers: { time: 'any', mood: 'laugh', company: 'solo' } });
+    env.w.document.body.appendChild(comp.create()[0]);
+    comp.start();
+    const before = sets;
+    comp.stop();
+    await env.clock.advance(30000);
+    const after = sets;
+    const journal = env.pk.Journal.list().length;
+    comp.destroy();
+    return { ok: before > 0 && after === before && journal === 0, got: 'фокус до stop: ' + before + ', после: ' + after + ', сессий: ' + journal };
+  } },
+  { id: 'U36b', title: '«Настроить вкус»: старый ответ после stop() не забирает пульт', fn: async () => {
+    const env = makeEnv();
+    let sets = 0, handler = null;
+    env.w.Lampa.Controller.collectionSet = () => { sets++; };
+    env.w.Lampa.Controller.add = (name, h) => { handler = h; };
+    env.w.Lampa.Controller.toggle = name => { if (name === 'content' && handler) handler.toggle(); };
+    const comp = new env.pk.PickerComponent({});
+    env.w.document.body.appendChild(comp.create()[0]);
+    comp.start();
+    comp.stop();
+    const before = sets;
+    await env.clock.advance(1000);
+    const after = sets;
+    comp.destroy();
+    return { ok: before > 0 && after === before, got: 'фокус до ответа: ' + before + ', после: ' + after };
+  } },
+
 );
 module.exports = CHECKS;
