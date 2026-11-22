@@ -10,7 +10,7 @@
   if (window.lampa_picker_loaded) return;
   window.lampa_picker_loaded = true;
 
-  var VERSION = '0.13.5';
+  var VERSION = '0.13.6';
   // Тестовая сборка (picker-dev.js): видна в меню, чтобы не перепутать с рабочей
   var DEV = /-dev$/.test(VERSION);
   var TITLE = 'Что посмотреть' + (DEV ? ' (dev)' : '');
@@ -176,6 +176,13 @@
 
   var MOVIE_TO_TV = { 28: 10759, 12: 10759, 878: 10765, 14: 10765, 10752: 10768 };
   var TV_HAS_SAME = [16, 35, 80, 99, 18, 10751, 9648, 37, 10762];
+  var TV_EXCLUDED = [10763, 10767]; // News, Talk: в нормализованных жанрах эти признаки теряются
+
+  function tvExcluded(ids) {
+    if (!isArray(ids)) return false;
+    for (var i = 0; i < ids.length; i++) if (TV_EXCLUDED.indexOf(ids[i] && ids[i].id || ids[i]) > -1) return true;
+    return false;
+  }
 
   function normGenres(ids) {
     var out = [];
@@ -849,6 +856,7 @@
       date: date,
       runtime: runtime,
       genres: normGenres((d.genres || []).map(function (g) { return g.id; })),
+      rawGenres: type === 'tv' ? (d.genres || []).map(function (g) { return g.id; }) : null,
       kw: kwRaw.slice(0, 10).map(function (k) { return k.id; }),
       cast: cast.map(function (p) { return p.id; }),
       dir: dirs.map(function (p) { return p.id; }),
@@ -927,6 +935,7 @@
       year: date.slice(0, 4),
       date: date,
       genres: normGenres(cardGenreIds(card)),
+      rawGenres: typeOf(card) === 'tv' ? cardGenreIds(card) : null,
       kw: [], cast: [], dir: [], names: {},
       lang: String(card.original_language || ''),
       // Рейтинг и голоса строкой (сторонние каталоги) — в число: иначе toFixed на экране упадёт
@@ -1530,6 +1539,17 @@
     // С детьми — сначала семейное и мультфильмы, потом остальное
     if (ans.company === 'kids') { push([10751], 'kids', 1); push([16, 10751], 'kids', 1); push([12, 10751], 'kids', 1); }
 
+    // «Посмеяться»: музыка сама по себе не комедия. Во всех запросах настроения
+    // обязательна Комедия (35), в том числе в пересечениях со вкусом.
+    if (ans.mood === 'laugh' && ans.company !== 'kids') {
+      push([35], 'mood', 1);
+      for (var j = 0; j < user.length; j++) {
+        if (user[j] === 35 || (mood.w[user[j]] !== undefined && mood.w[user[j]] < 0)) continue;
+        push([35, user[j]], 'pair', 0.5 + ((profile.f.genre && profile.f.genre[user[j]]) || 0));
+      }
+      return plan.slice(0, 7);
+    }
+
     if (hasMood) {
       var mg = moodPlus(mood, 3);
       var pairs = [];
@@ -1562,7 +1582,7 @@
     var out = [];
     if (mood) each(mood.w, function (v, g) { if (v <= -0.5) out.push(parseInt(g, 10)); });
     if (ans.company === 'kids') out = out.concat([27, 10752]);
-    if (type === 'tv') out = out.map(toTvGenre).filter(Boolean);
+    if (type === 'tv') out = out.map(toTvGenre).filter(Boolean).concat(TV_EXCLUDED);
     return uniq(out);
   }
 
@@ -1681,7 +1701,9 @@
       var exId = exType === 'tv' ? toTvGenre(exg) : exg;
       if (exId) {
         var ep = { with_genres: exId, sort_by: 'vote_average.desc', 'vote_count.gte': 500, page: 1 };
+        if (ans.mood === 'laugh' && ans.company !== 'kids') ep.with_genres = exId === 35 ? '35' : '35,' + exId;
         if (floor) ep[exType === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = floor + '-01-01';
+        if (exType === 'tv') ep.without_genres = moodExclude(ans, 'tv').join(',');
         req('discover/' + exType, ep, exType, null, 'explore');
       }
     }
@@ -1690,6 +1712,7 @@
     //    Даёт личные кандидаты в настроениях, где опорных фильмов почти нет.
     var tasteBase = function (type) {
       var tp = { sort_by: 'popularity.desc', 'vote_count.gte': type === 'tv' ? 100 : (short ? 150 : 200), 'vote_average.gte': 6, page: 1 };
+      if (ans.mood === 'laugh' && ans.company !== 'kids') tp.with_genres = 35;
       if (floor) tp[type === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = floor + '-01-01';
       if (type === 'movie' && limited) {
         var tl = short ? 45 : parseInt(ans.time, 10) + 10;
@@ -1765,6 +1788,8 @@
   function preReason(it, ex, ans) {
     if (ex[it.k]) return ex[it.k];
     var r = it.r || {};
+    // В TMDB News/Talk не имеют аналога в фильмах и теряются при нормализации.
+    if (it.type === 'tv' && tvExcluded(r.genre_ids || r.genres)) return 'tv_talk_news';
     // Начатое (в том числе онлайн, мимо истории Lampa) не предлагаем никогда
     if (startedAny(r, it.type)) return 'started';
     if (!it.wath) {
@@ -1794,6 +1819,8 @@
   function postReason(it, ans, profile, final) {
     var c = it.c;
     if (!c) return 'no_details';
+    // Повторная проверка по подробной карточке (в том числе «Позже» и кэшу).
+    if (c.type === 'tv' && (tvExcluded(c.rawGenres) || tvExcluded((it.r || {}).genre_ids))) return 'tv_talk_news';
 
     if (ans.time === '40') {
       if (!c.runtime) return 'no_runtime';
@@ -4033,6 +4060,10 @@
     var prevView = null;
     var last = null;          // последний элемент в фокусе
     var view = 'wizard';      // wizard | loading | results | empty
+    var active = false;       // только видимый экран может перехватывать фокус Lampa
+    var startedOnce = false;
+    var tasteSerial = 0;     // поздние ответы экрана вкуса не должны оживлять старый экран
+    var restartTaste = false;
     var step = 0;
     var ans = {};
     var state = null;
@@ -4267,6 +4298,7 @@
     }
 
     function refresh(target) {
+      if (!active) return;
       if (target) last = target.jquery ? target[0] : target;
       try {
         var en = Lampa.Controller.enabled();
@@ -4362,6 +4394,7 @@
 
     function renderTaste() {
       view = 'taste';
+      var serial = ++tasteSerial;
       save('taste_offered', true);
       var seen = {}, nextP = 1, picked = 0, items = [];
       var wrap = $('<div class="pkr-taste"></div>');
@@ -4428,13 +4461,14 @@
       };
       var exhausted = function () { return nextP > TASTE_MAX_PAGES && !prefetching && !items.length; };
       var show = function () {
+        if (serial !== tasteSerial || view !== 'taste' || (startedOnce && !active)) return;
         var chunk = items.splice(0, TASTE_PAGE);
         var first = null;
         for (var i = 0; i < chunk.length; i++) { var e = tcard(chunk[i]); if (!first) first = e; grid.append(e); }
         loading = false;
         if (items.length < TASTE_PAGE && nextP <= TASTE_MAX_PAGES && !prefetching) {
           prefetching = true;
-          fetchMore(function () { prefetching = false; if (wantShow) { wantShow = false; load(); } });
+          fetchMore(function () { prefetching = false; if (wantShow && serial === tasteSerial && view === 'taste') { wantShow = false; load(); } });
         }
         if (!first && !grid.children().length) {
           grid.append('<div class="pkr-j__row">Не удалось загрузить список — проверьте связь с TMDB</div>');
@@ -4443,11 +4477,12 @@
           moreBtn.remove(); moreBtn2.remove();
           if (!first) noty('Больше нет — это все популярные фильмы и сериалы');
         }
-        try { Lampa.Controller.collectionSet(focusable()); } catch (e2) {}
+        if (active) { try { Lampa.Controller.collectionSet(focusable()); } catch (e2) {} }
         if (first) refresh(first);
         else if (!grid.children('.pkr-tcard').length || exhausted()) refresh(foot.find('.selector').eq(0));
       };
       var load = function () {
+        if (serial !== tasteSerial || view !== 'taste' || (startedOnce && !active)) return;
         if (loading) return;
         if (items.length >= TASTE_PAGE || (nextP > TASTE_MAX_PAGES && !prefetching)) { loading = true; return show(); }
         if (prefetching) { wantShow = true; return; }   // следующая страница уже в пути
@@ -4608,7 +4643,7 @@
       bindFocus(d);
       try {
         var en = Lampa.Controller.enabled();
-        if (en && en.name === 'content') Lampa.Controller.collectionSet(focusable());
+        if (active && en && en.name === 'content') Lampa.Controller.collectionSet(focusable());
       } catch (e) {}
     }
 
@@ -4973,7 +5008,7 @@
 
     // ---- жизненный цикл компонента
 
-    var fitSafe = safe(function () { fit(); }, 'fit');
+    var fitSafe = safe(function () { if (active) fit(); }, 'fit');
 
     this.create = function () {
       injectCss();
@@ -4990,9 +5025,13 @@
     };
 
     this.start = function () {
+      active = true;
+      startedOnce = true;
+      if (restartTaste) { restartTaste = false; renderTaste(); }
       Lampa.Controller.add('content', {
         link: self,
         toggle: function () {
+          if (!active) return;
           Lampa.Controller.collectionSet(focusable());
           Lampa.Controller.collectionFocus(last || false, focusable());
         },
@@ -5024,10 +5063,16 @@
     };
 
     this.pause = function () {};
-    this.stop = function () {};
+    this.stop = function () {
+      active = false;
+      if (view === 'loading') { cancelRun(); renderWizard(STEPS.length - 1); }
+      if (view === 'taste') { ++tasteSerial; restartTaste = true; }
+    };
     this.render = function () { return html; };
 
     this.destroy = function () {
+      active = false;
+      ++tasteSerial;
       cancelRun();
       $(window).off('resize', fitSafe);
       html.remove();
